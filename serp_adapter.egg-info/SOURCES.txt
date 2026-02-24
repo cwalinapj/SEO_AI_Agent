@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+serp_adapter/__init__.py
+serp_adapter/models.py
+serp_adapter.egg-info/PKG-INFO
+serp_adapter.egg-info/SOURCES.txt
+serp_adapter.egg-info/dependency_links.txt
+serp_adapter.egg-info/requires.txt
+serp_adapter.egg-info/top_level.txt
+serp_adapter/adapters/__init__.py
+serp_adapter/adapters/apify.py
+serp_adapter/adapters/base.py
+tests/test_adapters.py
+tests/test_models.py

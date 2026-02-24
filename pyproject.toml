@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serp-adapter"
+version = "0.1.0"
+description = "Normalized SERP result adapter for the SEO AI Agent"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["serp_adapter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
