@@ -99,7 +99,7 @@ BEGIN
     updated_at = excluded.updated_at;
 END;
 
-CREATE TABLE IF NOT EXISTS conversation_events (
+CREATE TABLE IF NOT EXISTS conversion_events (
   event_id TEXT PRIMARY KEY,
   vertical TEXT NOT NULL,
   geo_bucket TEXT NOT NULL,
@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS conversation_events (
 
 CREATE VIEW IF NOT EXISTS cohort_device_priors AS
 SELECT
+  -- cohort_key = hash(vertical + geo_bucket + CTA_type + device + intent_bucket)
   lower(hex(
     coalesce(vertical, 'unknown') || '|' ||
     coalesce(geo_bucket, 'unknown') || '|' ||
@@ -132,9 +133,10 @@ SELECT
            / SUM(CASE WHEN event_type = 'impression' THEN 1 ELSE 0 END)
     ELSE 0.0
   END AS conversion_rate,
+  -- Confidence saturates at 1.0 once we have 50 impressions in a cohort/device bucket.
   min(1.0, 1.0 * SUM(CASE WHEN event_type = 'impression' THEN 1 ELSE 0 END) / 50.0) AS confidence,
   MAX(created_at) AS last_updated
-FROM conversation_events
+FROM conversion_events
 GROUP BY vertical, geo_bucket, cta_type, device, intent_bucket;
 
 CREATE VIEW IF NOT EXISTS keyword_device_expected_value AS
@@ -146,6 +148,7 @@ WITH base AS (
     k.geo_bucket,
     k.cta_type,
     k.intent_bucket,
+    -- V1 score: baseline 1.0 + scaled volume + scaled CPC (micros->units).
     (1.0 + COALESCE(km.monthly_volume, 0) / 1000.0 + COALESCE(km.avg_cpc_micros, 0) / 1000000.0) AS kw_score
   FROM keywords k
   LEFT JOIN kw_metrics km ON km.kw_id = k.kw_id
@@ -186,7 +189,9 @@ WITH ev AS (
 SELECT
   kw_id,
   CASE
+    -- Confidence gate: 0.2 == roughly 10 impressions when confidence reaches 1.0 at 50.
     WHEN COALESCE(max(mobile_confidence, desktop_confidence), 0.0) < 0.2 THEN 'both'
+    -- Dominance threshold: require a 20% EV lead before single-device mode.
     WHEN COALESCE(mobile_ev, 0.0) >= COALESCE(desktop_ev, 0.0) * 1.2 THEN 'mobile_only'
     WHEN COALESCE(desktop_ev, 0.0) >= COALESCE(mobile_ev, 0.0) * 1.2 THEN 'desktop_only'
     ELSE 'both'
