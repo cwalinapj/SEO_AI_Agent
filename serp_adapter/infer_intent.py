@@ -29,6 +29,12 @@ HIRE_MODIFIERS = (
 LOCAL_MODIFIERS = ("near me", "emergency", "24/7", "open now")
 COMPARISON_MODIFIERS = ("best", "top", "reviews", "vs", "compare")
 
+HIRE_WEIGHTS = {"cpc": 0.45, "modifier": 0.3, "local_service": 0.15, "directory": 0.1}
+DIY_WEIGHTS = {"inverse_cpc": 0.45, "modifier": 0.35, "publisher": 0.2}
+LOCAL_WEIGHTS = {"modifier": 0.55, "local_service": 0.25, "directory": 0.2}
+COMPARISON_WEIGHTS = {"modifier": 0.65, "serp_review_like": 0.35}
+BRAND_WEIGHTS = {"modifier": 0.8, "directory": 0.2}
+
 
 def _contains_any(text: str, terms: Iterable[str]) -> bool:
     lowered = text.lower()
@@ -69,11 +75,20 @@ def infer_intent(
     publisher_ratio = _ratio(archetypes, "publisher")
 
     scores = {
-        "commercial_hire": 0.45 * cpc_norm + 0.3 * float(has_hire) + 0.15 * local_service_ratio + 0.1 * directory_ratio,
-        "DIY_research": 0.45 * (1.0 - cpc_norm) + 0.35 * float(has_diy) + 0.2 * publisher_ratio,
-        "local_immediate": 0.55 * float(has_local) + 0.25 * local_service_ratio + 0.2 * directory_ratio,
-        "comparison": 0.65 * float(has_comparison) + 0.35 * (directory_ratio + publisher_ratio),
-        "brand_navigational": 0.8 * float(has_brand) + 0.2 * directory_ratio,
+        "commercial_hire": HIRE_WEIGHTS["cpc"] * cpc_norm
+        + HIRE_WEIGHTS["modifier"] * float(has_hire)
+        + HIRE_WEIGHTS["local_service"] * local_service_ratio
+        + HIRE_WEIGHTS["directory"] * directory_ratio,
+        "DIY_research": DIY_WEIGHTS["inverse_cpc"] * (1.0 - cpc_norm)
+        + DIY_WEIGHTS["modifier"] * float(has_diy)
+        + DIY_WEIGHTS["publisher"] * publisher_ratio,
+        "local_immediate": LOCAL_WEIGHTS["modifier"] * float(has_local)
+        + LOCAL_WEIGHTS["local_service"] * local_service_ratio
+        + LOCAL_WEIGHTS["directory"] * directory_ratio,
+        "comparison": COMPARISON_WEIGHTS["modifier"] * float(has_comparison)
+        + COMPARISON_WEIGHTS["serp_review_like"] * (directory_ratio + publisher_ratio),
+        "brand_navigational": BRAND_WEIGHTS["modifier"] * float(has_brand)
+        + BRAND_WEIGHTS["directory"] * directory_ratio,
     }
 
     ranking = sorted(scores.items(), key=lambda item: item[1], reverse=True)

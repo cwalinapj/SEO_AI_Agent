@@ -25,3 +25,8 @@ def test_count_serp_archetypes():
         "publisher": 1,
         "ecommerce": 1,
     }
+
+
+def test_substring_false_positives_are_not_misclassified():
+    assert classify_domain("forumshopping.com") == "local_service"
+    assert classify_domain("restore.com") == "local_service"

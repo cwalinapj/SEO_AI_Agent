@@ -38,6 +38,10 @@ def _is_match(domain: str, roots: set[str]) -> bool:
     return any(domain == root or domain.endswith(f".{root}") for root in roots)
 
 
+def _has_label(domain: str, label: str) -> bool:
+    return label in domain.split(".")
+
+
 def classify_domain(domain: str) -> str:
     """Classify a SERP domain into the expected archetype buckets."""
     normalized = _normalize_domain(domain)
@@ -46,9 +50,17 @@ def classify_domain(domain: str) -> str:
 
     if _is_match(normalized, _DIRECTORY_DOMAINS):
         return "directory"
-    if _is_match(normalized, _PUBLISHER_DOMAINS) or "forum" in normalized or "blog" in normalized:
+    if (
+        _is_match(normalized, _PUBLISHER_DOMAINS)
+        or _has_label(normalized, "forum")
+        or _has_label(normalized, "blog")
+    ):
         return "publisher"
-    if _is_match(normalized, _ECOMMERCE_DOMAINS) or "shop" in normalized or "store" in normalized:
+    if (
+        _is_match(normalized, _ECOMMERCE_DOMAINS)
+        or _has_label(normalized, "shop")
+        or _has_label(normalized, "store")
+    ):
         return "ecommerce"
     return "local_service"
 
