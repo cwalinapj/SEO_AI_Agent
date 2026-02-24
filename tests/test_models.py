@@ -2,6 +2,8 @@
 
 import pytest
 from serp_adapter.models import (
+    KeywordIntent,
+    KeywordUniverseRow,
     Location,
     NormalizedSerpResult,
     SerpResultItem,
@@ -114,3 +116,25 @@ class TestNormalizedSerpResult:
         assert result.location.country == "US"
         assert result.location.region == "CA"
         assert result.location.city == "San Jose"
+
+
+class TestKeywordModels:
+    def test_keyword_universe_row_defaults(self):
+        row = KeywordUniverseRow(kw="plumber near me", geo_bucket="US-CA-San Jose")
+        assert row.kw == "plumber near me"
+        assert row.geo_bucket == "US-CA-San Jose"
+        assert row.volume is None
+        assert row.cpc is None
+        assert row.difficulty is None
+        assert row.serp_top_domains == []
+
+    def test_keyword_intent_model(self):
+        intent = KeywordIntent(
+            intent_bucket="commercial_hire",
+            confidence=0.91,
+            scores={"commercial_hire": 0.91},
+            explanation="deterministic score",
+        )
+        assert intent.intent_bucket == "commercial_hire"
+        assert intent.confidence == 0.91
+        assert intent.scores["commercial_hire"] == 0.91

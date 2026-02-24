@@ -8,7 +8,7 @@ inspiration selection, keyword scoring, …) read *only* this format.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -74,3 +74,25 @@ class NormalizedSerpResult:
     ts: int  # Unix timestamp (seconds) of when the SERP was fetched
     results: List[SerpResultItem] = field(default_factory=list)
     source: Optional[SerpSource] = None
+
+
+@dataclass
+class KeywordUniverseRow:
+    """Canonical keyword universe row for a vertical + geo cohort."""
+
+    kw: str
+    geo_bucket: str
+    volume: Optional[int] = None
+    cpc: Optional[float] = None
+    difficulty: Optional[float] = None
+    serp_top_domains: List[str] = field(default_factory=list)
+
+
+@dataclass
+class KeywordIntent:
+    """Deterministic intent inference result for a keyword row."""
+
+    intent_bucket: str
+    confidence: float
+    scores: Dict[str, float]
+    explanation: str
