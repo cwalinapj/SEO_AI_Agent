@@ -1,0 +1,40 @@
+name = "tolldns-seo-agent"
+main = "src/worker.ts"
+compatibility_date = "2026-02-24"
+
+# If you use Node APIs in tooling, keep this:
+# compatibility_flags = ["nodejs_compat"]
+
+# --- Bindings ---
+# D1 (fill database_id after creation)
+[[d1_databases]]
+binding = "DB"
+database_name = "tolldns_seo"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+# Workers AI (embeddings etc. later; safe to keep now)
+[ai]
+binding = "AI"
+
+# Vectorize (optional for your semantic memories; create later if you want)
+# Comment these out if you’re not using Vectorize yet.
+[[vectorize]]
+binding = "USER_MEM"
+index_name = "user-memory"
+
+[[vectorize]]
+binding = "GLOBAL_TRENDS"
+index_name = "global-trends"
+
+[[vectorize]]
+binding = "DESIGN_CATALOG"
+index_name = "design-catalog"
+
+# --- Environment variables (non-secret) ---
+[vars]
+# Optional: default PSI strategy if site row doesn't specify
+DEFAULT_PSI_STRATEGY = "mobile"
+
+# --- Secrets (set via wrangler secret put) ---
+# PAGESPEED_API_KEY is required for PSI calls:
+#   npx wrangler secret put PAGESPEED_API_KEY
