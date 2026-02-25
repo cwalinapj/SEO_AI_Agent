@@ -41,3 +41,7 @@ CREATE TABLE IF NOT EXISTS seo_notes (
   message TEXT NOT NULL,
   tags_json TEXT NOT NULL              -- JSON array
 );
+
+APPLY:
+
+npx wrangler d1 migrations apply sitebuilder
