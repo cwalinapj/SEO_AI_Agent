@@ -5,6 +5,9 @@ compatibility_date = "2026-02-24"
 # If you use Node APIs in tooling, keep this:
 # compatibility_flags = ["nodejs_compat"]
 
+[triggers]
+crons = ["0 9 * * *"]
+
 # --- Bindings ---
 # D1 (fill database_id after creation)
 [[d1_databases]]
@@ -34,7 +37,13 @@ index_name = "design-catalog"
 [vars]
 # Optional: default PSI strategy if site row doesn't specify
 DEFAULT_PSI_STRATEGY = "mobile"
+# Optional: Apify actor for Google SERP (headless Chrome)
+APIFY_GOOGLE_ACTOR = "apify/google-search-scraper"
 
 # --- Secrets (set via wrangler secret put) ---
 # PAGESPEED_API_KEY is required for PSI calls:
 #   npx wrangler secret put PAGESPEED_API_KEY
+# APIFY_TOKEN is required for /serp/google/top20 and /serp/sample scraping:
+#   npx wrangler secret put APIFY_TOKEN
+# PROXY_CONTROL_SECRET protects /proxy/admin/* routes:
+#   npx wrangler secret put PROXY_CONTROL_SECRET
