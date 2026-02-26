@@ -39,5 +39,22 @@
 #### Required secret
 - `PAGESPEED_API_KEY`
 
+#### Optional WordPress plugin secret
+- `WP_PLUGIN_SHARED_SECRET`
+
+When set, the worker supports signed WordPress plugin SEO profile endpoints:
+
+- `POST /plugin/wp/schema/save` (store schema status/profile/JSON-LD)
+- `POST /plugin/wp/schema/profile` (fetch stored schema profile)
+- `POST /plugin/wp/redirects/save` (store audited broken-link redirect paths)
+- `POST /plugin/wp/redirects/profile` (fetch redirect profile)
+
+Request signing requirements:
+
+- `X-Plugin-Timestamp`
+- `X-Plugin-Signature` HMAC-SHA256 over `${timestamp}.${rawBody}`
+- 5-minute replay window enforcement
+
 ```bash
 npx wrangler secret put PAGESPEED_API_KEY
+npx wrangler secret put WP_PLUGIN_SHARED_SECRET

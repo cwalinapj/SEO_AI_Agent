@@ -1,9 +1,11 @@
 export interface Env {
   DB: D1Database;
   PAGESPEED_API_KEY: string;
+  WP_PLUGIN_SHARED_SECRET?: string;
 }
 
 const COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
+const PLUGIN_TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 
 function nowMs(): number {
   return Date.now();
@@ -13,6 +15,273 @@ function toDateYYYYMMDD(ms: number): string {
 }
 function uuid(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
+}
+
+function toHex(bytes: ArrayBuffer): string {
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function hmacSha256Hex(secret: string, payload: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signed = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return toHex(signed);
+}
+
+function safeEqualHex(left: string, right: string): boolean {
+  const a = left.trim().toLowerCase();
+  const b = right.trim().toLowerCase();
+  if (!a || !b || a.length !== b.length) {
+    return false;
+  }
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+function parseTimestampMs(raw: string): number | null {
+  const v = Number(raw);
+  if (!Number.isFinite(v)) {
+    return null;
+  }
+  if (v > 1e12) {
+    return Math.round(v);
+  }
+  if (v > 1e9) {
+    return Math.round(v * 1000);
+  }
+  return null;
+}
+
+function normalizeRedirectPath(rawPath: unknown): string | null {
+  let path = String(rawPath ?? "").trim();
+  if (!path) {
+    return null;
+  }
+
+  if (/^https?:\/\//i.test(path)) {
+    try {
+      const parsed = new URL(path);
+      path = `${parsed.pathname}${parsed.search}`;
+    } catch {
+      return null;
+    }
+  }
+
+  if (!path.startsWith("/")) {
+    path = `/${path}`;
+  }
+
+  const [pathname, query = ""] = path.split("?");
+  const collapsedPath = pathname.replace(/\/+/g, "/");
+  path = query ? `${collapsedPath}?${query}` : collapsedPath;
+
+  if (path.length > 240) {
+    return null;
+  }
+
+  if (
+    path === "/" ||
+    path.startsWith("/wp-admin") ||
+    path.startsWith("/wp-login.php") ||
+    path.startsWith("/wp-json")
+  ) {
+    return null;
+  }
+
+  return path;
+}
+
+function clampInt(input: unknown, min: number, max: number, fallback: number): number {
+  const asNumber = Number(input);
+  if (!Number.isFinite(asNumber)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.round(asNumber)));
+}
+
+function parseJsonObject(input: unknown): Record<string, unknown> | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+  return input as Record<string, unknown>;
+}
+
+type VerifiedPluginRequest =
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; response: Response };
+
+async function verifySignedPluginRequest(req: Request, env: Env): Promise<VerifiedPluginRequest> {
+  const secret = String(env.WP_PLUGIN_SHARED_SECRET || "").trim();
+  if (!secret) {
+    return {
+      ok: false,
+      response: Response.json({ ok: false, error: "WP plugin secret not configured." }, { status: 503 }),
+    };
+  }
+
+  const timestampHeader = req.headers.get("x-plugin-timestamp") || "";
+  const signatureHeader = req.headers.get("x-plugin-signature") || "";
+  if (!timestampHeader || !signatureHeader) {
+    return {
+      ok: false,
+      response: Response.json({ ok: false, error: "Missing plugin signature headers." }, { status: 401 }),
+    };
+  }
+
+  const tsMs = parseTimestampMs(timestampHeader);
+  if (!tsMs || Math.abs(nowMs() - tsMs) > PLUGIN_TIMESTAMP_WINDOW_MS) {
+    return {
+      ok: false,
+      response: Response.json({ ok: false, error: "Invalid or expired plugin timestamp." }, { status: 401 }),
+    };
+  }
+
+  const rawBody = await req.text();
+  const expectedSignature = await hmacSha256Hex(secret, `${timestampHeader}.${rawBody}`);
+  if (!safeEqualHex(signatureHeader, expectedSignature)) {
+    return {
+      ok: false,
+      response: Response.json({ ok: false, error: "Invalid plugin signature." }, { status: 401 }),
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(rawBody || "{}");
+    const body = parseJsonObject(parsed);
+    if (!body) {
+      return {
+        ok: false,
+        response: Response.json({ ok: false, error: "Invalid JSON body." }, { status: 400 }),
+      };
+    }
+    return { ok: true, body };
+  } catch {
+    return {
+      ok: false,
+      response: Response.json({ ok: false, error: "Invalid JSON body." }, { status: 400 }),
+    };
+  }
+}
+
+async function saveSchemaProfile(
+  env: Env,
+  sessionId: string,
+  schemaStatus: string,
+  schemaProfile: Record<string, unknown> | null,
+  schemaJsonLd: string | null
+) {
+  const now = nowMs();
+  await env.DB.prepare(
+    `INSERT INTO wp_schema_profiles(session_id, schema_status, schema_profile_json, schema_jsonld, updated_at)
+     VALUES(?,?,?,?,?)
+     ON CONFLICT(session_id) DO UPDATE SET
+       schema_status = excluded.schema_status,
+       schema_profile_json = excluded.schema_profile_json,
+       schema_jsonld = excluded.schema_jsonld,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      sessionId,
+      schemaStatus,
+      schemaProfile ? JSON.stringify(schemaProfile) : null,
+      schemaJsonLd,
+      now
+    )
+    .run();
+}
+
+async function loadSchemaProfile(env: Env, sessionId: string): Promise<{
+  schema_status: string;
+  schema_profile: Record<string, unknown> | null;
+  schema_jsonld: string | null;
+}> {
+  const row = await env.DB.prepare(
+    "SELECT schema_status, schema_profile_json, schema_jsonld FROM wp_schema_profiles WHERE session_id = ?"
+  )
+    .bind(sessionId)
+    .first();
+
+  if (!row) {
+    return { schema_status: "not_started", schema_profile: null, schema_jsonld: null };
+  }
+
+  let profile: Record<string, unknown> | null = null;
+  if (typeof row.schema_profile_json === "string" && row.schema_profile_json.trim()) {
+    try {
+      profile = parseJsonObject(JSON.parse(row.schema_profile_json));
+    } catch {
+      profile = null;
+    }
+  }
+
+  return {
+    schema_status: String(row.schema_status || "not_started"),
+    schema_profile: profile,
+    schema_jsonld: typeof row.schema_jsonld === "string" ? row.schema_jsonld : null,
+  };
+}
+
+async function saveRedirectProfile(
+  env: Env,
+  sessionId: string,
+  checkedLinkCount: number,
+  brokenLinkCount: number,
+  redirectPaths: string[]
+) {
+  const now = nowMs();
+  await env.DB.prepare(
+    `INSERT INTO wp_redirect_profiles(session_id, checked_link_count, broken_link_count, redirect_paths_json, updated_at)
+     VALUES(?,?,?,?,?)
+     ON CONFLICT(session_id) DO UPDATE SET
+       checked_link_count = excluded.checked_link_count,
+       broken_link_count = excluded.broken_link_count,
+       redirect_paths_json = excluded.redirect_paths_json,
+       updated_at = excluded.updated_at`
+  )
+    .bind(sessionId, checkedLinkCount, brokenLinkCount, JSON.stringify(redirectPaths), now)
+    .run();
+}
+
+async function loadRedirectProfile(env: Env, sessionId: string): Promise<{
+  checked_link_count: number;
+  broken_link_count: number;
+  redirect_paths: string[];
+}> {
+  const row = await env.DB.prepare(
+    "SELECT checked_link_count, broken_link_count, redirect_paths_json FROM wp_redirect_profiles WHERE session_id = ?"
+  )
+    .bind(sessionId)
+    .first();
+
+  if (!row) {
+    return { checked_link_count: 0, broken_link_count: 0, redirect_paths: [] };
+  }
+
+  let redirectPaths: string[] = [];
+  if (typeof row.redirect_paths_json === "string" && row.redirect_paths_json.trim()) {
+    try {
+      const parsed = JSON.parse(row.redirect_paths_json);
+      if (Array.isArray(parsed)) {
+        redirectPaths = parsed.map((item) => String(item)).filter(Boolean);
+      }
+    } catch {
+      redirectPaths = [];
+    }
+  }
+
+  return {
+    checked_link_count: clampInt(row.checked_link_count, 0, 1000000, 0),
+    broken_link_count: clampInt(row.broken_link_count, 0, 1000000, redirectPaths.length),
+    redirect_paths: redirectPaths.slice(0, 200),
+  };
 }
 
 // --- PSI extraction helpers ---
@@ -211,6 +480,116 @@ async function insertSnapshot(env: Env, siteId: string, strategy: string, trigge
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+
+    if (req.method === "POST" && url.pathname === "/plugin/wp/schema/save") {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (!verified.ok) {
+        return verified.response;
+      }
+
+      const sessionId = String(verified.body.session_id || "").trim();
+      if (!sessionId) {
+        return Response.json({ ok: false, error: "session_id required." }, { status: 400 });
+      }
+
+      const schemaStatus = String(verified.body.schema_status || "not_started").trim().slice(0, 64) || "not_started";
+      const schemaProfile = parseJsonObject(verified.body.schema_profile);
+      const schemaJsonLd = typeof verified.body.schema_jsonld === "string" ? verified.body.schema_jsonld : null;
+
+      await saveSchemaProfile(env, sessionId, schemaStatus, schemaProfile, schemaJsonLd);
+      return Response.json({ ok: true, session_id: sessionId, schema_status: schemaStatus });
+    }
+
+    if (req.method === "POST" && url.pathname === "/plugin/wp/schema/profile") {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (!verified.ok) {
+        return verified.response;
+      }
+
+      const sessionId = String(verified.body.session_id || "").trim();
+      if (!sessionId) {
+        return Response.json({ ok: false, error: "session_id required." }, { status: 400 });
+      }
+
+      const profile = await loadSchemaProfile(env, sessionId);
+      return Response.json({
+        ok: true,
+        session_id: sessionId,
+        schema_status: profile.schema_status,
+        schema_profile: profile.schema_profile,
+        schema_jsonld: profile.schema_jsonld,
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/plugin/wp/redirects/save") {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (!verified.ok) {
+        return verified.response;
+      }
+
+      const sessionId = String(verified.body.session_id || "").trim();
+      if (!sessionId) {
+        return Response.json({ ok: false, error: "session_id required." }, { status: 400 });
+      }
+
+      const rawPaths = Array.isArray(verified.body.redirect_paths) ? verified.body.redirect_paths : [];
+      const normalizedPaths: string[] = [];
+      const seen = new Set<string>();
+      for (const rawPath of rawPaths) {
+        const normalized = normalizeRedirectPath(rawPath);
+        if (!normalized || seen.has(normalized)) {
+          continue;
+        }
+        seen.add(normalized);
+        normalizedPaths.push(normalized);
+        if (normalizedPaths.length >= 200) {
+          break;
+        }
+      }
+
+      const checkedLinkCount = clampInt(
+        verified.body.checked_link_count,
+        0,
+        1000000,
+        normalizedPaths.length
+      );
+      const brokenLinkCount = clampInt(
+        verified.body.broken_link_count,
+        0,
+        1000000,
+        normalizedPaths.length
+      );
+
+      await saveRedirectProfile(env, sessionId, checkedLinkCount, brokenLinkCount, normalizedPaths);
+      return Response.json({
+        ok: true,
+        session_id: sessionId,
+        checked_link_count: checkedLinkCount,
+        broken_link_count: brokenLinkCount,
+        redirect_paths: normalizedPaths,
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/plugin/wp/redirects/profile") {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (!verified.ok) {
+        return verified.response;
+      }
+
+      const sessionId = String(verified.body.session_id || "").trim();
+      if (!sessionId) {
+        return Response.json({ ok: false, error: "session_id required." }, { status: 400 });
+      }
+
+      const profile = await loadRedirectProfile(env, sessionId);
+      return Response.json({
+        ok: true,
+        session_id: sessionId,
+        checked_link_count: profile.checked_link_count,
+        broken_link_count: profile.broken_link_count,
+        redirect_paths: profile.redirect_paths,
+      });
+    }
 
     // POST /deploy/notify  {site_id, deploy_hash}
     if (req.method === "POST" && url.pathname === "/deploy/notify") {
