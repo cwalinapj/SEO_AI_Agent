@@ -1,5 +1,19 @@
 PRAGMA foreign_keys = OFF;
 
+-- Ensure canonical URL registry exists for FK integrity in environments that
+-- previously skipped unified schema migrations.
+CREATE TABLE IF NOT EXISTS urls (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  url TEXT NOT NULL,
+  url_hash TEXT NOT NULL,
+  domain TEXT NOT NULL COLLATE NOCASE,
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  UNIQUE(url_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_urls_domain
+  ON urls(domain);
+
 -- Canonical usage ledger for budget explainability/enforcement.
 CREATE TABLE IF NOT EXISTS moz_job_usage (
   job_id TEXT PRIMARY KEY,
