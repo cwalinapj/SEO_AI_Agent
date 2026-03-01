@@ -33,6 +33,10 @@ index_name = "global-trends"
 binding = "DESIGN_CATALOG"
 index_name = "design-catalog"
 
+[[r2_buckets]]
+binding = "MEMORY_R2"
+bucket_name = "seo-ai-memory"
+
 # --- Environment variables (non-secret) ---
 [vars]
 # Optional: default PSI strategy if site row doesn't specify

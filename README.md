@@ -112,6 +112,8 @@ Worker endpoints:
 - `GET /v1/sites/{id}/moz/profile`
 - `POST /v1/sites/{id}/moz/profile`
 - `POST /v1/sites/{id}/moz/run`
+- `POST /v1/sites/{id}/memory/upsert`
+- `GET /v1/sites/{id}/memory/search?q=...`
 - `POST /moz/url-metrics`
 - `POST /moz/anchor-text`
 - `POST /moz/linking-root-domains`
@@ -132,6 +134,8 @@ Signed WP plugin endpoint namespace (`x-plugin-timestamp` + `x-plugin-signature`
 - `POST /plugin/wp/v1/sites/{id}/step3/tasks`
 - `POST /plugin/wp/v1/sites/{id}/tasks/{task_id}`
 - `POST /plugin/wp/v1/sites/{id}/tasks/bulk`
+- `POST /plugin/wp/v1/sites/{id}/memory/upsert`
+- `POST /plugin/wp/v1/sites/{id}/memory/search`
 
 API and integration docs:
 
@@ -481,6 +485,7 @@ Lease payload example:
 #### Required secrets
 - `PAGESPEED_API_KEY`
 - `DECODO_API_KEY` (recommended primary for SERP/page tasks)
+- `OPENAI_API_KEY` (required for semantic memory embeddings)
 
 #### Optional WordPress plugin secret
 - `WP_PLUGIN_SHARED_SECRET`
@@ -501,6 +506,7 @@ Request signing requirements:
 ```bash
 npx wrangler secret put PAGESPEED_API_KEY
 npx wrangler secret put DECODO_API_KEY
+npx wrangler secret put OPENAI_API_KEY
 npx wrangler secret put APIFY_TOKEN
 npx wrangler secret put WP_PLUGIN_SHARED_SECRET
 npx wrangler secret put PROXY_CONTROL_SECRET
