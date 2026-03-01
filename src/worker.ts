@@ -6,6 +6,12 @@ export interface Env {
   MOZ_API_TOKEN?: string;
   DECODO_API_KEY?: string;
   DECODO_TASKS_URL?: string;
+  SERP_PROVIDER_PRIMARY?: string;
+  SERP_PROVIDER_FALLBACK?: string;
+  PAGE_FETCH_PROVIDER_PRIMARY?: string;
+  PAGE_FETCH_PROVIDER_FALLBACK?: string;
+  PROVIDER_RETRY_MAX?: string;
+  PROVIDER_RETRY_BACKOFF_MS?: string;
   APIFY_TOKEN?: string;
   APIFY_GOOGLE_ACTOR?: string;
   PROXY_CONTROL_SECRET?: string;
@@ -388,11 +394,17 @@ function normalizeRegion(input: unknown): Record<string, unknown> {
 }
 
 function normalizeSerpProvider(input: unknown): SerpProvider {
-  return cleanString(input, 40).toLowerCase() === "decodo_serp_api" ? "decodo_serp_api" : "headless_google";
+  const raw = cleanString(input, 40).toLowerCase();
+  if (raw === "decodo_serp_api" || raw === "decodo") return "decodo_serp_api";
+  if (raw === "apify" || raw === "headless_google") return "headless_google";
+  return "headless_google";
 }
 
 function normalizePageProvider(input: unknown): PageProvider {
-  return cleanString(input, 40).toLowerCase() === "decodo_web_api" ? "decodo_web_api" : "direct_fetch";
+  const raw = cleanString(input, 40).toLowerCase();
+  if (raw === "decodo_web_api" || raw === "decodo") return "decodo_web_api";
+  if (raw === "direct_fetch" || raw === "apify") return "direct_fetch";
+  return "direct_fetch";
 }
 
 function normalizeGeoProvider(input: unknown): GeoProvider {
@@ -468,6 +480,41 @@ function mapGeoForProvider(
     return { region: out, decodoGeoLabel: metro };
   }
   return { region: out, decodoGeoLabel: null };
+}
+
+function retryMax(env: Env): number {
+  return clampInt(env.PROVIDER_RETRY_MAX, 1, 5, 2);
+}
+
+function retryBackoffMs(env: Env): number {
+  return clampInt(env.PROVIDER_RETRY_BACKOFF_MS, 50, 5000, 250);
+}
+
+function resolveSerpPrimary(env: Env, explicit: SerpProvider | null): SerpProvider {
+  if (explicit) return explicit;
+  return normalizeSerpProvider(env.SERP_PROVIDER_PRIMARY || "decodo_serp_api");
+}
+
+function resolveSerpFallback(env: Env): SerpProvider | null {
+  const raw = cleanString(env.SERP_PROVIDER_FALLBACK, 40);
+  if (!raw) return "headless_google";
+  const normalized = normalizeSerpProvider(raw);
+  return normalized;
+}
+
+function resolvePagePrimary(env: Env, explicit: PageProvider | null): PageProvider {
+  if (explicit) return explicit;
+  return normalizePageProvider(env.PAGE_FETCH_PROVIDER_PRIMARY || "decodo_web_api");
+}
+
+function resolvePageFallback(env: Env): PageProvider | null {
+  const raw = cleanString(env.PAGE_FETCH_PROVIDER_FALLBACK, 40);
+  if (!raw) return "direct_fetch";
+  return normalizePageProvider(raw);
+}
+
+async function sleepMs(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildGoogleQueryUrl(phrase: string, region: Record<string, unknown>): string {
@@ -1168,6 +1215,7 @@ async function insertSerpRun(
     parserVersion: string;
     rawPayloadSha256: string | null;
     extractorMode: string;
+    fallbackReason?: string | null;
   }
 ): Promise<void> {
   await env.DB.prepare(
@@ -1175,9 +1223,9 @@ async function insertSerpRun(
       serp_id, user_id, phrase, region_json, device, engine, provider, actor,
       run_id, status, error,
       keyword_norm, region_key, device_key, serp_key,
-      parser_version, raw_payload_sha256, extractor_mode,
+      parser_version, raw_payload_sha256, extractor_mode, fallback_reason,
       created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       input.serpId,
@@ -1198,6 +1246,7 @@ async function insertSerpRun(
       input.parserVersion,
       input.rawPayloadSha256,
       input.extractorMode,
+      cleanString(input.fallbackReason, 300) || null,
       nowMs()
     )
     .run();
@@ -1213,6 +1262,7 @@ async function updateSerpRunStatus(
     parserVersion?: string | null;
     rawPayloadSha256?: string | null;
     extractorMode?: string | null;
+    fallbackReason?: string | null;
   }
 ): Promise<void> {
   await env.DB.prepare(
@@ -1222,7 +1272,8 @@ async function updateSerpRunStatus(
          run_id = ?,
          parser_version = COALESCE(?, parser_version),
          raw_payload_sha256 = COALESCE(?, raw_payload_sha256),
-         extractor_mode = COALESCE(?, extractor_mode)
+         extractor_mode = COALESCE(?, extractor_mode),
+         fallback_reason = COALESCE(?, fallback_reason)
      WHERE serp_id = ?`
   )
     .bind(
@@ -1232,6 +1283,7 @@ async function updateSerpRunStatus(
       cleanString(extras?.parserVersion, 120) || null,
       cleanString(extras?.rawPayloadSha256, 128) || null,
       cleanString(extras?.extractorMode, 80) || null,
+      cleanString(extras?.fallbackReason, 300) || null,
       serpId
     )
     .run();
@@ -1289,7 +1341,7 @@ type SerpCollectionInput = {
   device: "mobile" | "desktop";
   maxResults: number;
   proxyUrl: string | null;
-  provider: SerpProvider;
+  provider: SerpProvider | null;
   geoProvider: GeoProvider;
   geoLabel?: string | null;
   auditJobId?: string | null;
@@ -1322,11 +1374,13 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
   const deviceKey = input.device;
   const serpKey = await buildSerpKey(keywordNorm, regionKey, deviceKey, toDateYYYYMMDD(nowMs()));
 
+  const primaryProvider = resolveSerpPrimary(env, input.provider);
+  const fallbackProvider = resolveSerpFallback(env);
   const actor =
-    input.provider === "decodo_serp_api"
+    primaryProvider === "decodo_serp_api"
       ? "decodo/google_search"
       : cleanString(env.APIFY_GOOGLE_ACTOR ?? "apify/google-search-scraper", 200);
-  const providerLabel = input.provider === "decodo_serp_api" ? "decodo-serp-api" : "apify-headless-chrome";
+  const providerLabel = primaryProvider === "decodo_serp_api" ? "decodo-serp-api" : "apify-headless-chrome";
   await insertSerpRun(env, {
     serpId,
     userId: input.userId,
@@ -1343,9 +1397,10 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
     regionKey,
     deviceKey,
     serpKey,
-    parserVersion: input.provider === "decodo_serp_api" ? "decodo-google-v1" : "apify-google-v1",
+    parserVersion: primaryProvider === "decodo_serp_api" ? "decodo-google-v1" : "apify-google-v1",
     rawPayloadSha256: null,
-    extractorMode: input.provider === "decodo_serp_api" ? "decodo_serp_api" : "apify",
+    extractorMode: primaryProvider === "decodo_serp_api" ? "decodo_serp_api" : "apify",
+    fallbackReason: null,
   });
 
   try {
@@ -1361,16 +1416,32 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
         }
       | null = null;
 
-    if (input.provider === "decodo_serp_api") {
+    if (primaryProvider === "decodo_serp_api") {
       try {
-        const decodo = await fetchGoogleTop20ViaDecodo(
-          env,
-          input.phrase,
-          input.region,
-          input.device,
-          input.maxResults,
-          input.geoProvider === "decodo_geo" ? cleanString(input.geoLabel, 120) || null : null
-        );
+        let decodo: Awaited<ReturnType<typeof fetchGoogleTop20ViaDecodo>> | null = null;
+        let lastErr: string | null = null;
+        for (let attempt = 1; attempt <= retryMax(env); attempt += 1) {
+          try {
+            decodo = await fetchGoogleTop20ViaDecodo(
+              env,
+              input.phrase,
+              input.region,
+              input.device,
+              input.maxResults,
+              input.geoProvider === "decodo_geo" ? cleanString(input.geoLabel, 120) || null : null
+            );
+            if ((decodo.rows ?? []).length > 0) break;
+            lastErr = "empty_decodo_rows";
+          } catch (err) {
+            lastErr = cleanString((err as Error)?.message ?? err, 180) || "decodo_error";
+          }
+          if (attempt < retryMax(env)) {
+            await sleepMs(retryBackoffMs(env) * attempt);
+          }
+        }
+        if (!decodo || decodo.rows.length < 1) {
+          throw new Error(lastErr || "decodo_failed_after_retries");
+        }
         collected = {
           ...decodo,
           extractorMode: "decodo_serp_api",
@@ -1378,19 +1449,23 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
         };
       } catch (decodoError) {
         const fallbackReason = `decodo_failed:${cleanString((decodoError as Error)?.message ?? decodoError, 180)}`;
-        const apify = await fetchGoogleTop20ViaApify(
-          env,
-          input.phrase,
-          input.region,
-          input.device,
-          input.maxResults,
-          input.proxyUrl
-        );
-        collected = {
-          ...apify,
-          extractorMode: "apify",
-          fallbackReason,
-        };
+        if (fallbackProvider === "headless_google") {
+          const apify = await fetchGoogleTop20ViaApify(
+            env,
+            input.phrase,
+            input.region,
+            input.device,
+            input.maxResults,
+            input.proxyUrl
+          );
+          collected = {
+            ...apify,
+            extractorMode: "apify",
+            fallbackReason,
+          };
+        } else {
+          throw decodoError;
+        }
       }
     } else {
       const apify = await fetchGoogleTop20ViaApify(
@@ -1428,6 +1503,7 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
       parserVersion: collected.extractorMode === "decodo_serp_api" ? "decodo-google-v1" : "apify-google-v1",
       rawPayloadSha256: collected.rawPayloadSha256,
       extractorMode: collected.extractorMode,
+      fallbackReason: collected.fallbackReason,
     });
     if (input.auditJobId) {
       await createArtifactRecord(env, {
@@ -4068,7 +4144,8 @@ type Step2PageFetchResult = {
 async function fetchPageHtmlByProvider(
   env: Env,
   input: {
-    pageProvider: PageProvider;
+    pageProvider: PageProvider | null;
+    fallbackPageProvider?: PageProvider | null;
     geoProvider: GeoProvider;
     geoLabel: string;
     url: string;
@@ -4076,7 +4153,9 @@ async function fetchPageHtmlByProvider(
     cache: { etag: string | null; last_modified: string | null; html: string | null } | null;
   }
 ): Promise<Step2PageFetchResult> {
-  if (input.pageProvider === "decodo_web_api") {
+  const primaryProvider = resolvePagePrimary(env, input.pageProvider);
+  const fallbackProvider = input.fallbackPageProvider ?? resolvePageFallback(env);
+  if (primaryProvider === "decodo_web_api") {
     try {
       const decodo = await fetchPageViaDecodo(env, {
         url: input.url,
@@ -4095,6 +4174,9 @@ async function fetchPageHtmlByProvider(
           provider_task_id: decodo.taskId,
         };
       }
+      if (fallbackProvider !== "direct_fetch") {
+        throw new Error("page_provider_fallback_not_supported");
+      }
       const direct = await fetchHtmlWithTimeout(
         input.url,
         input.timeoutMs,
@@ -4112,6 +4194,9 @@ async function fetchPageHtmlByProvider(
         provider_task_id: decodo.taskId,
       };
     } catch (error) {
+      if (fallbackProvider !== "direct_fetch") {
+        throw error;
+      }
       const direct = await fetchHtmlWithTimeout(
         input.url,
         input.timeoutMs,
@@ -8463,7 +8548,7 @@ async function runSerpWatchlist(
       device: candidate.device,
       maxResults: candidate.max_results,
       proxyUrl: activeLease?.proxy_url ?? null,
-      provider: "headless_google",
+      provider: resolveSerpPrimary(env, null),
       geoProvider: "proxy_lease_pool",
       geoLabel: cleanString(region.city ?? region.region, 120) || "us",
       auditJobId: jobId,
@@ -10824,7 +10909,10 @@ export default {
         siteIdHint && (await loadStep1Site(env, siteIdHint))
           ? await loadSiteProviderProfile(env, siteIdHint)
           : null;
-      const serpProvider = siteProfile?.serp_provider ?? normalizeSerpProvider(body.serp_provider);
+      const serpProvider = resolveSerpPrimary(
+        env,
+        siteProfile?.serp_provider ?? (cleanString(body.serp_provider, 40) ? normalizeSerpProvider(body.serp_provider) : null)
+      );
       const geoProvider = siteProfile?.geo_provider ?? normalizeGeoProvider(body.geo_provider);
       const geoMapped = mapGeoForProvider(
         cleanString(body.geo_label, 120) || cleanString(region.city ?? region.region, 120) || "us",
@@ -11752,7 +11840,10 @@ export default {
       }
       const site = siteId ? await loadStep1Site(env, siteId) : null;
       const providers = site ? await loadSiteProviderProfile(env, site.site_id) : null;
-      const pageProvider = providers?.page_provider ?? normalizePageProvider(body.page_provider);
+      const pageProvider = resolvePagePrimary(
+        env,
+        providers?.page_provider ?? (cleanString(body.page_provider, 40) ? normalizePageProvider(body.page_provider) : null)
+      );
       const geoProvider = providers?.geo_provider ?? normalizeGeoProvider(body.geo_provider);
       const geoLabel = cleanString(body.geo_label, 120) || "us";
       const jobId = await createJobRecord(env, {

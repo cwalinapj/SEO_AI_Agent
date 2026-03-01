@@ -480,7 +480,7 @@ Lease payload example:
 
 #### Required secrets
 - `PAGESPEED_API_KEY`
-- `APIFY_TOKEN`
+- `DECODO_API_KEY` (recommended primary for SERP/page tasks)
 
 #### Optional WordPress plugin secret
 - `WP_PLUGIN_SHARED_SECRET`
@@ -500,6 +500,7 @@ Request signing requirements:
 
 ```bash
 npx wrangler secret put PAGESPEED_API_KEY
+npx wrangler secret put DECODO_API_KEY
 npx wrangler secret put APIFY_TOKEN
 npx wrangler secret put WP_PLUGIN_SHARED_SECRET
 npx wrangler secret put PROXY_CONTROL_SECRET
@@ -508,3 +509,15 @@ npx wrangler secret put PROXY_CONTROL_SECRET
 Optional var in `wrangler.toml`:
 
 - `APIFY_GOOGLE_ACTOR` (default: `apify/google-search-scraper`)
+- `SERP_PROVIDER_PRIMARY` (default: `decodo_serp_api`)
+- `SERP_PROVIDER_FALLBACK` (default: `headless_google`)
+- `PAGE_FETCH_PROVIDER_PRIMARY` (default: `decodo_web_api`)
+- `PAGE_FETCH_PROVIDER_FALLBACK` (default: `direct_fetch`)
+- `PROVIDER_RETRY_MAX` (default: `2`)
+- `PROVIDER_RETRY_BACKOFF_MS` (default: `250`)
+
+Provider failover behavior:
+
+- SERP: Decodo retries first, then optional Apify fallback.
+- Page fetch: Decodo retries first, then optional `direct_fetch` fallback.
+- `serp_runs` persists `extractor_mode` and `fallback_reason`.
