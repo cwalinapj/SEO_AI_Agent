@@ -5,6 +5,7 @@ import sqlite3
 
 
 MIG_0002 = Path(__file__).resolve().parents[1] / "migrations" / "0002_serp.sql"
+MIG_0010 = Path(__file__).resolve().parents[1] / "migrations" / "0010_step1_keyword_research.sql"
 MIG_0004 = Path(__file__).resolve().parents[1] / "migrations" / "0004_pagespeed_monitoring.sql"
 MIG_0015 = Path(__file__).resolve().parents[1] / "migrations" / "0015_unified_d1_step2_step3.sql"
 MIG_0017 = Path(__file__).resolve().parents[1] / "migrations" / "0017_moz_snapshots_and_budgeting.sql"
@@ -14,6 +15,7 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(MIG_0002.read_text())
+    conn.executescript(MIG_0010.read_text())
     conn.executescript(MIG_0004.read_text())
     conn.executescript(MIG_0015.read_text())
     conn.executescript(MIG_0017.read_text())

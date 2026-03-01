@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS moz_url_metrics_snapshots (
   linking_domains INTEGER,
   external_links INTEGER,
   metrics_json TEXT,
+  rows_used INTEGER NOT NULL DEFAULT 0,
+  site_run_id TEXT,
   job_id TEXT,
   created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
   UNIQUE(url_id, collected_day, geo_key)
@@ -27,41 +29,53 @@ CREATE TABLE IF NOT EXISTS moz_anchor_text_snapshots (
   snapshot_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   target_url_id TEXT NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
   collected_day TEXT NOT NULL,
+  geo_key TEXT NOT NULL DEFAULT 'us',
   top_anchors_json TEXT NOT NULL,
   total_anchor_rows INTEGER,
   totals_json TEXT,
+  rows_used INTEGER NOT NULL DEFAULT 0,
+  site_run_id TEXT,
   job_id TEXT,
   created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-  UNIQUE(target_url_id, collected_day)
+  UNIQUE(target_url_id, collected_day, geo_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_moz_anchor_target_day
   ON moz_anchor_text_snapshots(target_url_id, collected_day DESC);
+CREATE INDEX IF NOT EXISTS idx_moz_anchor_day
+  ON moz_anchor_text_snapshots(collected_day, geo_key, created_at DESC);
 
 -- Moz linking root domains snapshots (daily per target URL)
 CREATE TABLE IF NOT EXISTS moz_linking_root_domains_snapshots (
   snapshot_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   target_url_id TEXT NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
   collected_day TEXT NOT NULL,
+  geo_key TEXT NOT NULL DEFAULT 'us',
   top_domains_json TEXT NOT NULL,
   total_domain_rows INTEGER,
   totals_json TEXT,
+  rows_used INTEGER NOT NULL DEFAULT 0,
+  site_run_id TEXT,
   job_id TEXT,
   created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-  UNIQUE(target_url_id, collected_day)
+  UNIQUE(target_url_id, collected_day, geo_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_moz_root_domains_target_day
   ON moz_linking_root_domains_snapshots(target_url_id, collected_day DESC);
+CREATE INDEX IF NOT EXISTS idx_moz_root_domains_day
+  ON moz_linking_root_domains_snapshots(collected_day, geo_key, created_at DESC);
 
 -- Optional cluster-level intersect snapshots for team outreach tasks
 CREATE TABLE IF NOT EXISTS moz_link_intersect_snapshots (
   snapshot_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-  site_id TEXT REFERENCES sites(site_id) ON DELETE SET NULL,
+  site_id TEXT REFERENCES wp_ai_seo_sites(site_id) ON DELETE SET NULL,
   cluster TEXT,
   collected_day TEXT NOT NULL,
   intersect_json TEXT NOT NULL,
   totals_json TEXT,
+  rows_used INTEGER NOT NULL DEFAULT 0,
+  site_run_id TEXT,
   job_id TEXT,
   created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );

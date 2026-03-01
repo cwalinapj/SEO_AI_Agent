@@ -1942,6 +1942,45 @@ async function recordMozJobUsage(
     profile: MozProfileName | null;
   }
 ): Promise<void> {
+  const endpoint =
+    input.jobType === "moz_linking_root_domains"
+      ? "root_domains"
+      : input.jobType === "moz_url_metrics"
+        ? "url_metrics"
+        : input.jobType === "moz_anchor_text"
+          ? "anchor_text"
+          : input.jobType === "moz_link_intersect"
+            ? "intersect"
+            : input.jobType === "moz_usage_data"
+              ? "usage"
+              : input.jobType === "moz_index_metadata"
+                ? "index_metadata"
+                : input.jobType === "moz_profile_run"
+                  ? "profile_run"
+                  : cleanString(input.jobType, 80).toLowerCase();
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO moz_job_usage (
+      job_id, site_id, collected_day, endpoint, rows_used, meta_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      cleanString(input.jobId, 120),
+      cleanString(input.siteId, 120) || null,
+      input.day,
+      endpoint,
+      Math.max(0, input.rowsUsed),
+      safeJsonStringify(
+        {
+          degraded_mode: input.degradedMode,
+          fallback_reason: cleanString(input.fallbackReason, 200) || null,
+          profile: input.profile,
+        },
+        4000
+      ),
+      Math.floor(nowMs() / 1000)
+    )
+    .run();
+  // Legacy compatibility table retained until old dashboards are removed.
   await env.DB.prepare(
     `INSERT INTO moz_job_row_usage (
       usage_id, site_id, collected_day, job_id, job_type, rows_used,
@@ -1966,7 +2005,7 @@ async function recordMozJobUsage(
 async function loadMozMonthlyUsage(env: Env, siteId: string, monthPrefix: string): Promise<number> {
   const internal = await env.DB.prepare(
     `SELECT SUM(rows_used) AS total_rows
-     FROM moz_job_row_usage
+     FROM moz_job_usage
      WHERE site_id = ?
        AND collected_day LIKE ?`
   )
@@ -1983,6 +2022,27 @@ async function loadMozMonthlyUsage(env: Env, siteId: string, monthPrefix: string
     0,
     clampInt(provider?.max_rows_used, 0, 10_000_000_000, 0)
   );
+}
+
+async function loadMozMonthlyUsageBreakdown(
+  env: Env,
+  siteId: string,
+  monthPrefix: string
+): Promise<Array<{ endpoint: string; rows_used: number }>> {
+  const rows = await env.DB.prepare(
+    `SELECT endpoint, SUM(rows_used) AS rows_used
+     FROM moz_job_usage
+     WHERE site_id = ?
+       AND collected_day LIKE ?
+     GROUP BY endpoint
+     ORDER BY rows_used DESC`
+  )
+    .bind(siteId, `${monthPrefix}%`)
+    .all<Record<string, unknown>>();
+  return (rows.results ?? []).map((row) => ({
+    endpoint: cleanString(row.endpoint, 80),
+    rows_used: clampInt(row.rows_used, 0, 10_000_000_000, 0),
+  }));
 }
 
 async function loadCompetitorFocusUrlCount(
@@ -11308,7 +11368,8 @@ export default {
         profile,
         isWeekly,
       });
-      return Response.json({ ok: true, site_id: site.site_id, profile, estimate, plan });
+      const usageBreakdown = await loadMozMonthlyUsageBreakdown(env, site.site_id, toDateYYYYMMDD(nowMs()).slice(0, 7));
+      return Response.json({ ok: true, site_id: site.site_id, profile, estimate, plan, month_usage_breakdown: usageBreakdown });
     }
 
     const siteProvidersSiteId = parseSiteIdFromPath(url.pathname, "/providers");
@@ -11415,6 +11476,7 @@ export default {
       const siteId = cleanString(body.site_id, 120) || null;
       const geoKey = parseMozGeoKey(body.geo_key);
       const collectedDay = normalizeDayString(body.collected_day);
+      const siteRunId = cleanString(body.site_run_id, 120) || null;
       const jobId = await createJobRecord(env, {
         userId,
         siteId,
@@ -11431,8 +11493,8 @@ export default {
           `INSERT INTO moz_url_metrics_snapshots (
             snapshot_id, url_id, collected_day, geo_key,
             page_authority, domain_authority, spam_score, linking_domains, external_links,
-            metrics_json, job_id, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            metrics_json, rows_used, site_run_id, job_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(url_id, collected_day, geo_key) DO UPDATE SET
             page_authority = excluded.page_authority,
             domain_authority = excluded.domain_authority,
@@ -11440,6 +11502,8 @@ export default {
             linking_domains = excluded.linking_domains,
             external_links = excluded.external_links,
             metrics_json = excluded.metrics_json,
+            rows_used = excluded.rows_used,
+            site_run_id = excluded.site_run_id,
             job_id = excluded.job_id,
             created_at = excluded.created_at`
         )
@@ -11454,6 +11518,8 @@ export default {
             clampInt(row.linking_domains, 0, 100000000, 0) || null,
             clampInt(row.external_links, 0, 100000000, 0) || null,
             safeJsonStringify(row, 32000),
+            1,
+            siteRunId,
             jobId,
             Math.floor(nowMs() / 1000)
           )
@@ -11501,21 +11567,26 @@ export default {
       const urlId = await getOrCreateUrlId(env, targetUrl);
       if (!urlId) return Response.json({ ok: false, error: "invalid_target_url" }, { status: 400 });
       const anchors = parseStringArray(body.top_anchors, 200, 400);
+      const geoKey = parseMozGeoKey(body.geo_key);
       const jobId = await createJobRecord(env, {
         userId: cleanString(body.user_id, 120) || null,
         siteId: cleanString(body.site_id, 120) || null,
         type: "moz_anchor_text",
-        request: { target_url: targetUrl, anchor_count: anchors.length },
+        request: { target_url: targetUrl, anchor_count: anchors.length, geo_key: geoKey },
       });
       const collectedDay = normalizeDayString(body.collected_day);
+      const siteRunId = cleanString(body.site_run_id, 120) || null;
       await env.DB.prepare(
         `INSERT INTO moz_anchor_text_snapshots (
-          snapshot_id, target_url_id, collected_day, top_anchors_json, total_anchor_rows, totals_json, job_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(target_url_id, collected_day) DO UPDATE SET
+          snapshot_id, target_url_id, collected_day, geo_key, top_anchors_json, total_anchor_rows,
+          totals_json, rows_used, site_run_id, job_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target_url_id, collected_day, geo_key) DO UPDATE SET
           top_anchors_json = excluded.top_anchors_json,
           total_anchor_rows = excluded.total_anchor_rows,
           totals_json = excluded.totals_json,
+          rows_used = excluded.rows_used,
+          site_run_id = excluded.site_run_id,
           job_id = excluded.job_id,
           created_at = excluded.created_at`
       )
@@ -11523,9 +11594,12 @@ export default {
           uuid("mozanch"),
           urlId,
           collectedDay,
+          geoKey,
           safeJsonStringify(anchors, 32000),
           anchors.length,
           safeJsonStringify(parseJsonObject(body.totals) ?? {}, 8000),
+          anchors.length,
+          siteRunId,
           jobId,
           Math.floor(nowMs() / 1000)
         )
@@ -11556,7 +11630,14 @@ export default {
         profile: usageProfile,
       });
       await finalizeJobSuccess(env, jobId, Math.max(1, anchors.length));
-      return Response.json({ ok: true, job_id: jobId, target_url_id: urlId, collected_day: collectedDay, anchor_count: anchors.length });
+      return Response.json({
+        ok: true,
+        job_id: jobId,
+        target_url_id: urlId,
+        collected_day: collectedDay,
+        geo_key: geoKey,
+        anchor_count: anchors.length,
+      });
     }
 
     if (req.method === "POST" && url.pathname === "/moz/linking-root-domains") {
@@ -11572,6 +11653,7 @@ export default {
       const urlId = await getOrCreateUrlId(env, targetUrl);
       if (!urlId) return Response.json({ ok: false, error: "invalid_target_url" }, { status: 400 });
       const domainsRaw = Array.isArray(body.top_domains) ? body.top_domains : [];
+      const geoKey = parseMozGeoKey(body.geo_key);
       const topDomains = domainsRaw
         .map((raw) => parseJsonObject(raw))
         .filter((v): v is Record<string, unknown> => !!v)
@@ -11580,17 +11662,21 @@ export default {
         userId: cleanString(body.user_id, 120) || null,
         siteId: cleanString(body.site_id, 120) || null,
         type: "moz_linking_root_domains",
-        request: { target_url: targetUrl, domain_rows: topDomains.length },
+        request: { target_url: targetUrl, domain_rows: topDomains.length, geo_key: geoKey },
       });
       const collectedDay = normalizeDayString(body.collected_day);
+      const siteRunId = cleanString(body.site_run_id, 120) || null;
       await env.DB.prepare(
         `INSERT INTO moz_linking_root_domains_snapshots (
-          snapshot_id, target_url_id, collected_day, top_domains_json, total_domain_rows, totals_json, job_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(target_url_id, collected_day) DO UPDATE SET
+          snapshot_id, target_url_id, collected_day, geo_key, top_domains_json, total_domain_rows,
+          totals_json, rows_used, site_run_id, job_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target_url_id, collected_day, geo_key) DO UPDATE SET
           top_domains_json = excluded.top_domains_json,
           total_domain_rows = excluded.total_domain_rows,
           totals_json = excluded.totals_json,
+          rows_used = excluded.rows_used,
+          site_run_id = excluded.site_run_id,
           job_id = excluded.job_id,
           created_at = excluded.created_at`
       )
@@ -11598,9 +11684,12 @@ export default {
           uuid("mozroot"),
           urlId,
           collectedDay,
+          geoKey,
           safeJsonStringify(topDomains, 32000),
           topDomains.length,
           safeJsonStringify(parseJsonObject(body.totals) ?? {}, 8000),
+          topDomains.length,
+          siteRunId,
           jobId,
           Math.floor(nowMs() / 1000)
         )
@@ -11636,6 +11725,7 @@ export default {
         job_id: jobId,
         target_url_id: urlId,
         collected_day: collectedDay,
+        geo_key: geoKey,
         domain_rows: topDomains.length,
       });
     }
@@ -11652,6 +11742,8 @@ export default {
       const cluster = cleanString(body.cluster, 160) || null;
       const siteId = cleanString(body.site_id, 120) || null;
       const payload = parseJsonObject(body.intersect) ?? {};
+      const siteRunId = cleanString(body.site_run_id, 120) || null;
+      const rowsUsed = clampInt(body.rows_used, 0, 1_000_000_000, 1);
       const jobId = await createJobRecord(env, {
         userId: cleanString(body.user_id, 120) || null,
         siteId,
@@ -11660,8 +11752,8 @@ export default {
       });
       await env.DB.prepare(
         `INSERT INTO moz_link_intersect_snapshots (
-          snapshot_id, site_id, cluster, collected_day, intersect_json, totals_json, job_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          snapshot_id, site_id, cluster, collected_day, intersect_json, totals_json, rows_used, site_run_id, job_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
         .bind(
           uuid("mozint"),
@@ -11670,6 +11762,8 @@ export default {
           collectedDay,
           safeJsonStringify(payload, 32000),
           safeJsonStringify(parseJsonObject(body.totals) ?? {}, 8000),
+          rowsUsed,
+          siteRunId,
           jobId,
           Math.floor(nowMs() / 1000)
         )
@@ -11689,7 +11783,7 @@ export default {
         day: collectedDay,
         jobId,
         jobType: "moz_link_intersect",
-        rowsUsed: clampInt(body.rows_used, 0, 1_000_000_000, 1),
+        rowsUsed,
         degradedMode: parseBoolUnknown(body.degraded_mode, false),
         fallbackReason: cleanString(body.fallback_reason, 200) || null,
         profile: usageProfile,
