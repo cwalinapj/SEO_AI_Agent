@@ -1,6 +1,9 @@
 export interface Env {
   DB: D1Database;
+  USER_MEM?: VectorizeIndex;
+  MEMORY_R2?: R2Bucket;
   PAGESPEED_API_KEY: string;
+  OPENAI_API_KEY?: string;
   WP_PLUGIN_SHARED_SECRET?: string;
   TASK_AGENT_SIGNING_SECRET?: string;
   MOZ_API_TOKEN?: string;
@@ -9353,6 +9356,255 @@ async function insertSnapshot(env: Env, siteId: string, strategy: string, trigge
   return snapshot_id;
 }
 
+type MemoryUpsertInput = {
+  type: string;
+  scope_key: string | null;
+  collected_day: string;
+  geo_key: string;
+  title: string | null;
+  text_summary: string;
+  tags: Record<string, unknown>;
+  raw_payload: unknown;
+};
+
+function normalizeMemoryType(input: unknown): string {
+  const base = cleanString(input, 120).toLowerCase();
+  return base.replace(/[^a-z0-9_:-]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "unknown";
+}
+
+function normalizeMemoryScopeKey(input: unknown): string {
+  const base = cleanString(input, 160).toLowerCase();
+  return base.replace(/[^a-z0-9_:-]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "na";
+}
+
+function normalizeMemoryGeoKey(input: unknown): string {
+  const raw = cleanString(input, 120).toLowerCase();
+  if (!raw || raw === "us") return "us";
+  if (raw === "both") return "both";
+  if (raw.startsWith("metro:")) return raw;
+  const slug = raw.replace(/[^a-z0-9-]+/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+  return slug ? `metro:${slug}` : "us";
+}
+
+function normalizeCollectedDay(input: unknown): string | null {
+  const raw = cleanString(input, 20);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  return null;
+}
+
+function parseMemoryUpsertBody(body: Record<string, unknown>): MemoryUpsertInput | { error: string } {
+  const type = normalizeMemoryType(body.type);
+  const scopeKey = cleanString(body.scope_key, 160) ? normalizeMemoryScopeKey(body.scope_key) : null;
+  const collectedDay = normalizeCollectedDay(body.collected_day) ?? toDateYYYYMMDD(nowMs());
+  const geoKey = normalizeMemoryGeoKey(body.geo_key);
+  const title = cleanString(body.title, 200) || null;
+  const textSummary = cleanString(body.text_summary, 16000);
+  if (!textSummary) {
+    return { error: "text_summary_required" };
+  }
+  const tags = parseJsonObject(body.tags) ?? {};
+  return {
+    type,
+    scope_key: scopeKey,
+    collected_day: collectedDay,
+    geo_key: geoKey,
+    title,
+    text_summary: textSummary,
+    tags,
+    raw_payload: body.raw_payload ?? {},
+  };
+}
+
+async function loadMemorySite(env: Env, siteId: string): Promise<{ site_id: string } | null> {
+  const row = await env.DB.prepare(`SELECT site_id FROM wp_ai_seo_sites WHERE site_id = ? LIMIT 1`)
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return { site_id: cleanString(row.site_id, 120) };
+}
+
+async function embedTextOpenAI(env: Env, text: string): Promise<{ embedding: number[]; tokenCount: number | null }> {
+  const apiKey = cleanString(env.OPENAI_API_KEY, 300);
+  if (!apiKey) {
+    throw new Error("openai_api_key_not_configured");
+  }
+  const response = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-large",
+      input: text,
+    }),
+  });
+  if (!response.ok) {
+    const err = cleanString(await response.text(), 1000);
+    throw new Error(`openai_embedding_failed:${response.status}:${err}`);
+  }
+  const payload = (await response.json()) as Record<string, unknown>;
+  const data = Array.isArray(payload.data) ? payload.data : [];
+  const first = parseJsonObject(data[0]);
+  const embeddingRaw = Array.isArray(first?.embedding) ? first?.embedding : [];
+  const embedding = embeddingRaw
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value));
+  if (embedding.length === 0) {
+    throw new Error("openai_embedding_empty");
+  }
+  const usage = parseJsonObject(payload.usage);
+  return {
+    embedding,
+    tokenCount: usage ? clampInt(usage.total_tokens, 0, Number.MAX_SAFE_INTEGER, 0) : null,
+  };
+}
+
+async function upsertSemanticMemory(
+  env: Env,
+  siteId: string,
+  input: MemoryUpsertInput
+): Promise<{ memoryId: string; vectorId: string; r2Key: string }> {
+  if (!env.MEMORY_R2) {
+    throw new Error("memory_r2_binding_missing");
+  }
+  if (!env.USER_MEM) {
+    throw new Error("vectorize_binding_missing");
+  }
+
+  const scopeKey = input.scope_key ?? "na";
+  const memoryId = uuid("mem");
+  const payloadCanonical = canonicalJson(input.raw_payload);
+  const payloadSha = await sha256Hex(payloadCanonical);
+  const r2Key = `memory/v1/site/${siteId}/day/${input.collected_day}/geo/${input.geo_key}/type/${input.type}/scope/${scopeKey}/${memoryId}.json`;
+
+  await env.MEMORY_R2.put(r2Key, payloadCanonical, {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: {
+      site_id: siteId,
+      type: input.type,
+      geo_key: input.geo_key,
+      collected_day: input.collected_day,
+      scope_key: scopeKey,
+      memory_id: memoryId,
+    },
+  });
+
+  const embedded = await embedTextOpenAI(env, input.text_summary);
+  const vectorId = `mem_v1:${siteId}:${input.type}:${input.geo_key}:${input.collected_day}:${scopeKey}`;
+
+  await env.USER_MEM.upsert([
+    {
+      id: vectorId,
+      values: embedded.embedding,
+      metadata: {
+        site_id: siteId,
+        type: input.type,
+        geo_key: input.geo_key,
+        collected_day: input.collected_day,
+        scope_key: scopeKey,
+      },
+    },
+  ]);
+
+  await env.DB.prepare(
+    `INSERT INTO memory_items (
+      memory_id, site_id, type, scope_key, collected_day, geo_key,
+      title, text_summary, tags_json, source_r2_key, source_sha256,
+      vector_namespace, vector_id, embedding_model, token_count, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mem_v1', ?, 'text-embedding-3-large', ?, strftime('%s','now'), strftime('%s','now'))
+    ON CONFLICT(site_id, type, COALESCE(scope_key,''), collected_day, geo_key) DO UPDATE SET
+      title = excluded.title,
+      text_summary = excluded.text_summary,
+      tags_json = excluded.tags_json,
+      source_r2_key = excluded.source_r2_key,
+      source_sha256 = excluded.source_sha256,
+      vector_id = excluded.vector_id,
+      token_count = excluded.token_count,
+      updated_at = strftime('%s','now')`
+  )
+    .bind(
+      memoryId,
+      siteId,
+      input.type,
+      input.scope_key,
+      input.collected_day,
+      input.geo_key,
+      input.title,
+      input.text_summary,
+      canonicalJson(input.tags),
+      r2Key,
+      payloadSha,
+      vectorId,
+      embedded.tokenCount
+    )
+    .run();
+
+  await env.DB.prepare(
+    `INSERT INTO memory_events (site_id, memory_id, event_type, message, meta_json, created_at)
+     VALUES (?, ?, 'upsert', 'memory upserted', ?, strftime('%s','now'))`
+  )
+    .bind(siteId, memoryId, canonicalJson({ vector_id: vectorId, type: input.type, geo_key: input.geo_key }))
+    .run();
+
+  return { memoryId, vectorId, r2Key };
+}
+
+async function searchSemanticMemory(
+  env: Env,
+  siteId: string,
+  query: string,
+  options: {
+    k: number;
+    type: string | null;
+    geoKey: string | null;
+    days: number;
+  }
+): Promise<Array<Record<string, unknown>>> {
+  if (!env.USER_MEM) {
+    throw new Error("vectorize_binding_missing");
+  }
+  const embedded = await embedTextOpenAI(env, query);
+  const vectorFilter: Record<string, unknown> = { site_id: siteId };
+  if (options.type) vectorFilter.type = options.type;
+  if (options.geoKey) vectorFilter.geo_key = options.geoKey;
+
+  const vectorResponse = (await env.USER_MEM.query(embedded.embedding, {
+    topK: options.k,
+    filter: vectorFilter,
+  })) as { matches?: Array<{ id: string; score: number }> };
+  const matches = Array.isArray(vectorResponse.matches) ? vectorResponse.matches : [];
+  if (matches.length === 0) {
+    return [];
+  }
+
+  const earliestMs = nowMs() - options.days * 24 * 60 * 60 * 1000;
+  const earliestDay = toDateYYYYMMDD(earliestMs);
+  const vectorIds = matches.map((m) => cleanString(m.id, 400)).filter(Boolean);
+  const placeholders = vectorIds.map(() => "?").join(",");
+  const stmt = env.DB.prepare(
+    `SELECT
+       memory_id, site_id, type, scope_key, collected_day, geo_key, title,
+       tags_json, source_r2_key, source_sha256, vector_namespace, vector_id, embedding_model, token_count, updated_at
+     FROM memory_items
+     WHERE site_id = ?
+       AND collected_day >= ?
+       AND vector_id IN (${placeholders})`
+  );
+  const rows = await stmt.bind(siteId, earliestDay, ...vectorIds).all<Record<string, unknown>>();
+  const byVectorId = new Map<string, Record<string, unknown>>();
+  for (const row of rows.results ?? []) {
+    byVectorId.set(cleanString(row.vector_id, 400), row);
+  }
+  return matches
+    .map((match) => ({
+      vector_id: cleanString(match.id, 400),
+      score: Number(match.score ?? 0) || 0,
+      item: byVectorId.get(cleanString(match.id, 400)) ?? null,
+    }))
+    .filter((entry) => entry.item !== null);
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -9865,6 +10117,75 @@ export default {
       return Response.json({ ok: false, error: "unsupported_task_action" }, { status: 400 });
     }
 
+    const memoryUpsertSiteId = parseSiteIdFromPath(url.pathname, "/memory/upsert");
+    if (req.method === "POST" && memoryUpsertSiteId) {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const site = await loadMemorySite(env, memoryUpsertSiteId);
+      if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+
+      const parsed = parseMemoryUpsertBody(body);
+      if ("error" in parsed) {
+        return Response.json({ ok: false, error: parsed.error }, { status: 400 });
+      }
+      try {
+        const saved = await upsertSemanticMemory(env, site.site_id, parsed);
+        return Response.json({
+          ok: true,
+          site_id: site.site_id,
+          memory_id: saved.memoryId,
+          vector_id: saved.vectorId,
+          r2_key: saved.r2Key,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        await env.DB
+          .prepare(
+            `INSERT INTO memory_events (site_id, event_type, message, meta_json, created_at)
+             VALUES (?, 'error', ?, ?, strftime('%s','now'))`
+          )
+          .bind(site.site_id, "memory upsert failed", canonicalJson({ error: message }))
+          .run();
+        const status = /not_configured|binding_missing/.test(message) ? 503 : 500;
+        return Response.json({ ok: false, error: message }, { status });
+      }
+    }
+
+    const memorySearchSiteId = parseSiteIdFromPath(url.pathname, "/memory/search");
+    if (req.method === "GET" && memorySearchSiteId) {
+      const site = await loadMemorySite(env, memorySearchSiteId);
+      if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      const q = cleanString(url.searchParams.get("q"), 3000);
+      if (!q) return Response.json({ ok: false, error: "q_required" }, { status: 400 });
+      const k = clampInt(url.searchParams.get("k"), 1, 20, 8);
+      const days = clampInt(url.searchParams.get("days"), 1, 365, 30);
+      const type = cleanString(url.searchParams.get("type"), 120);
+      const geo = cleanString(url.searchParams.get("geo_key"), 120);
+      try {
+        const matches = await searchSemanticMemory(env, site.site_id, q, {
+          k,
+          type: type ? normalizeMemoryType(type) : null,
+          geoKey: geo ? normalizeMemoryGeoKey(geo) : null,
+          days,
+        });
+        return Response.json({
+          ok: true,
+          site_id: site.site_id,
+          query: q,
+          count: matches.length,
+          matches,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        return Response.json({ ok: false, error: message }, { status: /not_configured|binding_missing/.test(message) ? 503 : 500 });
+      }
+    }
+
     if (req.method === "POST" && (url.pathname === `${pluginV1Prefix}/sites/upsert` || url.pathname === `${pluginV1Prefix}/sites/analyze`)) {
       const verified = await verifySignedPluginRequest(req, env);
       if (verified.ok === false) {
@@ -9913,6 +10234,84 @@ export default {
         },
         analyzed_at: saved.last_analysis_at,
       });
+    }
+
+    const pluginMemoryUpsertSiteId = parseSiteIdFromPrefixedPath(
+      url.pathname,
+      `${pluginV1Prefix}/sites/`,
+      "/memory/upsert"
+    );
+    if (req.method === "POST" && pluginMemoryUpsertSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const site = await loadMemorySite(env, pluginMemoryUpsertSiteId);
+      if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      const parsed = parseMemoryUpsertBody(verified.body);
+      if ("error" in parsed) {
+        return Response.json({ ok: false, error: parsed.error }, { status: 400 });
+      }
+      try {
+        const saved = await upsertSemanticMemory(env, site.site_id, parsed);
+        return Response.json({
+          ok: true,
+          site_id: site.site_id,
+          memory_id: saved.memoryId,
+          vector_id: saved.vectorId,
+          r2_key: saved.r2Key,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        await env.DB
+          .prepare(
+            `INSERT INTO memory_events (site_id, event_type, message, meta_json, created_at)
+             VALUES (?, 'error', ?, ?, strftime('%s','now'))`
+          )
+          .bind(site.site_id, "memory upsert failed", canonicalJson({ error: message }))
+          .run();
+        const status = /not_configured|binding_missing/.test(message) ? 503 : 500;
+        return Response.json({ ok: false, error: message }, { status });
+      }
+    }
+
+    const pluginMemorySearchSiteId = parseSiteIdFromPrefixedPath(
+      url.pathname,
+      `${pluginV1Prefix}/sites/`,
+      "/memory/search"
+    );
+    if (req.method === "POST" && pluginMemorySearchSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const site = await loadMemorySite(env, pluginMemorySearchSiteId);
+      if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+
+      const q = cleanString(verified.body.q, 3000);
+      if (!q) return Response.json({ ok: false, error: "q_required" }, { status: 400 });
+      const k = clampInt(verified.body.k, 1, 20, 8);
+      const days = clampInt(verified.body.days, 1, 365, 30);
+      const type = cleanString(verified.body.type, 120);
+      const geo = cleanString(verified.body.geo_key, 120);
+      try {
+        const matches = await searchSemanticMemory(env, site.site_id, q, {
+          k,
+          type: type ? normalizeMemoryType(type) : null,
+          geoKey: geo ? normalizeMemoryGeoKey(geo) : null,
+          days,
+        });
+        return Response.json({
+          ok: true,
+          site_id: site.site_id,
+          query: q,
+          count: matches.length,
+          matches,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        return Response.json({ ok: false, error: message }, { status: /not_configured|binding_missing/.test(message) ? 503 : 500 });
+      }
     }
 
     const pluginSiteResearchSiteId = parseSiteIdFromPrefixedPath(
