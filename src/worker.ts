@@ -10,6 +10,11 @@ export interface Env {
 const COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
 const PLUGIN_TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 const SERP_MAX_RESULTS = 20;
+const SITE_KEYWORD_CAP = 20;
+const SITE_SERP_RESULTS_CAP = 20;
+const SITE_MAX_URL_FETCHES_PER_DAY = 400;
+const SITE_MAX_BACKLINK_ENRICH_PER_DAY = 400;
+const SITE_MAX_GRAPH_DOMAINS_PER_DAY = 10;
 
 function nowMs(): number {
   return Date.now();
@@ -1178,6 +1183,5358 @@ function normalizeDevice(input: unknown): "mobile" | "desktop" {
   return cleanString(input, 20).toLowerCase() === "mobile" ? "mobile" : "desktop";
 }
 
+type Step1SiteRecord = {
+  site_id: string;
+  site_url: string;
+  site_name: string | null;
+  business_address: string | null;
+  primary_location_hint: string | null;
+  site_type_hint: string | null;
+  local_mode: boolean;
+  input_json: string;
+  site_profile_json: string;
+  last_analysis_at: number;
+  last_research_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type Step1SemrushMetric = {
+  keyword: string;
+  volume_us: number;
+  kd: number;
+  cpc: number;
+  competitive_density: number;
+  serp_features: string[];
+  top_domains: string[];
+};
+
+type Step1KeywordCandidate = {
+  keyword: string;
+  keyword_norm: string;
+  intent: "informational" | "commercial" | "transactional" | "navigational";
+  local_intent: "yes" | "weak" | "no";
+  page_type: "service" | "category" | "product" | "location landing" | "guide" | "faq" | "comparison" | "checklist";
+  cluster: string;
+  recommended_slug: string;
+  recommended_page_type: string;
+  volume_us: number;
+  kd: number;
+  cpc: number;
+  competitive_density: number;
+  serp_features: string[];
+  relevance_score: number;
+  intent_score: number;
+  volume_score: number;
+  cpc_proxy_score: number;
+  winnability_score: number;
+  local_boost: number;
+  difficulty_penalty: number;
+  serp_feature_penalty: number;
+  opportunity_score: number;
+  supporting_terms: string[];
+};
+
+function slugify(input: string, maxLen = 90): string {
+  return cleanString(input, 400)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, maxLen);
+}
+
+function clamp01(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  if (v < 0) return 0;
+  if (v > 1) return 1;
+  return v;
+}
+
+function parseStringArray(input: unknown, maxItems = 200, maxLen = 300): string[] {
+  if (!Array.isArray(input)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input) {
+    const value = cleanString(raw, maxLen);
+    if (!value) continue;
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function parseTopPages(input: unknown): Array<{ url: string; title: string; h1: string; meta: string }> {
+  if (!Array.isArray(input)) return [];
+  const out: Array<{ url: string; title: string; h1: string; meta: string }> = [];
+  for (const raw of input) {
+    const row = parseJsonObject(raw);
+    if (!row) continue;
+    out.push({
+      url: cleanString(row.url, 2000),
+      title: cleanString(row.title, 300),
+      h1: cleanString(row.h1, 300),
+      meta: cleanString(row.meta, 500),
+    });
+    if (out.length >= 300) break;
+  }
+  return out;
+}
+
+function normalizeSiteUpsertPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const signals = parseJsonObject(payload.signals) ?? {};
+  const plan = parseJsonObject(payload.plan) ?? {};
+  const topPagesRaw = Array.isArray(signals.top_pages) ? signals.top_pages : [];
+
+  const topPages = topPagesRaw
+    .map((raw) => {
+      const row = parseJsonObject(raw);
+      if (!row) return null;
+      return {
+        url: cleanString(row.url, 2000),
+        title: cleanString(row.title, 300),
+        h1: cleanString(row.h1, 300),
+        meta: cleanString(row.meta, 500),
+        text_extract: cleanString(row.text_extract, 2000),
+      };
+    })
+    .filter((row): row is { url: string; title: string; h1: string; meta: string; text_extract: string } => !!row)
+    .slice(0, 300);
+
+  const contentExtract = topPages
+    .map((row) => row.text_extract)
+    .filter((v) => cleanString(v, 2000).length > 0)
+    .slice(0, 500);
+
+  const isWoo = parseBoolUnknown(signals.is_woocommerce, false);
+  const inferredSiteType =
+    cleanString(payload.site_type_hint, 60) ||
+    cleanString(signals.industry_hint, 60) ||
+    (isWoo ? "woo" : "general");
+
+  const normalized: Record<string, unknown> = {
+    site_url: cleanString(payload.site_url, 2000),
+    wp_site_id: cleanString(payload.wp_site_id, 120) || null,
+    site_name: cleanString(signals.site_name ?? payload.site_name, 200),
+    business_address: cleanString(
+      signals.detected_address ?? payload.business_address ?? payload.primary_location_hint,
+      400
+    ),
+    primary_location_hint: cleanString(
+      payload.primary_location_hint ?? plan.metro ?? signals.detected_address ?? "",
+      200
+    ),
+    site_type_hint: inferredSiteType,
+    top_pages: topPages.map((row) => ({
+      url: row.url,
+      title: row.title,
+      h1: row.h1,
+      meta: row.meta,
+    })),
+    content_extract: contentExtract,
+    sitemap_urls: parseStringArray(signals.sitemap_urls, 500, 2000),
+    plan: {
+      metro_proxy: parseBoolUnknown(plan.metro_proxy, false),
+      metro: cleanString(plan.metro, 120) || null,
+    },
+    signals: {
+      detected_phone: cleanString(signals.detected_phone, 80) || null,
+      industry_hint: cleanString(signals.industry_hint, 120) || null,
+      is_woocommerce: isWoo,
+    },
+  };
+
+  return normalized;
+}
+
+function parseContentExtract(input: unknown): string[] {
+  return parseStringArray(input, 500, 2000);
+}
+
+function tokenizeText(input: string): string[] {
+  return cleanString(input, 2000)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .map((v) => v.trim())
+    .filter((v) => v.length >= 2 && v.length <= 30);
+}
+
+function toKeywordNorm(input: string): string {
+  return cleanString(input, 300).toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function safeJsonParseObject(input: string): Record<string, unknown> | null {
+  if (!input) return null;
+  try {
+    return parseJsonObject(JSON.parse(input));
+  } catch {
+    return null;
+  }
+}
+
+function parseSemrushMetrics(input: unknown): Step1SemrushMetric[] {
+  if (!Array.isArray(input)) return [];
+  const out: Step1SemrushMetric[] = [];
+  const seen = new Set<string>();
+  for (const raw of input) {
+    const row = parseJsonObject(raw);
+    if (!row) continue;
+    const keyword = cleanString(row.keyword ?? row.kw ?? row.phrase, 300);
+    if (!keyword) continue;
+    const keywordNorm = toKeywordNorm(keyword);
+    if (!keywordNorm || seen.has(keywordNorm)) continue;
+    seen.add(keywordNorm);
+    const serpFeatures = parseStringArray(
+      Array.isArray(row.serp_features) ? row.serp_features : String(row.serp_features ?? "").split(","),
+      30,
+      80
+    ).map((v) => v.toLowerCase());
+    out.push({
+      keyword,
+      volume_us: Math.max(0, Number(row.volume_us ?? row.volume ?? 0) || 0),
+      kd: Math.max(0, Math.min(100, Number(row.kd ?? row.keyword_difficulty ?? 0) || 0)),
+      cpc: Math.max(0, Number(row.cpc ?? row.cost_per_click ?? 0) || 0),
+      competitive_density: clamp01(Number(row.competitive_density ?? row.competition ?? 0) || 0),
+      serp_features: serpFeatures,
+      top_domains: parseStringArray(row.top_domains, 20, 120).map((v) => normalizeRootDomain(v)),
+    });
+    if (out.length >= 5000) break;
+  }
+  return out;
+}
+
+function detectSiteTypeHint(input: {
+  siteTypeHint: string;
+  siteUrl: string;
+  services: string[];
+  products: string[];
+  categories: string[];
+  tags: string[];
+}): "local" | "woo" | "saas" | "publisher" | "general" {
+  const hinted = cleanString(input.siteTypeHint, 60).toLowerCase();
+  if (hinted.includes("local")) return "local";
+  if (hinted.includes("woo") || hinted.includes("ecom") || hinted.includes("shop")) return "woo";
+  if (hinted.includes("saas") || hinted.includes("software")) return "saas";
+  if (hinted.includes("blog") || hinted.includes("publisher")) return "publisher";
+
+  if (input.products.length > 2 || input.categories.length > 3) return "woo";
+  if (input.tags.length > 10 && input.services.length < 3) return "publisher";
+  if (/app|saas|software/.test(input.siteUrl.toLowerCase())) return "saas";
+  return "general";
+}
+
+function detectLocalMode(input: {
+  businessAddress: string;
+  primaryLocationHint: string;
+  topPages: Array<{ url: string; title: string; h1: string; meta: string }>;
+  contentExtract: string[];
+  siteType: string;
+}): boolean {
+  if (input.siteType === "local") return true;
+  if (cleanString(input.businessAddress, 400)) return true;
+  if (cleanString(input.primaryLocationHint, 200)) return true;
+  const localSignals = /(near me|service area|local business|visit us|our location|city|county|state)/i;
+  const haystack = `${input.topPages.map((p) => `${p.title} ${p.h1} ${p.meta}`).join(" ")} ${input.contentExtract
+    .slice(0, 20)
+    .join(" ")}`.slice(0, 12000);
+  return localSignals.test(haystack);
+}
+
+function inferIndustry(offerTerms: string[], siteType: string): string {
+  const joined = offerTerms.join(" ").toLowerCase();
+  if (siteType === "woo") return "ecommerce";
+  if (siteType === "saas") return "software";
+  if (siteType === "publisher") return "media";
+  if (/\b(plumbing|hvac|roof|electric|dental|lawyer|medspa|chiropractic)\b/.test(joined)) return "local_services";
+  if (/\b(accounting|consulting|agency|marketing|design|development)\b/.test(joined)) return "professional_services";
+  return "general_business";
+}
+
+function inferAudience(offerTerms: string[], contentExtract: string[]): string {
+  const joined = `${offerTerms.join(" ")} ${contentExtract.slice(0, 20).join(" ")}`.toLowerCase();
+  if (/\benterprise|b2b|agency|teams|organizations?\b/.test(joined)) return "b2b";
+  if (/\bhomeowner|residential|family|consumer|shop\b/.test(joined)) return "b2c";
+  return "mixed";
+}
+
+function inferPricingTier(offerTerms: string[], contentExtract: string[]): "budget" | "mid" | "premium" | "unknown" {
+  const joined = `${offerTerms.join(" ")} ${contentExtract.slice(0, 20).join(" ")}`.toLowerCase();
+  if (/\b(luxury|premium|white glove|high-end)\b/.test(joined)) return "premium";
+  if (/\b(cheap|affordable|budget|low cost|discount)\b/.test(joined)) return "budget";
+  if (/\b(pricing|quote|plans|packages)\b/.test(joined)) return "mid";
+  return "unknown";
+}
+
+function inferPrimaryGoals(siteType: string, offerTerms: string[]): string[] {
+  if (siteType === "woo") return ["sales", "revenue"];
+  if (siteType === "publisher") return ["traffic", "newsletter_growth"];
+  if (siteType === "saas") return ["trials", "demos", "pipeline"];
+  if (offerTerms.length > 0) return ["leads", "calls", "bookings"];
+  return ["traffic", "leads"];
+}
+
+function inferConstraints(contentExtract: string[]): string[] {
+  const joined = contentExtract.slice(0, 40).join(" ").toLowerCase();
+  const out: string[] = [];
+  if (/\bhipaa\b/.test(joined)) out.push("hipaa");
+  if (/\bgdpr\b/.test(joined)) out.push("gdpr");
+  if (/\blicensed|insured\b/.test(joined)) out.push("regulated_service");
+  if (/\bemergency|24\/7\b/.test(joined)) out.push("urgent_response_expectation");
+  return out;
+}
+
+function inferContentMix(topPages: Array<{ url: string; title: string; h1: string; meta: string }>): string {
+  let productLike = 0;
+  let blogLike = 0;
+  let serviceLike = 0;
+  for (const page of topPages) {
+    const text = `${page.url} ${page.title} ${page.h1}`.toLowerCase();
+    if (/\b(product|shop|cart|category|sku)\b/.test(text)) productLike += 1;
+    if (/\b(blog|post|guide|article|news)\b/.test(text)) blogLike += 1;
+    if (/\b(service|location|about|contact|quote|book)\b/.test(text)) serviceLike += 1;
+  }
+  if (productLike > blogLike && productLike > serviceLike) return "ecommerce-heavy";
+  if (blogLike > productLike && blogLike > serviceLike) return "content-heavy";
+  if (serviceLike > 0) return "service-heavy";
+  return "mixed";
+}
+
+function inferSiteBriefType(siteType: string): string {
+  if (siteType === "local") return "local_service";
+  if (siteType === "woo") return "ecommerce";
+  if (siteType === "saas") return "saas";
+  if (siteType === "publisher") return "publisher";
+  return "general";
+}
+
+function inferBriefConfidence(input: {
+  offerTerms: string[];
+  locations: string[];
+  topPagesCount: number;
+  contentExtractCount: number;
+}): number {
+  let score = 0.25;
+  if (input.offerTerms.length >= 5) score += 0.25;
+  if (input.locations.length >= 1) score += 0.15;
+  if (input.topPagesCount >= 8) score += 0.2;
+  if (input.contentExtractCount >= 8) score += 0.15;
+  return Number(clamp01(score).toFixed(2));
+}
+
+function buildStep1SiteProfile(input: Record<string, unknown>): Record<string, unknown> {
+  const services = parseStringArray(input.services, 200, 160);
+  const products = parseStringArray(input.products, 400, 160);
+  const categories = parseStringArray(input.categories, 400, 160);
+  const tags = parseStringArray(input.tags, 400, 80);
+  const topPages = parseTopPages(input.top_pages);
+  const contentExtract = parseContentExtract(input.content_extract);
+  const siteUrl = cleanString(input.site_url, 2000);
+  const siteType = detectSiteTypeHint({
+    siteTypeHint: cleanString(input.site_type_hint, 60),
+    siteUrl,
+    services,
+    products,
+    categories,
+    tags,
+  });
+  const localMode = detectLocalMode({
+    businessAddress: cleanString(input.business_address, 400),
+    primaryLocationHint: cleanString(input.primary_location_hint, 200),
+    topPages,
+    contentExtract,
+    siteType,
+  });
+
+  const offerTerms = [...services, ...products, ...categories]
+    .map((v) => cleanString(v, 160))
+    .filter(Boolean)
+    .slice(0, 300);
+
+  const locations = [
+    cleanString(input.primary_location_hint, 200),
+    ...cleanString(input.business_address, 400)
+      .split(/[,\n]/g)
+      .map((v) => cleanString(v, 80)),
+  ]
+    .filter(Boolean)
+    .slice(0, 8);
+  const industry = inferIndustry(offerTerms, siteType);
+  const audience = inferAudience(offerTerms, contentExtract);
+  const pricingTier = inferPricingTier(offerTerms, contentExtract);
+  const primaryGoals = inferPrimaryGoals(siteType, offerTerms);
+  const constraints = inferConstraints(contentExtract);
+  const contentMix = inferContentMix(topPages);
+  const conversionGoal = primaryGoals.includes("sales")
+    ? "sales"
+    : primaryGoals.includes("leads")
+      ? "leads"
+      : "traffic";
+  const briefConstraints = [...constraints];
+  if (!briefConstraints.includes("US-only")) {
+    briefConstraints.push("US-only");
+  }
+  const briefConfidence = inferBriefConfidence({
+    offerTerms,
+    locations,
+    topPagesCount: topPages.length,
+    contentExtractCount: contentExtract.length,
+  });
+
+  return {
+    site_type_detected: siteType,
+    local_mode: localMode,
+    offer_terms: offerTerms,
+    top_pages_count: topPages.length,
+    content_extract_count: contentExtract.length,
+    site_brief: {
+      industry,
+      offerings: offerTerms.slice(0, 60),
+      audiences: [audience],
+      locations,
+      site_type: inferSiteBriefType(siteType),
+      conversion_goal: conversionGoal,
+      constraints: briefConstraints,
+      confidence: briefConfidence,
+      content_type_mix: contentMix,
+      pricing_tier: pricingTier,
+      primary_goals: primaryGoals,
+    },
+  };
+}
+
+async function upsertStep1Site(env: Env, payload: Record<string, unknown>): Promise<Step1SiteRecord> {
+  const siteUrl = cleanString(payload.site_url, 2000);
+  if (!siteUrl) {
+    throw new Error("site_url required.");
+  }
+  const wpSiteId = cleanString(payload.wp_site_id, 120) || null;
+  const siteName = cleanString(payload.site_name, 200) || null;
+  const businessAddress = cleanString(payload.business_address, 400) || null;
+  const primaryLocationHint = cleanString(payload.primary_location_hint, 200) || null;
+  const siteTypeHint = cleanString(payload.site_type_hint, 60) || null;
+  const profile = buildStep1SiteProfile(payload);
+  const localMode = parseBoolUnknown(profile.local_mode, false) ? 1 : 0;
+  const ts = nowMs();
+  const siteIdentity = wpSiteId ? `${siteUrl.toLowerCase()}|${wpSiteId.toLowerCase()}` : siteUrl.toLowerCase();
+  const siteId = `site_${await sha256Hex(siteIdentity)}`.slice(0, 48);
+  const inputJson = safeJsonStringify(payload, 320000);
+  const profileJson = safeJsonStringify(profile, 32000);
+
+  await env.DB.prepare(
+    `INSERT INTO wp_ai_seo_sites (
+      site_id, site_url, site_name, business_address, primary_location_hint, site_type_hint,
+      local_mode, input_json, site_profile_json, last_analysis_at, last_research_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+    ON CONFLICT(site_id) DO UPDATE SET
+      site_url = excluded.site_url,
+      site_name = excluded.site_name,
+      business_address = excluded.business_address,
+      primary_location_hint = excluded.primary_location_hint,
+      site_type_hint = excluded.site_type_hint,
+      local_mode = excluded.local_mode,
+      input_json = excluded.input_json,
+      site_profile_json = excluded.site_profile_json,
+      last_analysis_at = excluded.last_analysis_at,
+      updated_at = excluded.updated_at`
+  )
+    .bind(
+      siteId,
+      siteUrl,
+      siteName,
+      businessAddress,
+      primaryLocationHint,
+      siteTypeHint,
+      localMode,
+      inputJson,
+      profileJson,
+      ts,
+      ts,
+      ts
+    )
+    .run();
+
+  return {
+    site_id: siteId,
+    site_url: siteUrl,
+    site_name: siteName,
+    business_address: businessAddress,
+    primary_location_hint: primaryLocationHint,
+    site_type_hint: siteTypeHint,
+    local_mode: localMode === 1,
+    input_json: inputJson,
+    site_profile_json: profileJson,
+    last_analysis_at: ts,
+    last_research_at: null,
+    created_at: ts,
+    updated_at: ts,
+  };
+}
+
+async function loadStep1Site(env: Env, siteId: string): Promise<Step1SiteRecord | null> {
+  const row = await env.DB.prepare(
+    `SELECT
+      site_id, site_url, site_name, business_address, primary_location_hint, site_type_hint,
+      local_mode, input_json, site_profile_json, last_analysis_at, last_research_at, created_at, updated_at
+     FROM wp_ai_seo_sites
+     WHERE site_id = ?
+     LIMIT 1`
+  )
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return {
+    site_id: cleanString(row.site_id, 64),
+    site_url: cleanString(row.site_url, 2000),
+    site_name: cleanString(row.site_name, 200) || null,
+    business_address: cleanString(row.business_address, 400) || null,
+    primary_location_hint: cleanString(row.primary_location_hint, 200) || null,
+    site_type_hint: cleanString(row.site_type_hint, 60) || null,
+    local_mode: clampInt(row.local_mode, 0, 1, 0) === 1,
+    input_json: cleanString(row.input_json, 320000),
+    site_profile_json: cleanString(row.site_profile_json, 32000),
+    last_analysis_at: clampInt(row.last_analysis_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    last_research_at:
+      row.last_research_at == null ? null : clampInt(row.last_research_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    updated_at: clampInt(row.updated_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  };
+}
+
+function parseSiteIdFromPath(pathname: string, suffix: string): string | null {
+  if (!pathname.startsWith("/v1/sites/")) return null;
+  if (!pathname.endsWith(suffix)) return null;
+  const middle = pathname.slice("/v1/sites/".length, pathname.length - suffix.length);
+  const siteId = cleanString(decodeURIComponent(middle), 120);
+  if (!siteId || siteId.includes("/")) return null;
+  return siteId;
+}
+
+function extractOfferTerms(input: Record<string, unknown>): string[] {
+  const direct = [
+    ...parseStringArray(input.services, 300, 160),
+    ...parseStringArray(input.products, 500, 160),
+    ...parseStringArray(input.categories, 500, 160),
+    ...parseStringArray(input.tags, 500, 80),
+  ];
+  if (direct.length > 0) return direct.slice(0, 800);
+
+  const topPages = parseTopPages(input.top_pages);
+  const phrases: string[] = [];
+  for (const page of topPages) {
+    for (const source of [page.title, page.h1]) {
+      const cleaned = cleanString(source, 200);
+      if (!cleaned) continue;
+      const parts = cleaned.split(/[|:-]/g).map((v) => cleanString(v, 120)).filter(Boolean);
+      for (const part of parts) {
+        if (part.length >= 4) {
+          phrases.push(part);
+        }
+      }
+    }
+  }
+  return phrases.slice(0, 600);
+}
+
+function extractLocationTerms(input: Record<string, unknown>): string[] {
+  const out = new Set<string>();
+  const raw = [
+    cleanString(input.primary_location_hint, 200),
+    cleanString(input.business_address, 400),
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const parts = raw.split(/[,\n]/g).map((v) => cleanString(v, 80)).filter(Boolean);
+  for (const part of parts) {
+    if (part.length >= 2) out.add(part.toLowerCase());
+  }
+  return [...out].slice(0, 20);
+}
+
+function classifyIntent(keyword: string): "informational" | "commercial" | "transactional" | "navigational" {
+  const text = toKeywordNorm(keyword);
+  if (/\b(login|signin|facebook|youtube|wikipedia)\b/.test(text)) return "navigational";
+  if (/\b(buy|book|hire|quote|near me|order|pricing|price|cost)\b/.test(text)) return "transactional";
+  if (/\b(best|top|service|company|agency|software for|platform)\b/.test(text)) return "commercial";
+  if (/\b(how|what|why|guide|tips|checklist|vs|comparison|faq|requirements|time)\b/.test(text)) {
+    return "informational";
+  }
+  return "commercial";
+}
+
+function classifyLocalIntent(keyword: string, locationTerms: string[], localMode: boolean): "yes" | "weak" | "no" {
+  const text = toKeywordNorm(keyword);
+  if (/\bnear me\b/.test(text)) return "yes";
+  for (const loc of locationTerms) {
+    if (loc && text.includes(loc)) return "yes";
+  }
+  if (!localMode) return "no";
+  if (/\b(city|county|state|metro|neighborhood)\b/.test(text)) return "weak";
+  return "weak";
+}
+
+function classifyPageType(
+  intent: "informational" | "commercial" | "transactional" | "navigational",
+  siteType: string,
+  localIntent: "yes" | "weak" | "no",
+  keyword: string
+): Step1KeywordCandidate["page_type"] {
+  const text = toKeywordNorm(keyword);
+  if (intent === "informational") {
+    if (/\b(vs|comparison)\b/.test(text)) return "comparison";
+    if (/\b(checklist|steps)\b/.test(text)) return "checklist";
+    if (/\b(faq|questions)\b/.test(text)) return "faq";
+    return "guide";
+  }
+  if (siteType === "woo") return "product";
+  if (siteType === "local" || localIntent === "yes") return "location landing";
+  if (/\b(category|types|best)\b/.test(text)) return "category";
+  return "service";
+}
+
+function clusterForKeyword(keyword: string, offerTerms: string[]): string {
+  const text = toKeywordNorm(keyword);
+  for (const term of offerTerms) {
+    const norm = toKeywordNorm(term);
+    if (!norm) continue;
+    if (text.includes(norm)) return norm;
+  }
+  const tokens = tokenizeText(text).filter((v) => !["near", "best", "cost", "price", "in", "for"].includes(v));
+  return tokens.slice(0, 2).join(" ") || "general";
+}
+
+function stripGarbageKeyword(keyword: string, siteType: string): boolean {
+  const text = toKeywordNorm(keyword);
+  if (!text) return true;
+  if (/\b(torrent|pirate|free download|crack|nulled)\b/.test(text)) return true;
+  if (siteType !== "publisher" && /\b(definition|meaning|dictionary)\b/.test(text)) return true;
+  if (!/\bhiring|jobs|careers?\b/.test(siteType) && /\b(jobs?|careers?|salary)\b/.test(text)) return true;
+  return false;
+}
+
+function buildVariantGroup(keyword: string, locationTerms: string[]): string {
+  const stop = new Set([
+    "the",
+    "a",
+    "an",
+    "in",
+    "for",
+    "to",
+    "near",
+    "me",
+    "best",
+    "top",
+    "cost",
+    "price",
+    "services",
+    "service",
+  ]);
+  const locationWords = new Set(locationTerms.flatMap((v) => tokenizeText(v)));
+  const tokens = tokenizeText(keyword).filter((v) => !stop.has(v) && !locationWords.has(v));
+  return tokens.slice(0, 3).join(" ") || toKeywordNorm(keyword);
+}
+
+function generateCandidateKeywords(input: {
+  offerTerms: string[];
+  locationTerms: string[];
+  siteType: string;
+  localMode: boolean;
+  semrushMetrics: Step1SemrushMetric[];
+}): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (kw: string) => {
+    const cleaned = toKeywordNorm(kw);
+    if (!cleaned || seen.has(cleaned)) return;
+    seen.add(cleaned);
+    out.push(cleaned);
+  };
+
+  const baseTerms = input.offerTerms.map((v) => toKeywordNorm(v)).filter(Boolean).slice(0, 120);
+  const city = input.locationTerms[0] || "";
+  const templateMods = [
+    "{term}",
+    "best {term}",
+    "{term} cost",
+    "{term} pricing",
+    "{term} near me",
+    "{term} company",
+    "{term} services",
+  ];
+  const localMods = ["{term} {city}", "best {term} in {city}", "{term} {city} ca", "{term} in {city}"];
+  const saasMods = ["{term} software", "{term} for small business", "{term} platform"];
+  const ecomMods = ["buy {term} online", "{term} online", "{term} deals", "{term} for sale"];
+  const infoMods = ["how to choose {term}", "{term} checklist", "{term} faq", "{term} comparison"];
+
+  for (const term of baseTerms) {
+    for (const t of templateMods) push(t.replace("{term}", term));
+    for (const t of infoMods) push(t.replace("{term}", term));
+    if (input.localMode && city) {
+      for (const t of localMods) push(t.replace("{term}", term).replace("{city}", city));
+    }
+    if (input.siteType === "saas") {
+      for (const t of saasMods) push(t.replace("{term}", term));
+    }
+    if (input.siteType === "woo") {
+      for (const t of ecomMods) push(t.replace("{term}", term));
+    }
+  }
+
+  for (const metric of input.semrushMetrics) {
+    push(metric.keyword);
+  }
+
+  return out.slice(0, 2000);
+}
+
+function buildDeterministicFallbackKeywords(input: {
+  siteUrl: string;
+  siteName: string;
+  industry: string;
+  locationTerms: string[];
+}): string[] {
+  const base = new Set<string>();
+  const host = normalizeRootDomain(input.siteUrl);
+  const hostTokens = tokenizeText(host.replace(/\./g, " "));
+  for (const token of hostTokens) {
+    if (token.length >= 3) base.add(token);
+  }
+  for (const token of tokenizeText(input.siteName)) {
+    if (token.length >= 3) base.add(token);
+  }
+  for (const token of tokenizeText(input.industry)) {
+    if (token.length >= 3) base.add(token);
+  }
+  if (base.size < 1) {
+    base.add("local service");
+    base.add("professional service");
+  }
+  const city = input.locationTerms[0] ?? "";
+  const out: string[] = [];
+  const push = (v: string) => {
+    const kw = toKeywordNorm(v);
+    if (!kw || out.includes(kw)) return;
+    out.push(kw);
+  };
+  for (const term of [...base].slice(0, 12)) {
+    push(term);
+    push(`${term} services`);
+    push(`best ${term}`);
+    push(`${term} cost`);
+    push(`${term} near me`);
+    if (city) {
+      push(`${term} ${city}`);
+      push(`best ${term} in ${city}`);
+    }
+    push(`how to choose ${term}`);
+    push(`${term} faq`);
+    push(`${term} comparison`);
+  }
+  return out.slice(0, 200);
+}
+
+function findSupportingTerms(keyword: string, offerTerms: string[], localMode: boolean): string[] {
+  const defaults = localMode
+    ? ["near me", "same day", "licensed", "insured", "cost", "quote", "reviews", "best", "local", "service"]
+    : ["pricing", "features", "benefits", "reviews", "best", "guide", "comparison", "cost", "setup", "support"];
+  const merged = [...tokenizeText(keyword), ...offerTerms.flatMap((v) => tokenizeText(v).slice(0, 2)), ...defaults];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const term of merged) {
+    const value = cleanString(term, 40).toLowerCase();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+    if (out.length >= 15) break;
+  }
+  return out.slice(0, 15);
+}
+
+function computeWinnabilityScore(metric: Step1SemrushMetric | undefined): number {
+  if (!metric) return 0.45;
+  const domains = metric.top_domains.map((v) => normalizeRootDomain(v));
+  const giantDomains = new Set([
+    "amazon.com",
+    "wikipedia.org",
+    "youtube.com",
+    "reddit.com",
+    "facebook.com",
+    "linkedin.com",
+    "yelp.com",
+  ]);
+  let giantCount = 0;
+  for (const domain of domains.slice(0, 10)) {
+    if (giantDomains.has(domain)) giantCount += 1;
+  }
+  const giantPenalty = clamp01(giantCount / 10);
+
+  const serpFeatures = metric.serp_features.map((v) => v.toLowerCase());
+  const featurePenalty = clamp01(
+    (serpFeatures.some((v) => v.includes("ads")) ? 0.15 : 0) +
+      (serpFeatures.some((v) => v.includes("shopping")) ? 0.15 : 0) +
+      (serpFeatures.some((v) => v.includes("answer")) ? 0.08 : 0)
+  );
+
+  const kdPenalty = clamp01(metric.kd / 100);
+  return clamp01(1 - 0.45 * giantPenalty - 0.3 * featurePenalty - 0.25 * kdPenalty);
+}
+
+function scoreKeywordCandidates(input: {
+  keywords: string[];
+  semrushMetrics: Step1SemrushMetric[];
+  offerTerms: string[];
+  locationTerms: string[];
+  siteType: string;
+  localMode: boolean;
+}): Step1KeywordCandidate[] {
+  const metricByKeyword = new Map(input.semrushMetrics.map((m) => [toKeywordNorm(m.keyword), m]));
+  const maxVolume = Math.max(
+    1,
+    ...input.semrushMetrics.map((m) => Math.max(0, Number(m.volume_us || 0)))
+  );
+  const maxCpc = Math.max(0.1, ...input.semrushMetrics.map((m) => Math.max(0, Number(m.cpc || 0))));
+  const offerVocab = new Set(input.offerTerms.flatMap((term) => tokenizeText(term)));
+
+  const rows: Step1KeywordCandidate[] = [];
+  for (const keyword of input.keywords) {
+    if (stripGarbageKeyword(keyword, input.siteType)) continue;
+    const keywordNorm = toKeywordNorm(keyword);
+    const metric = metricByKeyword.get(keywordNorm);
+    const intent = classifyIntent(keywordNorm);
+    const localIntent = classifyLocalIntent(keywordNorm, input.locationTerms, input.localMode);
+    const pageType = classifyPageType(intent, input.siteType, localIntent, keywordNorm);
+    const cluster = clusterForKeyword(keywordNorm, input.offerTerms);
+    const recommendedSlugBase = slugify(keywordNorm, 80);
+    const recommendedPageType = pageType === "location landing" ? "location landing" : pageType;
+    const recommendedSlug =
+      pageType === "location landing" ? `locations/${recommendedSlugBase}` : recommendedSlugBase || slugify(cluster, 80);
+
+    const volume = Math.max(0, Number(metric?.volume_us ?? 0) || 0);
+    const kd = Math.max(0, Math.min(100, Number(metric?.kd ?? 55) || 55));
+    const cpc = Math.max(0, Number(metric?.cpc ?? 0) || 0);
+    const competitiveDensity = clamp01(Number(metric?.competitive_density ?? 0) || 0);
+    const serpFeatures = metric?.serp_features ?? [];
+
+    const keywordTokens = tokenizeText(keywordNorm);
+    let overlap = 0;
+    for (const token of keywordTokens) {
+      if (offerVocab.has(token)) overlap += 1;
+    }
+    const relevanceScore = clamp01(keywordTokens.length > 0 ? overlap / keywordTokens.length : 0.2);
+    const intentScore =
+      intent === "transactional" ? 1 : intent === "commercial" ? 0.8 : intent === "informational" ? 0.45 : 0.25;
+    const volumeScore = clamp01(Math.log10(volume + 1) / Math.log10(maxVolume + 1));
+    const cpcProxyScore = clamp01(cpc / maxCpc);
+    const winnabilityScore = computeWinnabilityScore(metric);
+    const localBoost =
+      input.localMode === false
+        ? 0.25
+        : localIntent === "yes"
+          ? 1
+          : localIntent === "weak"
+            ? 0.6
+            : 0.15;
+    const difficultyPenalty = clamp01(kd / 100);
+    const featurePenaltyParts = serpFeatures.map((feature) => feature.toLowerCase());
+    const serpFeaturePenalty = clamp01(
+      (featurePenaltyParts.some((f) => f.includes("ads")) ? 0.12 : 0) +
+        (featurePenaltyParts.some((f) => f.includes("shopping")) ? 0.12 : 0) +
+        (featurePenaltyParts.some((f) => f.includes("local")) ? 0.1 : 0)
+    );
+
+    const score =
+      100 *
+      (0.35 * relevanceScore +
+        0.2 * intentScore +
+        0.2 * volumeScore +
+        0.1 * cpcProxyScore +
+        0.1 * localBoost +
+        0.05 * winnabilityScore) *
+      (1 - 0.6 * difficultyPenalty) *
+      (1 - serpFeaturePenalty);
+
+    rows.push({
+      keyword: keywordNorm,
+      keyword_norm: keywordNorm,
+      intent,
+      local_intent: localIntent,
+      page_type: pageType,
+      cluster,
+      recommended_slug: recommendedSlug,
+      recommended_page_type: recommendedPageType,
+      volume_us: Math.round(volume),
+      kd: Number(kd.toFixed(2)),
+      cpc: Number(cpc.toFixed(2)),
+      competitive_density: Number(competitiveDensity.toFixed(3)),
+      serp_features: serpFeatures,
+      relevance_score: Number(relevanceScore.toFixed(4)),
+      intent_score: Number(intentScore.toFixed(4)),
+      volume_score: Number(volumeScore.toFixed(4)),
+      cpc_proxy_score: Number(cpcProxyScore.toFixed(4)),
+      winnability_score: Number(winnabilityScore.toFixed(4)),
+      local_boost: Number(localBoost.toFixed(4)),
+      difficulty_penalty: Number(difficultyPenalty.toFixed(4)),
+      serp_feature_penalty: Number(serpFeaturePenalty.toFixed(4)),
+      opportunity_score: Number(score.toFixed(2)),
+      supporting_terms: findSupportingTerms(keywordNorm, input.offerTerms, input.localMode),
+    });
+  }
+
+  rows.sort((a, b) => b.opportunity_score - a.opportunity_score);
+  return rows;
+}
+
+function pickPrimaryKeywords(scored: Step1KeywordCandidate[], locationTerms: string[]): Step1KeywordCandidate[] {
+  const primaryPool = scored.filter((row) => row.intent === "transactional" || row.intent === "commercial");
+  const selected: Step1KeywordCandidate[] = [];
+  const variantCount = new Map<string, number>();
+  const clusterSet = new Set<string>();
+  const slugSet = new Set<string>();
+
+  // Pass 1: seed cluster diversity.
+  const byCluster = new Map<string, Step1KeywordCandidate[]>();
+  for (const row of primaryPool) {
+    const bucket = byCluster.get(row.cluster) ?? [];
+    bucket.push(row);
+    byCluster.set(row.cluster, bucket);
+  }
+  const clusterCandidates = [...byCluster.entries()]
+    .map(([cluster, rows]) => ({ cluster, best: rows[0] }))
+    .sort((a, b) => b.best.opportunity_score - a.best.opportunity_score)
+    .slice(0, 3);
+  for (const item of clusterCandidates) {
+    const group = buildVariantGroup(item.best.keyword, locationTerms);
+    variantCount.set(group, 1);
+    clusterSet.add(item.cluster);
+    slugSet.add(item.best.recommended_slug);
+    selected.push(item.best);
+  }
+
+  for (const row of primaryPool) {
+    if (selected.length >= 10) break;
+    if (selected.some((v) => v.keyword_norm === row.keyword_norm)) continue;
+    const variantGroup = buildVariantGroup(row.keyword, locationTerms);
+    const count = variantCount.get(variantGroup) ?? 0;
+    if (count >= 2) continue;
+
+    // Before reaching 5 unique slugs, prefer rows introducing new target pages.
+    if (slugSet.size < 5 && slugSet.has(row.recommended_slug)) {
+      continue;
+    }
+    selected.push(row);
+    variantCount.set(variantGroup, count + 1);
+    clusterSet.add(row.cluster);
+    slugSet.add(row.recommended_slug);
+  }
+
+  if (selected.length < 10) {
+    for (const row of primaryPool) {
+      if (selected.length >= 10) break;
+      if (selected.some((v) => v.keyword_norm === row.keyword_norm)) continue;
+      const variantGroup = buildVariantGroup(row.keyword, locationTerms);
+      const count = variantCount.get(variantGroup) ?? 0;
+      if (count >= 2) continue;
+      selected.push(row);
+      variantCount.set(variantGroup, count + 1);
+      clusterSet.add(row.cluster);
+      slugSet.add(row.recommended_slug);
+    }
+  }
+
+  const isMonetizable = (row: Step1KeywordCandidate): boolean => {
+    if (!(row.intent === "commercial" || row.intent === "transactional")) return false;
+    return (
+      row.page_type === "service" ||
+      row.page_type === "category" ||
+      row.page_type === "product" ||
+      row.page_type === "location landing"
+    );
+  };
+
+  const monetizableTarget = Math.min(8, Math.max(6, selected.length - 2));
+  let monetizableCount = selected.filter(isMonetizable).length;
+  if (monetizableCount < monetizableTarget) {
+    const replacements = primaryPool.filter(
+      (row) => isMonetizable(row) && !selected.some((v) => v.keyword_norm === row.keyword_norm)
+    );
+    for (const candidate of replacements) {
+      if (monetizableCount >= monetizableTarget) break;
+      const idx = selected.findIndex((row) => !isMonetizable(row));
+      if (idx < 0) break;
+      selected[idx] = candidate;
+      monetizableCount += 1;
+    }
+  }
+
+  return selected.slice(0, 10).sort((a, b) => b.opportunity_score - a.opportunity_score);
+}
+
+function chooseSecondaryContentType(keyword: string): "FAQ" | "guide" | "comparison" | "checklist" {
+  const text = toKeywordNorm(keyword);
+  if (/\b(vs|comparison|alternative)\b/.test(text)) return "comparison";
+  if (/\b(checklist|steps|template)\b/.test(text)) return "checklist";
+  if (/\b(faq|questions|what|why)\b/.test(text)) return "FAQ";
+  return "guide";
+}
+
+function buildOutlineBullets(keyword: string, type: "FAQ" | "guide" | "comparison" | "checklist"): string[] {
+  if (type === "FAQ") {
+    return [
+      `What ${keyword} means`,
+      `Who needs ${keyword}`,
+      `Typical pricing and timeline`,
+      "Common mistakes to avoid",
+      "How to choose a provider",
+      "Next steps",
+    ];
+  }
+  if (type === "comparison") {
+    return [
+      `${keyword}: key options compared`,
+      "Feature-by-feature breakdown",
+      "Pricing and value trade-offs",
+      "Best use cases",
+      "Decision framework",
+      "Recommended next step",
+    ];
+  }
+  if (type === "checklist") {
+    return [
+      `${keyword} pre-work checklist`,
+      "Required inputs and documents",
+      "Quality and compliance checks",
+      "Cost/time planning checklist",
+      "Launch checklist",
+      "Post-launch checks",
+    ];
+  }
+  return [
+    `Introduction to ${keyword}`,
+    "Core concepts and definitions",
+    "Process and best practices",
+    "Cost, effort, and timelines",
+    "Common pitfalls and fixes",
+    "When to hire an expert",
+  ];
+}
+
+function pickSecondaryKeywords(
+  scored: Step1KeywordCandidate[],
+  primary: Step1KeywordCandidate[],
+  locationTerms: string[]
+): Step1SecondarySelection[] {
+  const primarySet = new Set(primary.map((row) => row.keyword_norm));
+  const byClusterPrimary = new Map<string, Step1KeywordCandidate[]>();
+  for (const row of primary) {
+    const list = byClusterPrimary.get(row.cluster) ?? [];
+    list.push(row);
+    byClusterPrimary.set(row.cluster, list);
+  }
+
+  const pool = scored.filter((row) => !primarySet.has(row.keyword_norm) && row.intent !== "navigational");
+  const selected: Step1SecondarySelection[] = [];
+  const variantCount = new Map<string, number>();
+
+  for (const row of pool) {
+    if (selected.length >= 10) break;
+    if (!(row.intent === "informational" || row.intent === "commercial" || row.intent === "transactional")) continue;
+    const variantGroup = buildVariantGroup(row.keyword, locationTerms);
+    const count = variantCount.get(variantGroup) ?? 0;
+    if (count >= 2) continue;
+
+    const primaryClusterRows = byClusterPrimary.get(row.cluster) ?? primary;
+    const support = primaryClusterRows[0];
+    const contentType = chooseSecondaryContentType(row.keyword);
+    const internalLinkTo = support?.recommended_slug ?? primary[0]?.recommended_slug ?? "";
+    selected.push({
+      keyword: row.keyword,
+      intent: row.intent,
+      cluster: row.cluster,
+      supports_primary_keyword: support?.keyword ?? "",
+      recommended_content_type: contentType,
+      recommended_slug: `learn/${slugify(row.keyword, 80)}`,
+      outline_bullets: buildOutlineBullets(row.keyword, contentType).slice(0, 10),
+      internal_link_to: internalLinkTo,
+      volume_us: row.volume_us,
+      kd: row.kd,
+      cpc: row.cpc,
+      serp_features: row.serp_features,
+      opportunity_score: row.opportunity_score,
+    });
+    variantCount.set(variantGroup, count + 1);
+  }
+
+  return selected.slice(0, 10);
+}
+
+function buildClusterMap(
+  primary: Step1KeywordCandidate[],
+  secondary: Array<{ keyword: string; cluster: string }>
+): Array<{
+  cluster: string;
+  primary_keywords: string[];
+  secondary_keywords: string[];
+  suggested_pillar_page: string;
+}> {
+  const map = new Map<
+    string,
+    {
+      cluster: string;
+      primary_keywords: string[];
+      secondary_keywords: string[];
+      suggested_pillar_page: string;
+      score: number;
+    }
+  >();
+  for (const row of primary) {
+    const key = row.cluster || "general";
+    const slot = map.get(key) ?? {
+      cluster: key,
+      primary_keywords: [],
+      secondary_keywords: [],
+      suggested_pillar_page: row.recommended_slug,
+      score: row.opportunity_score,
+    };
+    slot.primary_keywords.push(row.keyword);
+    slot.score = Math.max(slot.score, row.opportunity_score);
+    if (!slot.suggested_pillar_page) {
+      slot.suggested_pillar_page = row.recommended_slug;
+    }
+    map.set(key, slot);
+  }
+  for (const row of secondary) {
+    const key = row.cluster || "general";
+    const slot = map.get(key);
+    if (!slot) continue;
+    slot.secondary_keywords.push(row.keyword);
+  }
+  return [...map.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8)
+    .map((row) => ({
+      cluster: row.cluster,
+      primary_keywords: row.primary_keywords.slice(0, 6),
+      secondary_keywords: row.secondary_keywords.slice(0, 12),
+      suggested_pillar_page: row.suggested_pillar_page,
+    }));
+}
+
+function fillPrimaryToTop10(
+  current: Step1KeywordCandidate[],
+  scored: Step1KeywordCandidate[],
+  locationTerms: string[]
+): Step1KeywordCandidate[] {
+  const out = [...current];
+  const seen = new Set(out.map((row) => row.keyword_norm));
+  const variantCount = new Map<string, number>();
+  for (const row of out) {
+    const key = buildVariantGroup(row.keyword, locationTerms);
+    variantCount.set(key, (variantCount.get(key) ?? 0) + 1);
+  }
+  for (const row of scored) {
+    if (out.length >= 10) break;
+    if (seen.has(row.keyword_norm)) continue;
+    if (!(row.intent === "commercial" || row.intent === "transactional")) continue;
+    const key = buildVariantGroup(row.keyword, locationTerms);
+    const count = variantCount.get(key) ?? 0;
+    if (count >= 2) continue;
+    out.push(row);
+    seen.add(row.keyword_norm);
+    variantCount.set(key, count + 1);
+  }
+  for (const row of scored) {
+    if (out.length >= 10) break;
+    if (seen.has(row.keyword_norm)) continue;
+    out.push(row);
+    seen.add(row.keyword_norm);
+  }
+  while (out.length < 10) {
+    const base = out[0] ?? scored[0];
+    if (!base) break;
+    const suffix = out.length + 1;
+    const fallbackKeyword = toKeywordNorm(`${base.cluster} service ${suffix}`);
+    if (seen.has(fallbackKeyword)) break;
+    out.push({
+      ...base,
+      keyword: fallbackKeyword,
+      keyword_norm: fallbackKeyword,
+      recommended_slug: slugify(fallbackKeyword, 80),
+      volume_us: 0,
+      kd: base.kd,
+      cpc: 0,
+      opportunity_score: Math.max(1, base.opportunity_score - suffix),
+      supporting_terms: findSupportingTerms(fallbackKeyword, [base.cluster], false),
+    });
+    seen.add(fallbackKeyword);
+  }
+  return out.slice(0, 10);
+}
+
+type Step1SecondarySelection = {
+  keyword: string;
+  intent: string;
+  cluster: string;
+  supports_primary_keyword: string;
+  recommended_content_type: "FAQ" | "guide" | "comparison" | "checklist";
+  recommended_slug: string;
+  outline_bullets: string[];
+  internal_link_to: string;
+  volume_us: number;
+  kd: number;
+  cpc: number;
+  serp_features: string[];
+  opportunity_score: number;
+};
+
+function fillSecondaryToTop10(
+  current: Step1SecondarySelection[],
+  scored: Step1KeywordCandidate[],
+  primary: Step1KeywordCandidate[],
+  locationTerms: string[]
+): Step1SecondarySelection[] {
+  const out = [...current];
+  const seen = new Set(out.map((row) => toKeywordNorm(row.keyword)));
+  const primarySeen = new Set(primary.map((row) => row.keyword_norm));
+  const variantCount = new Map<string, number>();
+  for (const row of out) {
+    const key = buildVariantGroup(row.keyword, locationTerms);
+    variantCount.set(key, (variantCount.get(key) ?? 0) + 1);
+  }
+  for (const row of scored) {
+    if (out.length >= 10) break;
+    if (primarySeen.has(row.keyword_norm)) continue;
+    if (seen.has(row.keyword_norm)) continue;
+    if (row.intent === "navigational") continue;
+    const key = buildVariantGroup(row.keyword, locationTerms);
+    const count = variantCount.get(key) ?? 0;
+    if (count >= 2) continue;
+    const contentType = chooseSecondaryContentType(row.keyword);
+    out.push({
+      keyword: row.keyword,
+      intent: row.intent,
+      cluster: row.cluster,
+      supports_primary_keyword: primary[0]?.keyword ?? "",
+      recommended_content_type: contentType,
+      recommended_slug: `learn/${slugify(row.keyword, 80)}`,
+      outline_bullets: buildOutlineBullets(row.keyword, contentType).slice(0, 10),
+      internal_link_to: primary[0]?.recommended_slug ?? "",
+      volume_us: row.volume_us,
+      kd: row.kd,
+      cpc: row.cpc,
+      serp_features: row.serp_features,
+      opportunity_score: row.opportunity_score,
+    });
+    seen.add(row.keyword_norm);
+    variantCount.set(key, count + 1);
+  }
+  while (out.length < 10) {
+    const base = out[0];
+    if (!base) break;
+    const suffix = out.length + 1;
+    const fallbackKeyword = toKeywordNorm(`${base.cluster} guide ${suffix}`);
+    if (seen.has(fallbackKeyword)) break;
+    const contentType = chooseSecondaryContentType(fallbackKeyword);
+    out.push({
+      keyword: fallbackKeyword,
+      intent: "informational",
+      cluster: base.cluster,
+      supports_primary_keyword: base.supports_primary_keyword,
+      recommended_content_type: contentType,
+      recommended_slug: `learn/${slugify(fallbackKeyword, 80)}`,
+      outline_bullets: buildOutlineBullets(fallbackKeyword, contentType).slice(0, 10),
+      internal_link_to: base.internal_link_to,
+      volume_us: 0,
+      kd: base.kd,
+      cpc: 0,
+      serp_features: [],
+      opportunity_score: Math.max(1, base.opportunity_score - suffix),
+    });
+    seen.add(fallbackKeyword);
+  }
+  return out.slice(0, 10);
+}
+
+function resolveTargetUrlForSlug(topPages: Array<{ url: string }>, slug: string): string | null {
+  const candidate = cleanString(slug, 200).replace(/^\/+/, "");
+  if (!candidate) return null;
+  for (const page of topPages) {
+    const url = cleanString(page.url, 2000);
+    if (!url) continue;
+    if (url.toLowerCase().includes(candidate.toLowerCase())) {
+      return url;
+    }
+  }
+  return null;
+}
+
+function buildStep1Step2Contract(
+  primary: Step1KeywordCandidate[],
+  secondary: Step1SecondarySelection[],
+  topPages: Array<{ url: string }>
+): Array<Record<string, unknown>> {
+  const rows: Array<Record<string, unknown>> = [];
+  for (const row of primary) {
+    rows.push({
+      keyword: row.keyword,
+      cluster: row.cluster,
+      intent: row.intent,
+      is_local_intent: row.local_intent === "yes" || row.local_intent === "weak",
+      target_page_type: row.recommended_page_type,
+      target_url: resolveTargetUrlForSlug(topPages, row.recommended_slug),
+      target_slug: row.recommended_slug,
+      priority: "primary",
+    });
+  }
+  for (const row of secondary) {
+    rows.push({
+      keyword: row.keyword,
+      cluster: row.cluster,
+      intent: row.intent,
+      is_local_intent: false,
+      target_page_type: row.recommended_content_type,
+      target_url: resolveTargetUrlForSlug(topPages, row.recommended_slug),
+      target_slug: row.recommended_slug,
+      priority: "secondary",
+    });
+  }
+  return rows.slice(0, 20);
+}
+
+async function saveStep1KeywordResearchResults(
+  env: Env,
+  input: {
+    siteId: string;
+    researchRunId: string;
+    primary: Step1KeywordCandidate[];
+    secondary: Step1SecondarySelection[];
+    clusters: Array<{
+      cluster: string;
+      primary_keywords: string[];
+      secondary_keywords: string[];
+      suggested_pillar_page: string;
+    }>;
+    step2Contract: Array<Record<string, unknown>>;
+  }
+): Promise<void> {
+  const ts = nowMs();
+
+  await env.DB.prepare("DELETE FROM wp_ai_seo_keywords WHERE site_id = ?").bind(input.siteId).run();
+
+  const selectedTierByKeyword = new Map<string, "primary" | "secondary" | "none">();
+  for (const row of input.primary) selectedTierByKeyword.set(row.keyword_norm, "primary");
+  for (const row of input.secondary) {
+    if (!selectedTierByKeyword.has(toKeywordNorm(row.keyword))) {
+      selectedTierByKeyword.set(toKeywordNorm(row.keyword), "secondary");
+    }
+  }
+
+  const allKeywordRows: Array<{
+    keyword: string;
+    keyword_norm: string;
+    cluster: string;
+    intent: string;
+    local_intent: string;
+    page_type: string;
+    recommended_slug: string;
+    opportunity_score: number;
+    selected_tier: "primary" | "secondary" | "none";
+    volume_us: number;
+    kd: number;
+    cpc: number;
+    competitive_density: number;
+    serp_features: string[];
+    data_source: string;
+  }> = [
+    ...input.primary.map((row) => ({
+      keyword: row.keyword,
+      keyword_norm: row.keyword_norm,
+      cluster: row.cluster,
+      intent: row.intent,
+      local_intent: row.local_intent,
+      page_type: row.page_type,
+      recommended_slug: row.recommended_slug,
+      opportunity_score: row.opportunity_score,
+      selected_tier: "primary" as const,
+      volume_us: row.volume_us,
+      kd: row.kd,
+      cpc: row.cpc,
+      competitive_density: row.competitive_density,
+      serp_features: row.serp_features,
+      data_source: "semrush_or_heuristic",
+    })),
+    ...input.secondary.map((row) => ({
+      keyword: row.keyword,
+      keyword_norm: toKeywordNorm(row.keyword),
+      cluster: row.cluster,
+      intent: row.intent,
+      local_intent: "weak",
+      page_type: row.recommended_content_type.toLowerCase(),
+      recommended_slug: row.recommended_slug,
+      opportunity_score: row.opportunity_score,
+      selected_tier: "secondary" as const,
+      volume_us: row.volume_us,
+      kd: row.kd,
+      cpc: row.cpc,
+      competitive_density: 0,
+      serp_features: row.serp_features,
+      data_source: "semrush_or_heuristic",
+    })),
+  ];
+
+  for (const row of allKeywordRows) {
+    const keywordId = uuid("kw");
+    await env.DB.prepare(
+      `INSERT INTO wp_ai_seo_keywords (
+        keyword_id, site_id, research_run_id, keyword, keyword_norm, cluster,
+        intent, local_intent, page_type, recommended_slug, opportunity_score,
+        selected_tier, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        keywordId,
+        input.siteId,
+        input.researchRunId,
+        row.keyword,
+        row.keyword_norm,
+        row.cluster,
+        row.intent,
+        row.local_intent,
+        row.page_type,
+        row.recommended_slug,
+        row.opportunity_score,
+        row.selected_tier,
+        ts,
+        ts
+      )
+      .run();
+
+    await env.DB.prepare(
+      `INSERT INTO wp_ai_seo_keyword_metrics (
+        metric_id, keyword_id, volume_us, kd, cpc, competitive_density, serp_features_json, data_source, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        uuid("met"),
+        keywordId,
+        row.volume_us,
+        row.kd,
+        row.cpc,
+        row.competitive_density,
+        safeJsonStringify(row.serp_features, 4000),
+        row.data_source,
+        ts
+      )
+      .run();
+  }
+
+  const primaryOutput = input.primary.map((row) => ({
+    keyword: row.keyword,
+    intent: row.intent,
+    cluster: row.cluster,
+    volume_us: row.volume_us,
+    kd: row.kd,
+    cpc: row.cpc,
+    serp_features: row.serp_features,
+    recommended_page_type: row.recommended_page_type,
+    recommended_slug: row.recommended_slug,
+    title_tag_suggestion: `${row.keyword} | ${row.cluster} Experts`,
+    h1_suggestion: row.keyword.replace(/\b\w/g, (v) => v.toUpperCase()),
+    supporting_terms: row.supporting_terms.slice(0, 15),
+    winnability_score: row.winnability_score,
+    opportunity_score: row.opportunity_score,
+  }));
+
+  const secondaryOutput = input.secondary.map((row) => ({
+    keyword: row.keyword,
+    intent: row.intent,
+    cluster: row.cluster,
+    supports_primary_keyword: row.supports_primary_keyword,
+    recommended_content_type: row.recommended_content_type,
+    recommended_slug: row.recommended_slug,
+    outline_bullets: row.outline_bullets.slice(0, 10),
+    internal_link_to: row.internal_link_to,
+    volume_us: row.volume_us,
+    kd: row.kd,
+    cpc: row.cpc,
+    serp_features: row.serp_features,
+    opportunity_score: row.opportunity_score,
+  }));
+
+  const resultPayload = {
+    site_id: input.siteId,
+    research_run_id: input.researchRunId,
+    generated_at: ts,
+    primary_top_10: primaryOutput,
+    secondary_top_10: secondaryOutput,
+    cluster_map: input.clusters,
+    step2_contract: input.step2Contract,
+  };
+
+  await env.DB.prepare(
+    `INSERT INTO wp_ai_seo_selections (
+      selection_id, site_id, research_run_id, selection_type, payload_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      uuid("sel"),
+      input.siteId,
+      input.researchRunId,
+      "keyword_research_results",
+      safeJsonStringify(resultPayload, 1_000_000),
+      ts
+    )
+    .run();
+
+  await env.DB.prepare("UPDATE wp_ai_seo_sites SET last_research_at = ?, updated_at = ? WHERE site_id = ?")
+    .bind(ts, ts, input.siteId)
+    .run();
+}
+
+async function loadLatestStep1KeywordResearchResults(env: Env, siteId: string): Promise<Record<string, unknown> | null> {
+  const row = await env.DB.prepare(
+    `SELECT payload_json
+     FROM wp_ai_seo_selections
+     WHERE site_id = ? AND selection_type = 'keyword_research_results'
+     ORDER BY created_at DESC
+     LIMIT 1`
+  )
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  const parsed = safeJsonParseObject(cleanString(row.payload_json, 1_000_000));
+  return parsed;
+}
+
+async function runStep1KeywordResearch(
+  env: Env,
+  site: Step1SiteRecord,
+  requestBody: Record<string, unknown> | null
+): Promise<{
+  researchRunId: string;
+  result: Record<string, unknown>;
+}> {
+  const siteInput = safeJsonParseObject(site.input_json) ?? {};
+  const payload = requestBody ?? {};
+  const semrushMetrics = parseSemrushMetrics(payload.semrush_keywords ?? siteInput.semrush_keywords);
+  const siteProfile = safeJsonParseObject(site.site_profile_json) ?? {};
+  const offerTerms = extractOfferTerms(siteInput);
+  const locationTerms = extractLocationTerms(siteInput);
+  const siteType = cleanString(siteProfile.site_type_detected, 60) || "general";
+  const localMode = site.local_mode || parseBoolUnknown(siteProfile.local_mode, false);
+
+  const candidateKeywords = generateCandidateKeywords({
+    offerTerms,
+    locationTerms,
+    siteType,
+    localMode,
+    semrushMetrics,
+  });
+  if (candidateKeywords.length < 40) {
+    const fallback = buildDeterministicFallbackKeywords({
+      siteUrl: cleanString(siteInput.site_url, 2000),
+      siteName: cleanString(siteInput.site_name, 200),
+      industry: cleanString(parseJsonObject(siteProfile.site_brief)?.industry, 120),
+      locationTerms,
+    });
+    for (const kw of fallback) {
+      if (!candidateKeywords.includes(kw)) {
+        candidateKeywords.push(kw);
+      }
+      if (candidateKeywords.length >= 2000) break;
+    }
+  }
+  const scored = scoreKeywordCandidates({
+    keywords: candidateKeywords,
+    semrushMetrics,
+    offerTerms,
+    locationTerms,
+    siteType,
+    localMode,
+  });
+  const primaryBase = pickPrimaryKeywords(scored, locationTerms);
+  const primary = fillPrimaryToTop10(primaryBase, scored, locationTerms);
+  const secondaryBase = pickSecondaryKeywords(scored, primary, locationTerms);
+  const secondary = fillSecondaryToTop10(secondaryBase, scored, primary, locationTerms);
+  const clusters = buildClusterMap(
+    primary,
+    secondary.map((row) => ({ keyword: row.keyword, cluster: row.cluster }))
+  );
+  const topPages = parseTopPages(siteInput.top_pages);
+  const step2Contract = buildStep1Step2Contract(primary, secondary, topPages);
+
+  const researchRunId = uuid("krr");
+  await saveStep1KeywordResearchResults(env, {
+    siteId: site.site_id,
+    researchRunId,
+    primary,
+    secondary,
+    clusters,
+    step2Contract,
+  });
+
+  const result = (await loadLatestStep1KeywordResearchResults(env, site.site_id)) ?? {};
+  return {
+    researchRunId,
+    result,
+  };
+}
+
+type Step2KeywordTarget = {
+  keyword: string;
+  cluster: string;
+  intent: string;
+  is_local_intent: boolean;
+  target_page_type: string;
+  target_url: string | null;
+  target_slug: string | null;
+  priority: "primary" | "secondary";
+};
+
+function getSitePlanFromInput(siteInput: Record<string, unknown>): { metro_proxy: boolean; metro: string | null } {
+  const plan = parseJsonObject(siteInput.plan) ?? {};
+  return {
+    metro_proxy: parseBoolUnknown(plan.metro_proxy, false),
+    metro: cleanString(plan.metro, 120) || null,
+  };
+}
+
+function parseStep2KeywordTargets(result: Record<string, unknown>): Step2KeywordTarget[] {
+  const raw = Array.isArray(result.step2_contract) ? result.step2_contract : [];
+  const out: Step2KeywordTarget[] = [];
+  for (const item of raw) {
+    const row = parseJsonObject(item);
+    if (!row) continue;
+    const keyword = cleanString(row.keyword, 300);
+    if (!keyword) continue;
+    const priority = cleanString(row.priority, 20).toLowerCase() === "secondary" ? "secondary" : "primary";
+    out.push({
+      keyword,
+      cluster: cleanString(row.cluster, 120) || "general",
+      intent: cleanString(row.intent, 40) || "commercial",
+      is_local_intent: parseBoolUnknown(row.is_local_intent, false),
+      target_page_type: cleanString(row.target_page_type, 80) || "service",
+      target_url: cleanString(row.target_url, 2000) || null,
+      target_slug: cleanString(row.target_slug, 120) || null,
+      priority,
+    });
+    if (out.length >= SITE_KEYWORD_CAP) break;
+  }
+  return out;
+}
+
+function classifySerpResultPageType(url: string, title: string | null, h1: string | null): string {
+  const text = `${cleanString(url, 2000)} ${cleanString(title, 300)} ${cleanString(h1, 300)}`.toLowerCase();
+  if (/\b(product|shop|sku|buy|cart)\b/.test(text)) return "product";
+  if (/\b(category|collections?)\b/.test(text)) return "category";
+  if (/\b(forum|reddit|quora)\b/.test(text)) return "forum";
+  if (/\b(yelp|angi|tripadvisor|directory)\b/.test(text)) return "directory";
+  if (/\b(blog|guide|how-to|article|news)\b/.test(text)) return "blog";
+  if (/\b(service|location|near-me|quote|book)\b/.test(text)) return "service";
+  return "other";
+}
+
+function extractHtmlTagText(html: string, tag: string): string[] {
+  const pattern = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "gi");
+  const out: string[] = [];
+  let match: RegExpExecArray | null = null;
+  while ((match = pattern.exec(html)) != null) {
+    const text = cleanString(match[1], 4000).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (text) out.push(text);
+    if (out.length >= 200) break;
+  }
+  return out;
+}
+
+function extractMetaContent(html: string, name: string): string | null {
+  const pattern = new RegExp(
+    `<meta[^>]+(?:name|property)=["']${name}["'][^>]*content=["']([^"']*)["'][^>]*>`,
+    "i"
+  );
+  const m = html.match(pattern);
+  return m ? cleanString(m[1], 800) || null : null;
+}
+
+function extractLinkHref(html: string, relValue: string): string | null {
+  const pattern = new RegExp(
+    `<link[^>]+rel=["'][^"']*${relValue}[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>`,
+    "i"
+  );
+  const m = html.match(pattern);
+  return m ? cleanString(m[1], 2000) || null : null;
+}
+
+async function fetchHtmlWithTimeout(
+  url: string,
+  timeoutMs = 8000,
+  etag: string | null = null,
+  lastModified: string | null = null
+): Promise<{ status: number; html: string | null; etag: string | null; last_modified: string | null }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const headers: Record<string, string> = {
+      "user-agent": "SEO-Agent/1.0 (+https://example.invalid)",
+    };
+    if (etag) headers["if-none-match"] = etag;
+    if (lastModified) headers["if-modified-since"] = lastModified;
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers,
+    });
+    if (res.status === 304) {
+      return { status: 304, html: null, etag: etag ?? null, last_modified: lastModified ?? null };
+    }
+    if (!res.ok) {
+      return { status: res.status, html: null, etag: null, last_modified: null };
+    }
+    return {
+      status: res.status,
+      html: await res.text(),
+      etag: cleanString(res.headers.get("etag"), 500) || null,
+      last_modified: cleanString(res.headers.get("last-modified"), 200) || null,
+    };
+  } catch {
+    return { status: 0, html: null, etag: null, last_modified: null };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+type Step2PageExtract = {
+  url: string;
+  domain: string;
+  title: string | null;
+  meta_description: string | null;
+  robots_meta: string | null;
+  canonical_url: string | null;
+  hreflang_count: number;
+  h1_text: string | null;
+  h2_json: string;
+  h3_json: string;
+  word_count: number;
+  schema_types_json: string;
+  internal_links_out_count: number;
+  internal_anchors_json: string;
+  external_links_out_count: number;
+  external_anchors_json: string;
+  image_count: number;
+  alt_coverage_rate: number;
+  keyword_placement_flags_json: string;
+  faq_section_present: number;
+  pricing_section_present: number;
+  testimonials_present: number;
+  location_refs_present: number;
+  how_it_works_present: number;
+  internal_edges: Array<{ to_url: string; anchor: string }>;
+};
+
+function buildStep2PageExtract(url: string, html: string, keyword: string): Step2PageExtract {
+  const domain = normalizeDomain(url);
+  const title = extractHtmlTagText(html, "title")[0] ?? null;
+  const metaDescription = extractMetaContent(html, "description");
+  const robotsMeta = extractMetaContent(html, "robots");
+  const canonicalUrl = extractLinkHref(html, "canonical");
+  const hreflangMatches = html.match(/<link[^>]+hreflang=/gi) ?? [];
+  const h1List = extractHtmlTagText(html, "h1");
+  const h2List = extractHtmlTagText(html, "h2");
+  const h3List = extractHtmlTagText(html, "h3");
+  const bodyText = cleanString(html, 2_000_000).replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const words = bodyText ? bodyText.split(/\s+/).filter(Boolean) : [];
+
+  const schemaTypes = new Set<string>();
+  const ldJsonPattern = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let ldMatch: RegExpExecArray | null = null;
+  while ((ldMatch = ldJsonPattern.exec(html)) != null) {
+    const raw = cleanString(ldMatch[1], 100_000);
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      const scan = (value: unknown) => {
+        if (Array.isArray(value)) {
+          for (const row of value) scan(row);
+          return;
+        }
+        const obj = parseJsonObject(value);
+        if (!obj) return;
+        const typeValue = obj["@type"];
+        if (typeof typeValue === "string") schemaTypes.add(cleanString(typeValue, 80));
+        if (Array.isArray(typeValue)) {
+          for (const row of typeValue) {
+            const t = cleanString(row, 80);
+            if (t) schemaTypes.add(t);
+          }
+        }
+      };
+      scan(parsed);
+    } catch {
+      continue;
+    }
+  }
+
+  const linkPattern = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let linkMatch: RegExpExecArray | null = null;
+  let internalOut = 0;
+  let externalOut = 0;
+  const internalAnchors: string[] = [];
+  const externalAnchors: string[] = [];
+  const internalEdges: Array<{ to_url: string; anchor: string }> = [];
+  while ((linkMatch = linkPattern.exec(html)) != null) {
+    const hrefRaw = cleanString(linkMatch[1], 2000);
+    if (!hrefRaw || hrefRaw.startsWith("#") || hrefRaw.startsWith("mailto:") || hrefRaw.startsWith("tel:")) continue;
+    const anchor = cleanString(linkMatch[2], 300).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    try {
+      const absolute = new URL(hrefRaw, url);
+      if (absolute.hostname === domain || absolute.hostname.endsWith(`.${domain}`)) {
+        internalOut += 1;
+        if (anchor) {
+          internalAnchors.push(anchor);
+          internalEdges.push({ to_url: absolute.toString(), anchor });
+        }
+      } else {
+        externalOut += 1;
+        if (anchor) externalAnchors.push(anchor);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  const imageTags = html.match(/<img\b[^>]*>/gi) ?? [];
+  let imageCount = 0;
+  let altCount = 0;
+  for (const img of imageTags) {
+    imageCount += 1;
+    if (/\balt=["'][^"']*["']/i.test(img)) altCount += 1;
+  }
+  const altCoverage = imageCount > 0 ? altCount / imageCount : 1;
+  const keywordNorm = toKeywordNorm(keyword);
+  const first100 = words.slice(0, 100).join(" ").toLowerCase();
+  const placements = {
+    in_title: toKeywordNorm(title ?? "").includes(keywordNorm),
+    in_h1: toKeywordNorm(h1List[0] ?? "").includes(keywordNorm),
+    in_first_100_words: first100.includes(keywordNorm),
+    in_url: toKeywordNorm(url).includes(keywordNorm),
+    in_alt_text: false,
+  };
+  if (keywordNorm) {
+    const imgAltPattern = /<img\b[^>]*\balt=["']([^"']+)["'][^>]*>/gi;
+    let altMatch: RegExpExecArray | null = null;
+    while ((altMatch = imgAltPattern.exec(html)) != null) {
+      const alt = toKeywordNorm(altMatch[1]);
+      if (alt.includes(keywordNorm)) {
+        placements.in_alt_text = true;
+        break;
+      }
+    }
+  }
+  const pageLower = bodyText.toLowerCase();
+
+  return {
+    url,
+    domain,
+    title,
+    meta_description: metaDescription,
+    robots_meta: robotsMeta,
+    canonical_url: canonicalUrl,
+    hreflang_count: hreflangMatches.length,
+    h1_text: h1List[0] ?? null,
+    h2_json: safeJsonStringify(h2List.slice(0, 40), 12000),
+    h3_json: safeJsonStringify(h3List.slice(0, 40), 12000),
+    word_count: words.length,
+    schema_types_json: safeJsonStringify([...schemaTypes], 4000),
+    internal_links_out_count: internalOut,
+    internal_anchors_json: safeJsonStringify(internalAnchors.slice(0, 80), 12000),
+    external_links_out_count: externalOut,
+    external_anchors_json: safeJsonStringify(externalAnchors.slice(0, 80), 12000),
+    image_count: imageCount,
+    alt_coverage_rate: Number(altCoverage.toFixed(4)),
+    keyword_placement_flags_json: safeJsonStringify(placements, 2000),
+    faq_section_present: /\bfaq|frequently asked/i.test(pageLower) ? 1 : 0,
+    pricing_section_present: /\bpricing|cost|price|quote\b/i.test(pageLower) ? 1 : 0,
+    testimonials_present: /\btestimonial|reviews?|case study\b/i.test(pageLower) ? 1 : 0,
+    location_refs_present: /\bnear me|in [a-z]{3,}|serving\b/i.test(pageLower) ? 1 : 0,
+    how_it_works_present: /\bhow it works|steps|process\b/i.test(pageLower) ? 1 : 0,
+    internal_edges: internalEdges.slice(0, 120),
+  };
+}
+
+async function loadHtmlCache(
+  env: Env,
+  urlHash: string,
+  now: number
+): Promise<{ html_snapshot: string; etag: string | null; last_modified: string | null } | null> {
+  const row = await env.DB.prepare(
+    `SELECT html_snapshot, etag, last_modified
+     FROM step2_html_cache
+     WHERE url_hash = ? AND expires_at > ?
+     LIMIT 1`
+  )
+    .bind(urlHash, now)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  const html = cleanString(row.html_snapshot, 1_500_000);
+  if (!html) return null;
+  return {
+    html_snapshot: html,
+    etag: cleanString(row.etag, 500) || null,
+    last_modified: cleanString(row.last_modified, 200) || null,
+  };
+}
+
+async function upsertHtmlCache(
+  env: Env,
+  input: {
+    urlHash: string;
+    url: string;
+    etag: string | null;
+    lastModified: string | null;
+    html: string;
+    now: number;
+    ttlMs: number;
+  }
+): Promise<void> {
+  const contentHash = await sha256Hex(input.html);
+  const expiresAt = input.now + input.ttlMs;
+  await env.DB.prepare(
+    `INSERT INTO step2_html_cache (
+      cache_id, url_hash, url, etag, last_modified, content_hash, html_snapshot, updated_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(url_hash) DO UPDATE SET
+      url = excluded.url,
+      etag = excluded.etag,
+      last_modified = excluded.last_modified,
+      content_hash = excluded.content_hash,
+      html_snapshot = excluded.html_snapshot,
+      updated_at = excluded.updated_at,
+      expires_at = excluded.expires_at`
+  )
+    .bind(
+      uuid("s2hc"),
+      input.urlHash,
+      input.url,
+      input.etag,
+      input.lastModified,
+      contentHash,
+      input.html.slice(0, 1_500_000),
+      input.now,
+      expiresAt
+    )
+    .run();
+}
+
+async function canFetchByRobots(
+  env: Env,
+  url: string,
+  robotsCache: Map<string, { allowedAll: boolean; disallowAll: boolean }>
+): Promise<boolean> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  const domain = parsed.hostname.toLowerCase();
+  const cached = robotsCache.get(domain);
+  if (cached) {
+    return cached.allowedAll || !cached.disallowAll;
+  }
+
+  const cacheKey = `robots:${domain}`;
+  const now = nowMs();
+  const dbCached = await env.DB.prepare(
+    `SELECT data_json
+     FROM step2_backlink_cache
+     WHERE cache_key = ? AND expires_at > ?
+     LIMIT 1`
+  )
+    .bind(cacheKey, now)
+    .first<Record<string, unknown>>();
+  if (dbCached) {
+    const data = safeJsonParseObject(cleanString(dbCached.data_json, 4000)) ?? {};
+    const value = {
+      allowedAll: parseBoolUnknown(data.allowed_all, false),
+      disallowAll: parseBoolUnknown(data.disallow_all, false),
+    };
+    robotsCache.set(domain, value);
+    return value.allowedAll || !value.disallowAll;
+  }
+
+  const robotsUrl = `${parsed.protocol}//${domain}/robots.txt`;
+  const fetched = await fetchHtmlWithTimeout(robotsUrl, 5000);
+  let disallowAll = false;
+  let allowedAll = true;
+  if (fetched.status >= 200 && fetched.status < 300 && fetched.html) {
+    const lines = fetched.html.split(/\r?\n/).map((v) => v.trim());
+    let inGlobal = false;
+    disallowAll = false;
+    allowedAll = true;
+    for (const line of lines) {
+      if (!line || line.startsWith("#")) continue;
+      const low = line.toLowerCase();
+      if (low.startsWith("user-agent:")) {
+        const ua = cleanString(line.split(":").slice(1).join(":"), 200).toLowerCase();
+        inGlobal = ua === "*" || ua === "";
+        continue;
+      }
+      if (!inGlobal) continue;
+      if (low.startsWith("disallow:")) {
+        const path = cleanString(line.split(":").slice(1).join(":"), 300);
+        if (path === "/") {
+          disallowAll = true;
+          allowedAll = false;
+        }
+      }
+      if (low.startsWith("allow:")) {
+        const path = cleanString(line.split(":").slice(1).join(":"), 300);
+        if (path === "/" || path.length > 1) {
+          allowedAll = true;
+        }
+      }
+    }
+  }
+
+  const summary = { allowed_all: allowedAll, disallow_all: disallowAll };
+  await env.DB.prepare(
+    `INSERT INTO step2_backlink_cache (
+      cache_id, cache_key, scope, provider, data_json, updated_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(cache_key) DO UPDATE SET
+      scope = excluded.scope,
+      provider = excluded.provider,
+      data_json = excluded.data_json,
+      updated_at = excluded.updated_at,
+      expires_at = excluded.expires_at`
+  )
+    .bind(
+      uuid("s2bc"),
+      cacheKey,
+      "robots",
+      "internal",
+      safeJsonStringify(summary, 4000),
+      now,
+      now + 24 * 60 * 60 * 1000
+    )
+    .run();
+
+  const value = { allowedAll, disallowAll };
+  robotsCache.set(domain, value);
+  return value.allowedAll || !value.disallowAll;
+}
+
+async function getBacklinkMetricsCached(
+  env: Env,
+  input: { urlHash: string; url: string; domain: string }
+): Promise<{ backlinks: number; ref_domains: number; authority_metric: number; provider: string; top_anchors: string[] }> {
+  const now = nowMs();
+  const key = `bl:url:${input.urlHash}`;
+  const cached = await env.DB.prepare(
+    `SELECT data_json
+     FROM step2_backlink_cache
+     WHERE cache_key = ? AND expires_at > ?
+     LIMIT 1`
+  )
+    .bind(key, now)
+    .first<Record<string, unknown>>();
+  if (cached) {
+    const data = safeJsonParseObject(cleanString(cached.data_json, 4000)) ?? {};
+    return {
+      backlinks: clampInt(data.backlinks, 0, 10_000_000, 0),
+      ref_domains: clampInt(data.ref_domains, 0, 1_000_000, 0),
+      authority_metric: Math.max(0, Number(data.authority_metric ?? 0) || 0),
+      provider: cleanString(data.provider, 40) || "semrush",
+      top_anchors: parseStringArray(data.top_anchors, 20, 120),
+    };
+  }
+
+  const placeholder = {
+    backlinks: 0,
+    ref_domains: 0,
+    authority_metric: 0,
+    provider: "semrush",
+    top_anchors: [] as string[],
+  };
+  await env.DB.prepare(
+    `INSERT INTO step2_backlink_cache (
+      cache_id, cache_key, scope, provider, data_json, updated_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(cache_key) DO UPDATE SET
+      scope = excluded.scope,
+      provider = excluded.provider,
+      data_json = excluded.data_json,
+      updated_at = excluded.updated_at,
+      expires_at = excluded.expires_at`
+  )
+    .bind(
+      uuid("s2bc"),
+      key,
+      "url",
+      "semrush",
+      safeJsonStringify({ ...placeholder, url: input.url, domain: input.domain }, 4000),
+      now,
+      now + 7 * 24 * 60 * 60 * 1000
+    )
+    .run();
+  return placeholder;
+}
+
+async function saveStep2SerpSnapshot(
+  env: Env,
+  input: { siteId: string; keyword: string; cluster: string; intent: string; geo: string; serpFeatures: string[]; scrapedAt: number }
+): Promise<string> {
+  const serpId = uuid("s2serp");
+  await env.DB.prepare(
+    `INSERT INTO step2_serp_snapshots (
+      serp_id, site_id, keyword, cluster, intent, geo, date_yyyymmdd, serp_features_json, scraped_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      serpId,
+      input.siteId,
+      cleanString(input.keyword, 300),
+      cleanString(input.cluster, 120),
+      cleanString(input.intent, 40),
+      cleanString(input.geo, 120),
+      toDateYYYYMMDD(input.scrapedAt),
+      safeJsonStringify(input.serpFeatures, 4000),
+      input.scrapedAt
+    )
+    .run();
+  return serpId;
+}
+
+async function loadLatestStep2SerpSnapshotBeforeDate(
+  env: Env,
+  input: { siteId: string; keyword: string; geo: string; beforeDate: string }
+): Promise<{ serp_id: string; date_yyyymmdd: string } | null> {
+  const row = await env.DB.prepare(
+    `SELECT serp_id, date_yyyymmdd
+     FROM step2_serp_snapshots
+     WHERE site_id = ? AND keyword = ? AND geo = ? AND date_yyyymmdd < ?
+     ORDER BY date_yyyymmdd DESC, scraped_at DESC
+     LIMIT 1`
+  )
+    .bind(input.siteId, input.keyword, input.geo, input.beforeDate)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return {
+    serp_id: cleanString(row.serp_id, 120),
+    date_yyyymmdd: cleanString(row.date_yyyymmdd, 20),
+  };
+}
+
+async function loadStep2SerpResultsForSnapshot(
+  env: Env,
+  serpId: string
+): Promise<Array<{ rank: number; url: string; url_hash: string; domain: string; page_type: string }>> {
+  const rows = await env.DB.prepare(
+    `SELECT rank, url, url_hash, domain, page_type
+     FROM step2_serp_results
+     WHERE serp_id = ?
+     ORDER BY rank ASC`
+  )
+    .bind(serpId)
+    .all<Record<string, unknown>>();
+  return (rows.results ?? []).map((row) => ({
+    rank: clampInt(row.rank, 1, 1000, 999),
+    url: cleanString(row.url, 2000),
+    url_hash: cleanString(row.url_hash, 128),
+    domain: cleanString(row.domain, 255),
+    page_type: cleanString(row.page_type, 80) || "other",
+  }));
+}
+
+async function loadLatestStep2PageExtract(
+  env: Env,
+  urlHash: string,
+  beforeDate: string
+): Promise<
+  | {
+      date_yyyymmdd: string;
+      title: string | null;
+      meta_description: string | null;
+      h1_text: string | null;
+      word_count: number;
+      schema_types_json: string;
+      faq_section_present: number;
+      pricing_section_present: number;
+      testimonials_present: number;
+      how_it_works_present: number;
+      location_refs_present: number;
+    }
+  | null
+> {
+  const row = await env.DB.prepare(
+    `SELECT
+       date_yyyymmdd, title, meta_description, h1_text, word_count,
+       schema_types_json, faq_section_present, pricing_section_present,
+       testimonials_present, how_it_works_present, location_refs_present
+     FROM step2_page_extracts
+     WHERE url_hash = ? AND date_yyyymmdd < ?
+     ORDER BY date_yyyymmdd DESC
+     LIMIT 1`
+  )
+    .bind(urlHash, beforeDate)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return {
+    date_yyyymmdd: cleanString(row.date_yyyymmdd, 20),
+    title: cleanString(row.title, 800) || null,
+    meta_description: cleanString(row.meta_description, 800) || null,
+    h1_text: cleanString(row.h1_text, 800) || null,
+    word_count: clampInt(row.word_count, 0, 2_000_000, 0),
+    schema_types_json: cleanString(row.schema_types_json, 12000) || "[]",
+    faq_section_present: clampInt(row.faq_section_present, 0, 1, 0),
+    pricing_section_present: clampInt(row.pricing_section_present, 0, 1, 0),
+    testimonials_present: clampInt(row.testimonials_present, 0, 1, 0),
+    how_it_works_present: clampInt(row.how_it_works_present, 0, 1, 0),
+    location_refs_present: clampInt(row.location_refs_present, 0, 1, 0),
+  };
+}
+
+async function loadLatestStep2BacklinkRow(
+  env: Env,
+  urlHash: string,
+  beforeDate: string
+): Promise<{ ref_domains: number } | null> {
+  const row = await env.DB.prepare(
+    `SELECT ref_domains
+     FROM step2_url_backlinks
+     WHERE url_hash = ? AND date_yyyymmdd < ?
+     ORDER BY date_yyyymmdd DESC
+     LIMIT 1`
+  )
+    .bind(urlHash, beforeDate)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return {
+    ref_domains: clampInt(row.ref_domains, 0, 1_000_000, 0),
+  };
+}
+
+async function loadLatestBaselineForSite(
+  env: Env,
+  siteId: string
+): Promise<{ baseline_snapshot_id: string; date_yyyymmdd: string; created_at: number } | null> {
+  const row = await env.DB.prepare(
+    `SELECT baseline_snapshot_id, date_yyyymmdd, created_at
+     FROM step2_baselines
+     WHERE site_id = ?
+     ORDER BY created_at DESC
+     LIMIT 1`
+  )
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return {
+    baseline_snapshot_id: cleanString(row.baseline_snapshot_id, 120),
+    date_yyyymmdd: cleanString(row.date_yyyymmdd, 20),
+    created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  };
+}
+
+async function saveStep2BaselineSnapshot(
+  env: Env,
+  input: { siteId: string; date: string; parentJobId: string | null; summary: unknown }
+): Promise<string> {
+  const id = uuid("s2base");
+  await env.DB.prepare(
+    `INSERT INTO step2_baselines (
+      baseline_snapshot_id, site_id, date_yyyymmdd, run_job_id, summary_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      id,
+      input.siteId,
+      input.date,
+      cleanString(input.parentJobId, 120) || null,
+      safeJsonStringify(input.summary, 32000),
+      nowMs()
+    )
+    .run();
+  return id;
+}
+
+function shouldRefreshUrlForDelta(input: {
+  rank: number;
+  isNewEntrant: boolean;
+  movedIntoTop10: boolean;
+  movedIntoTop5: boolean;
+  movedIntoTop3: boolean;
+  lastExtractDate: string | null;
+  todayDate: string;
+}): boolean {
+  if (input.rank <= 5) return true;
+  if (input.isNewEntrant) return true;
+  if (input.movedIntoTop10 || input.movedIntoTop5 || input.movedIntoTop3) return true;
+  if (!input.lastExtractDate) return true;
+  return input.lastExtractDate < toDateYYYYMMDD(nowMs() - 7 * 24 * 60 * 60 * 1000);
+}
+
+function diffSchemaTypes(prevJson: string, currJson: string): { added: string[]; removed: string[] } {
+  const prev = new Set(parseStringArray(safeJsonParseObject(`{"a":${prevJson}}`)?.a, 50, 100).map((v) => v.toLowerCase()));
+  const curr = new Set(parseStringArray(safeJsonParseObject(`{"a":${currJson}}`)?.a, 50, 100).map((v) => v.toLowerCase()));
+  const added: string[] = [];
+  const removed: string[] = [];
+  for (const v of curr) if (!prev.has(v)) added.push(v);
+  for (const v of prev) if (!curr.has(v)) removed.push(v);
+  return { added, removed };
+}
+
+async function saveStep2SerpDiff(
+  env: Env,
+  input: {
+    siteId: string;
+    date: string;
+    keyword: string;
+    geo: string;
+    previous: Array<{ rank: number; url: string; url_hash: string; page_type: string }>;
+    current: Array<{ rank: number; url: string; url_hash: string; page_type: string }>;
+    baseline: Array<{ rank: number; url: string; url_hash: string; page_type: string }>;
+    serpFeatureDelta: Record<string, unknown>;
+  }
+): Promise<void> {
+  const prevByHash = new Map(input.previous.map((row) => [row.url_hash, row]));
+  const currByHash = new Map(input.current.map((row) => [row.url_hash, row]));
+  const baselineByHash = new Map(input.baseline.map((row) => [row.url_hash, row]));
+
+  const entered = input.current.filter((row) => !prevByHash.has(row.url_hash)).map((row) => row.url);
+  const dropped = input.previous.filter((row) => !currByHash.has(row.url_hash)).map((row) => row.url);
+  const rankDelta = input.current
+    .filter((row) => prevByHash.has(row.url_hash))
+    .map((row) => ({
+      url: row.url,
+      from_rank: prevByHash.get(row.url_hash)?.rank ?? null,
+      to_rank: row.rank,
+      delta: (prevByHash.get(row.url_hash)?.rank ?? row.rank) - row.rank,
+    }));
+
+  const formatDelta = {
+    previous: input.previous.reduce<Record<string, number>>((acc, row) => {
+      acc[row.page_type] = (acc[row.page_type] ?? 0) + 1;
+      return acc;
+    }, {}),
+    current: input.current.reduce<Record<string, number>>((acc, row) => {
+      acc[row.page_type] = (acc[row.page_type] ?? 0) + 1;
+      return acc;
+    }, {}),
+  };
+
+  const baselineDelta = input.current
+    .filter((row) => baselineByHash.has(row.url_hash))
+    .map((row) => ({
+      url: row.url,
+      baseline_rank: baselineByHash.get(row.url_hash)?.rank ?? null,
+      current_rank: row.rank,
+      delta: (baselineByHash.get(row.url_hash)?.rank ?? row.rank) - row.rank,
+    }));
+
+  await env.DB.prepare(
+    `INSERT INTO step2_serp_diffs (
+      diff_id, site_id, date_yyyymmdd, keyword, geo,
+      entered_urls_json, dropped_urls_json, rank_delta_json,
+      serp_feature_delta_json, format_delta_json, baseline_delta_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      uuid("s2sd"),
+      input.siteId,
+      input.date,
+      input.keyword,
+      input.geo,
+      safeJsonStringify(entered, 12000),
+      safeJsonStringify(dropped, 12000),
+      safeJsonStringify(rankDelta, 32000),
+      safeJsonStringify(input.serpFeatureDelta, 4000),
+      safeJsonStringify(formatDelta, 16000),
+      safeJsonStringify(baselineDelta, 32000),
+      nowMs()
+    )
+    .run();
+}
+
+async function saveStep2UrlDiff(
+  env: Env,
+  input: {
+    siteId: string;
+    date: string;
+    keyword: string;
+    url: string;
+    urlHash: string;
+    previousExtract: Awaited<ReturnType<typeof loadLatestStep2PageExtract>>;
+    currentExtract: Step2PageExtract;
+    previousRefDomains: number;
+    currentRefDomains: number;
+    previousInbound: number;
+    currentInbound: number;
+  }
+): Promise<void> {
+  const prev = input.previousExtract;
+  if (!prev) return;
+  const fieldChanges: Record<string, unknown> = {};
+  if ((prev.title ?? "") !== (input.currentExtract.title ?? "")) {
+    fieldChanges.title = { from: prev.title, to: input.currentExtract.title };
+  }
+  if ((prev.meta_description ?? "") !== (input.currentExtract.meta_description ?? "")) {
+    fieldChanges.meta_description = { from: prev.meta_description, to: input.currentExtract.meta_description };
+  }
+  if ((prev.h1_text ?? "") !== (input.currentExtract.h1_text ?? "")) {
+    fieldChanges.h1 = { from: prev.h1_text, to: input.currentExtract.h1_text };
+  }
+  const schemaDelta = diffSchemaTypes(prev.schema_types_json, input.currentExtract.schema_types_json);
+  const moduleChanges = {
+    faq: { from: prev.faq_section_present, to: input.currentExtract.faq_section_present },
+    pricing: { from: prev.pricing_section_present, to: input.currentExtract.pricing_section_present },
+    testimonials: { from: prev.testimonials_present, to: input.currentExtract.testimonials_present },
+    how_it_works: { from: prev.how_it_works_present, to: input.currentExtract.how_it_works_present },
+    location_refs: { from: prev.location_refs_present, to: input.currentExtract.location_refs_present },
+    schema_delta: schemaDelta,
+  };
+
+  await env.DB.prepare(
+    `INSERT INTO step2_url_diffs (
+      diff_id, site_id, date_yyyymmdd, keyword, url, url_hash,
+      field_changes_json, module_changes_json,
+      word_count_delta, internal_inbound_delta, ref_domains_delta, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      uuid("s2ud"),
+      input.siteId,
+      input.date,
+      input.keyword,
+      input.url,
+      input.urlHash,
+      safeJsonStringify(fieldChanges, 16000),
+      safeJsonStringify(moduleChanges, 16000),
+      input.currentExtract.word_count - prev.word_count,
+      input.currentInbound - input.previousInbound,
+      input.currentRefDomains - input.previousRefDomains,
+      nowMs()
+    )
+    .run();
+}
+
+async function upsertStep2PageExtract(env: Env, extract: Step2PageExtract, scrapedAt: number): Promise<void> {
+  const urlHash = await sha256Hex(extract.url.toLowerCase());
+  const date = toDateYYYYMMDD(scrapedAt);
+  await env.DB.prepare(
+    `INSERT INTO step2_page_extracts (
+      extract_id, url_hash, url, domain, date_yyyymmdd,
+      title, meta_description, robots_meta, canonical_url, hreflang_count,
+      h1_text, h2_json, h3_json, word_count, schema_types_json,
+      internal_links_out_count, internal_anchors_json, external_links_out_count, external_anchors_json,
+      image_count, alt_coverage_rate, keyword_placement_flags_json,
+      faq_section_present, pricing_section_present, testimonials_present, location_refs_present, how_it_works_present,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(url_hash, date_yyyymmdd) DO UPDATE SET
+      title = excluded.title,
+      meta_description = excluded.meta_description,
+      robots_meta = excluded.robots_meta,
+      canonical_url = excluded.canonical_url,
+      hreflang_count = excluded.hreflang_count,
+      h1_text = excluded.h1_text,
+      h2_json = excluded.h2_json,
+      h3_json = excluded.h3_json,
+      word_count = excluded.word_count,
+      schema_types_json = excluded.schema_types_json,
+      internal_links_out_count = excluded.internal_links_out_count,
+      internal_anchors_json = excluded.internal_anchors_json,
+      external_links_out_count = excluded.external_links_out_count,
+      external_anchors_json = excluded.external_anchors_json,
+      image_count = excluded.image_count,
+      alt_coverage_rate = excluded.alt_coverage_rate,
+      keyword_placement_flags_json = excluded.keyword_placement_flags_json,
+      faq_section_present = excluded.faq_section_present,
+      pricing_section_present = excluded.pricing_section_present,
+      testimonials_present = excluded.testimonials_present,
+      location_refs_present = excluded.location_refs_present,
+      how_it_works_present = excluded.how_it_works_present,
+      updated_at = excluded.updated_at`
+  )
+    .bind(
+      uuid("s2ext"),
+      urlHash,
+      extract.url,
+      extract.domain,
+      date,
+      extract.title,
+      extract.meta_description,
+      extract.robots_meta,
+      extract.canonical_url,
+      extract.hreflang_count,
+      extract.h1_text,
+      extract.h2_json,
+      extract.h3_json,
+      extract.word_count,
+      extract.schema_types_json,
+      extract.internal_links_out_count,
+      extract.internal_anchors_json,
+      extract.external_links_out_count,
+      extract.external_anchors_json,
+      extract.image_count,
+      extract.alt_coverage_rate,
+      extract.keyword_placement_flags_json,
+      extract.faq_section_present,
+      extract.pricing_section_present,
+      extract.testimonials_present,
+      extract.location_refs_present,
+      extract.how_it_works_present,
+      scrapedAt,
+      scrapedAt
+    )
+    .run();
+}
+
+function rankBand(rank: number): "top_3" | "top_4_5" | "top_6_10" | "rank_11_20" {
+  if (rank <= 3) return "top_3";
+  if (rank <= 5) return "top_4_5";
+  if (rank <= 10) return "top_6_10";
+  return "rank_11_20";
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const s = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  if (s.length % 2 === 1) return s[mid];
+  return (s[mid - 1] + s[mid]) / 2;
+}
+
+async function buildAndStoreStep2Analyses(
+  env: Env,
+  input: {
+    siteId: string;
+    date: string;
+    keyword: string;
+    rows: Array<{ rank: number; word_count: number; schema_types: string[]; page_type: string; internal_inbound_count: number; ref_domains: number }>;
+  }
+): Promise<void> {
+  const byBand = new Map<string, Array<{ word_count: number; hasFaqSchema: boolean; page_type: string; internal_inbound_count: number; ref_domains: number }>>();
+  for (const row of input.rows) {
+    const band = rankBand(row.rank);
+    const list = byBand.get(band) ?? [];
+    list.push({
+      word_count: row.word_count,
+      hasFaqSchema: row.schema_types.some((v) => v.toLowerCase().includes("faq")),
+      page_type: row.page_type,
+      internal_inbound_count: row.internal_inbound_count,
+      ref_domains: row.ref_domains,
+    });
+    byBand.set(band, list);
+  }
+  const summarizeBand = (band: string) => {
+    const list = byBand.get(band) ?? [];
+    return {
+      count: list.length,
+      median_word_count: median(list.map((v) => v.word_count)),
+      faq_schema_rate: list.length > 0 ? Number((list.filter((v) => v.hasFaqSchema).length / list.length).toFixed(3)) : 0,
+      median_internal_inbound_links: median(list.map((v) => v.internal_inbound_count)),
+      median_ref_domains: median(list.map((v) => v.ref_domains)),
+      page_type_distribution: list.reduce<Record<string, number>>((acc, row) => {
+        acc[row.page_type] = (acc[row.page_type] ?? 0) + 1;
+        return acc;
+      }, {}),
+    };
+  };
+  const findings = {
+    keyword: input.keyword,
+    rank_bands: {
+      top_3: summarizeBand("top_3"),
+      top_4_5: summarizeBand("top_4_5"),
+      top_6_10: summarizeBand("top_6_10"),
+      rank_11_20: summarizeBand("rank_11_20"),
+    },
+  };
+  const recommendations = {
+    requirements: [
+      "Match winning page type for the keyword intent",
+      "Add FAQ + pricing modules when top bands show those patterns",
+      "Increase internal links from relevant cluster pages",
+      "Expand entity coverage where top bands have higher word-count and richer schema",
+    ],
+    page_checklist: [
+      "Title and H1 aligned with keyword + intent",
+      "FAQ and How-it-works sections where applicable",
+      "Schema coverage for LocalBusiness/Product/FAQ as relevant",
+      "Internal link anchors aligned to cluster terms",
+    ],
+  };
+  await env.DB.prepare(
+    `INSERT INTO step2_ai_analyses (
+      analysis_id, site_id, date_yyyymmdd, scope, scope_key, rank_band, findings_json, recommendations_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      uuid("s2an"),
+      input.siteId,
+      input.date,
+      "keyword",
+      input.keyword,
+      "all",
+      safeJsonStringify(findings, 32000),
+      safeJsonStringify(recommendations, 32000),
+      nowMs()
+    )
+    .run();
+}
+
+async function runStep2DailyHarvest(
+  env: Env,
+  site: Step1SiteRecord,
+  opts: { maxKeywords: number; maxResults: number; geo: string; parentJobId?: string | null; runType?: "baseline" | "delta" | "auto" }
+): Promise<{
+  run_type: "baseline" | "delta";
+  baseline_snapshot_id: string | null;
+  site_id: string;
+  date: string;
+  keyword_count: number;
+  serp_rows: number;
+  page_extracts: number;
+  keyword_summaries: Array<Record<string, unknown>>;
+  limits: {
+    keywords_cap: number;
+    serp_results_cap: number;
+    url_fetches_cap_per_day: number;
+    backlink_enrich_cap_per_day: number;
+    graph_domains_cap_per_day: number;
+  };
+}> {
+  const result = await loadLatestStep1KeywordResearchResults(env, site.site_id);
+  if (!result) {
+    throw new Error("keyword_research_results_not_found");
+  }
+  const targets = parseStep2KeywordTargets(result).slice(
+    0,
+    Math.max(1, Math.min(SITE_KEYWORD_CAP, opts.maxKeywords))
+  );
+  if (targets.length < 1) {
+    throw new Error("step2_contract_empty");
+  }
+  const siteInput = safeJsonParseObject(site.input_json) ?? {};
+  const plan = getSitePlanFromInput(siteInput);
+  const geos = [opts.geo];
+  if (plan.metro_proxy && plan.metro) {
+    geos.push(`metro:${plan.metro}`);
+  }
+  const date = toDateYYYYMMDD(nowMs());
+  const latestBaseline = await loadLatestBaselineForSite(env, site.site_id);
+  const defaultRunType: "baseline" | "delta" =
+    !latestBaseline || latestBaseline.date_yyyymmdd < toDateYYYYMMDD(nowMs() - 30 * 24 * 60 * 60 * 1000)
+      ? "baseline"
+      : "delta";
+  const requestedRunType = opts.runType ?? "auto";
+  const runType: "baseline" | "delta" =
+    requestedRunType === "baseline" || requestedRunType === "delta" ? requestedRunType : defaultRunType;
+  let serpRowsInserted = 0;
+  let pageExtracts = 0;
+  let urlFetches = 0;
+  let backlinkEnriches = 0;
+  const graphDomainsTouched = new Set<string>();
+  const keywordSummaries: Array<Record<string, unknown>> = [];
+  const robotsCache = new Map<string, { allowedAll: boolean; disallowAll: boolean }>();
+
+  for (const target of targets) {
+    const childJobId = await createJobRecord(env, {
+      siteId: site.site_id,
+      type: "site_daily_keyword_run",
+      request: {
+        parent_job_id: cleanString(opts.parentJobId, 120) || null,
+        date,
+        keyword: target.keyword,
+        cluster: target.cluster,
+        priority: target.priority,
+      },
+    });
+    let keywordSerpRows = 0;
+    let keywordPageExtracts = 0;
+    let keywordErrors = 0;
+    for (const geo of geos) {
+      const prevSnapshot = await loadLatestStep2SerpSnapshotBeforeDate(env, {
+        siteId: site.site_id,
+        keyword: target.keyword,
+        geo,
+        beforeDate: date,
+      });
+      const previousRows = prevSnapshot ? await loadStep2SerpResultsForSnapshot(env, prevSnapshot.serp_id) : [];
+      const baselineRows =
+        latestBaseline && latestBaseline.date_yyyymmdd < date
+          ? (
+              await env.DB.prepare(
+                `SELECT r.rank, r.url, r.url_hash, r.domain, r.page_type
+                 FROM step2_serp_results r
+                 JOIN step2_serp_snapshots s ON s.serp_id = r.serp_id
+                 WHERE s.site_id = ? AND s.keyword = ? AND s.geo = ? AND s.date_yyyymmdd = ?
+                 ORDER BY r.rank ASC`
+              )
+                .bind(site.site_id, target.keyword, geo, latestBaseline.date_yyyymmdd)
+                .all<Record<string, unknown>>()
+            ).results?.map((row) => ({
+              rank: clampInt(row.rank, 1, 1000, 999),
+              url: cleanString(row.url, 2000),
+              url_hash: cleanString(row.url_hash, 128),
+              domain: cleanString(row.domain, 255),
+              page_type: cleanString(row.page_type, 80) || "other",
+            })) ?? []
+          : [];
+
+      const serp = await collectAndPersistSerpTop20(env, {
+        userId: site.site_id,
+        phrase: target.keyword,
+        region: normalizeRegion({ country: "US", language: "en", metro: geo.startsWith("metro:") ? geo.slice(6) : "" }),
+        device: "desktop",
+        maxResults: Math.max(1, Math.min(SITE_SERP_RESULTS_CAP, opts.maxResults)),
+        proxyUrl: null,
+      });
+      if (serp.ok === false) {
+        keywordErrors += 1;
+        continue;
+      }
+
+      const step2SerpId = await saveStep2SerpSnapshot(env, {
+        siteId: site.site_id,
+        keyword: target.keyword,
+        cluster: target.cluster,
+        intent: target.intent,
+        geo,
+        serpFeatures: [],
+        scrapedAt: nowMs(),
+      });
+
+      const analysisRows: Array<{
+        rank: number;
+        word_count: number;
+        schema_types: string[];
+        page_type: string;
+        internal_inbound_count: number;
+        ref_domains: number;
+      }> = [];
+      const currentRowsForDiff: Array<{ rank: number; url: string; url_hash: string; page_type: string }> = [];
+      const prevByHash = new Map(previousRows.map((r) => [r.url_hash, r]));
+
+      for (const row of serp.rows) {
+        const pageType = classifySerpResultPageType(row.url, row.title, null);
+        const urlHash = await sha256Hex(cleanString(row.url, 2000).toLowerCase());
+        currentRowsForDiff.push({ rank: row.rank, url: row.url, url_hash: urlHash, page_type: pageType });
+        await env.DB.prepare(
+          `INSERT INTO step2_serp_results (
+            result_id, serp_id, rank, url, url_hash, domain, page_type, title_snippet, desc_snippet, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+          .bind(
+            uuid("s2res"),
+            step2SerpId,
+            row.rank,
+            row.url,
+            urlHash,
+            normalizeRootDomain(row.domain || normalizeDomain(row.url)),
+            pageType,
+            cleanString(row.title, 500) || null,
+            cleanString(row.snippet, 1000) || null,
+            nowMs()
+        )
+          .run();
+        serpRowsInserted += 1;
+        keywordSerpRows += 1;
+      }
+
+      await saveStep2SerpDiff(env, {
+        siteId: site.site_id,
+        date,
+        keyword: target.keyword,
+        geo,
+        previous: previousRows.map((r) => ({ rank: r.rank, url: r.url, url_hash: r.url_hash, page_type: r.page_type })),
+        current: currentRowsForDiff,
+        baseline: baselineRows.map((r) => ({ rank: r.rank, url: r.url, url_hash: r.url_hash, page_type: r.page_type })),
+        serpFeatureDelta: {},
+      });
+
+      const refreshCandidates = currentRowsForDiff.filter((row) => {
+        if (runType === "baseline") return true;
+        const prev = prevByHash.get(row.url_hash);
+        const isNewEntrant = !prev;
+        const movedIntoTop10 = !!prev && prev.rank > 10 && row.rank <= 10;
+        const movedIntoTop5 = !!prev && prev.rank > 5 && row.rank <= 5;
+        const movedIntoTop3 = !!prev && prev.rank > 3 && row.rank <= 3;
+        return row.rank <= 5 || isNewEntrant || movedIntoTop10 || movedIntoTop5 || movedIntoTop3;
+      });
+
+      for (const row of refreshCandidates) {
+        if (urlFetches >= SITE_MAX_URL_FETCHES_PER_DAY) {
+          break;
+        }
+        if (!(await canFetchByRobots(env, row.url, robotsCache))) {
+          continue;
+        }
+        urlFetches += 1;
+
+        const pageType = row.page_type;
+        const urlHash = row.url_hash;
+        const previousExtract = await loadLatestStep2PageExtract(env, urlHash, date);
+
+        const cachedHtml = await loadHtmlCache(env, urlHash, nowMs());
+        const fetched = await fetchHtmlWithTimeout(
+          row.url,
+          8000,
+          cachedHtml?.etag ?? null,
+          cachedHtml?.last_modified ?? null
+        );
+        const html = fetched.status === 304 ? cachedHtml?.html_snapshot ?? null : fetched.html;
+        if (!html) continue;
+        if (fetched.status !== 304) {
+          await upsertHtmlCache(env, {
+            urlHash,
+            url: row.url,
+            etag: fetched.etag,
+            lastModified: fetched.last_modified,
+            html,
+            now: nowMs(),
+            ttlMs: 7 * 24 * 60 * 60 * 1000,
+          });
+        }
+
+        const pageExtract = buildStep2PageExtract(row.url, html, target.keyword);
+        await upsertStep2PageExtract(env, pageExtract, nowMs());
+        pageExtracts += 1;
+        keywordPageExtracts += 1;
+
+        if (graphDomainsTouched.has(pageExtract.domain) || graphDomainsTouched.size < SITE_MAX_GRAPH_DOMAINS_PER_DAY) {
+          graphDomainsTouched.add(pageExtract.domain);
+          for (const edge of pageExtract.internal_edges.slice(0, 120)) {
+            await env.DB.prepare(
+              `INSERT INTO step2_internal_graph_edges (
+                edge_id, domain, date_yyyymmdd, from_url, to_url, anchor, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+            )
+              .bind(
+                uuid("s2edge"),
+                pageExtract.domain,
+                date,
+                pageExtract.url,
+                edge.to_url,
+                edge.anchor,
+                nowMs()
+              )
+              .run();
+          }
+        }
+
+        const bl =
+          backlinkEnriches < SITE_MAX_BACKLINK_ENRICH_PER_DAY
+            ? await getBacklinkMetricsCached(env, {
+                urlHash,
+                url: row.url,
+                domain: pageExtract.domain,
+              })
+            : { backlinks: 0, ref_domains: 0, authority_metric: 0, provider: "semrush", top_anchors: [] };
+        if (backlinkEnriches < SITE_MAX_BACKLINK_ENRICH_PER_DAY) {
+          backlinkEnriches += 1;
+        }
+        await env.DB.prepare(
+          `INSERT INTO step2_url_backlinks (
+            backlink_id, url_hash, url, domain, date_yyyymmdd,
+            backlinks, ref_domains, follow_nofollow_json, link_types_json, top_anchors_json, authority_provider, authority_metric, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(url_hash, date_yyyymmdd) DO NOTHING`
+        )
+          .bind(
+            uuid("s2ubl"),
+            urlHash,
+            row.url,
+            pageExtract.domain,
+            date,
+            bl.backlinks,
+            bl.ref_domains,
+            safeJsonStringify({ follow: 0, nofollow: 0 }),
+            safeJsonStringify({ text: 0, image: 0, redirect: 0, form: 0 }),
+            safeJsonStringify(bl.top_anchors),
+            bl.provider,
+            bl.authority_metric,
+            nowMs()
+          )
+          .run();
+
+        await env.DB.prepare(
+          `INSERT INTO step2_domain_backlinks (
+            domain_backlink_id, domain, date_yyyymmdd, authority_provider, authority_metric, ref_domains, topical_categories_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(domain, date_yyyymmdd) DO NOTHING`
+        )
+          .bind(uuid("s2dbl"), pageExtract.domain, date, "semrush", 0, 0, safeJsonStringify([]), nowMs())
+          .run();
+
+        const inboundRow = await env.DB.prepare(
+          `SELECT COUNT(*) AS c
+           FROM step2_internal_graph_edges
+           WHERE date_yyyymmdd = ? AND to_url = ?`
+        )
+          .bind(date, pageExtract.url)
+          .first<Record<string, unknown>>();
+        const inboundCount = clampInt(inboundRow?.c, 0, 1_000_000, 0);
+        const prevInboundRow =
+          previousExtract == null
+            ? null
+            : await env.DB.prepare(
+                `SELECT COUNT(*) AS c
+                 FROM step2_internal_graph_edges
+                 WHERE date_yyyymmdd = ? AND to_url = ?`
+              )
+                .bind(previousExtract.date_yyyymmdd, pageExtract.url)
+                .first<Record<string, unknown>>();
+        const prevInboundCount = clampInt(prevInboundRow?.c, 0, 1_000_000, 0);
+        const prevBacklinks = await loadLatestStep2BacklinkRow(env, urlHash, date);
+
+        analysisRows.push({
+          rank: row.rank,
+          word_count: pageExtract.word_count,
+          schema_types: parseStringArray(safeJsonParseObject(`{"a":${pageExtract.schema_types_json}}`)?.a, 20, 80),
+          page_type: pageType,
+          internal_inbound_count: inboundCount,
+          ref_domains: bl.ref_domains,
+        });
+
+        await saveStep2UrlDiff(env, {
+          siteId: site.site_id,
+          date,
+          keyword: target.keyword,
+          url: row.url,
+          urlHash,
+          previousExtract,
+          currentExtract: pageExtract,
+          previousRefDomains: prevBacklinks?.ref_domains ?? 0,
+          currentRefDomains: bl.ref_domains,
+          previousInbound: prevInboundCount,
+          currentInbound: inboundCount,
+        });
+      }
+
+      await buildAndStoreStep2Analyses(env, {
+        siteId: site.site_id,
+        date,
+        keyword: target.keyword,
+        rows: analysisRows,
+      });
+    }
+    if (keywordSerpRows > 0) {
+      await finalizeJobSuccess(env, childJobId, Math.max(1, keywordPageExtracts));
+    } else {
+      await finalizeJobFailure(env, childJobId, "keyword_daily_run_failed", {
+        keyword: target.keyword,
+        geo_count: geos.length,
+        errors: keywordErrors,
+      });
+    }
+    keywordSummaries.push({
+      keyword: target.keyword,
+      priority: target.priority,
+      child_job_id: childJobId,
+      serp_rows: keywordSerpRows,
+      page_extracts: keywordPageExtracts,
+      errors: keywordErrors,
+    });
+  }
+
+  const baselineSnapshotId =
+    runType === "baseline"
+      ? await saveStep2BaselineSnapshot(env, {
+          siteId: site.site_id,
+          date,
+          parentJobId: cleanString(opts.parentJobId, 120) || null,
+          summary: {
+            keyword_count: targets.length,
+            serp_rows: serpRowsInserted,
+            page_extracts: pageExtracts,
+          },
+        })
+      : null;
+
+  await env.DB.prepare(
+    `INSERT INTO step2_daily_reports (
+      report_id, site_id, date_yyyymmdd, run_type, baseline_snapshot_id, summary_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      uuid("s2rep"),
+      site.site_id,
+      date,
+      runType,
+      baselineSnapshotId,
+      safeJsonStringify(
+        {
+          keyword_count: targets.length,
+          serp_rows: serpRowsInserted,
+          page_extracts: pageExtracts,
+          keyword_summaries: keywordSummaries,
+          limits: {
+            keywords_cap: SITE_KEYWORD_CAP,
+            serp_results_cap: SITE_SERP_RESULTS_CAP,
+            url_fetches_cap_per_day: SITE_MAX_URL_FETCHES_PER_DAY,
+            backlink_enrich_cap_per_day: SITE_MAX_BACKLINK_ENRICH_PER_DAY,
+            graph_domains_cap_per_day: SITE_MAX_GRAPH_DOMAINS_PER_DAY,
+          },
+        },
+        128000
+      ),
+      nowMs()
+    )
+    .run();
+
+  return {
+    run_type: runType,
+    baseline_snapshot_id: baselineSnapshotId,
+    site_id: site.site_id,
+    date,
+    keyword_count: targets.length,
+    serp_rows: serpRowsInserted,
+    page_extracts: pageExtracts,
+    keyword_summaries: keywordSummaries,
+    limits: {
+      keywords_cap: SITE_KEYWORD_CAP,
+      serp_results_cap: SITE_SERP_RESULTS_CAP,
+      url_fetches_cap_per_day: SITE_MAX_URL_FETCHES_PER_DAY,
+      backlink_enrich_cap_per_day: SITE_MAX_BACKLINK_ENRICH_PER_DAY,
+      graph_domains_cap_per_day: SITE_MAX_GRAPH_DOMAINS_PER_DAY,
+    },
+  };
+}
+
+async function listStep2EligibleSites(env: Env, limit = 30): Promise<Step1SiteRecord[]> {
+  const rows = await env.DB.prepare(
+    `SELECT
+      site_id, site_url, site_name, business_address, primary_location_hint, site_type_hint,
+      local_mode, input_json, site_profile_json, last_analysis_at, last_research_at, created_at, updated_at
+     FROM wp_ai_seo_sites
+     WHERE last_research_at IS NOT NULL
+     ORDER BY updated_at DESC
+     LIMIT ?`
+  )
+    .bind(Math.max(1, Math.min(limit, 100)))
+    .all<Record<string, unknown>>();
+  return (rows.results ?? []).map((row) => ({
+    site_id: cleanString(row.site_id, 64),
+    site_url: cleanString(row.site_url, 2000),
+    site_name: cleanString(row.site_name, 200) || null,
+    business_address: cleanString(row.business_address, 400) || null,
+    primary_location_hint: cleanString(row.primary_location_hint, 200) || null,
+    site_type_hint: cleanString(row.site_type_hint, 60) || null,
+    local_mode: clampInt(row.local_mode, 0, 1, 0) === 1,
+    input_json: cleanString(row.input_json, 320000),
+    site_profile_json: cleanString(row.site_profile_json, 32000),
+    last_analysis_at: clampInt(row.last_analysis_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    last_research_at:
+      row.last_research_at == null ? null : clampInt(row.last_research_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    updated_at: clampInt(row.updated_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  }));
+}
+
+async function loadLatestStep2Report(env: Env, siteId: string, dateFilter: string): Promise<Record<string, unknown>> {
+  const daily = await env.DB.prepare(
+    `SELECT run_type, baseline_snapshot_id, summary_json, created_at
+     FROM step2_daily_reports
+     WHERE site_id = ? AND (? = '' OR date_yyyymmdd = ?)
+     ORDER BY created_at DESC
+     LIMIT 1`
+  )
+    .bind(siteId, dateFilter, dateFilter)
+    .first<Record<string, unknown>>();
+  const analyses = await env.DB.prepare(
+    `SELECT scope_key, findings_json, recommendations_json, created_at
+     FROM step2_ai_analyses
+     WHERE site_id = ? AND scope = 'keyword' AND (? = '' OR date_yyyymmdd = ?)
+     ORDER BY created_at DESC
+     LIMIT 400`
+  )
+    .bind(siteId, dateFilter, dateFilter)
+    .all<Record<string, unknown>>();
+  const rows = analyses.results ?? [];
+  return {
+    site_id: siteId,
+    date: dateFilter || null,
+    daily_report:
+      daily == null
+        ? null
+        : {
+            run_type: cleanString(daily.run_type, 20),
+            baseline_snapshot_id: cleanString(daily.baseline_snapshot_id, 120) || null,
+            summary: safeJsonParseObject(cleanString(daily.summary_json, 128000)) ?? {},
+            created_at: clampInt(daily.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+          },
+    analysis_count: rows.length,
+    keyword_reports: rows.map((row) => ({
+      keyword: cleanString(row.scope_key, 300),
+      findings: safeJsonParseObject(cleanString(row.findings_json, 32000)) ?? {},
+      recommendations: safeJsonParseObject(cleanString(row.recommendations_json, 32000)) ?? {},
+      created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    })),
+  };
+}
+
+type Step3TaskCategory =
+  | "ON_PAGE"
+  | "TECHNICAL_SEO"
+  | "LOCAL_SEO"
+  | "CONTENT"
+  | "AUTHORITY"
+  | "SOCIAL"
+  | "MEASUREMENT";
+
+type Step3TaskMode = "AUTO" | "DIY" | "TEAM";
+type Step3TaskPriority = "P0" | "P1" | "P2" | "P3";
+type Step3TaskEffort = "S" | "M" | "L";
+type Step3TaskStatus = "NEW" | "READY" | "BLOCKED" | "IN_PROGRESS" | "DONE" | "SKIPPED" | "FAILED";
+
+type Step3TaskType =
+  | "SERVICE_PAGE_UPGRADE"
+  | "LOCATION_PAGE_CREATE"
+  | "LOCATION_PAGE_UPGRADE"
+  | "FAQ_ADD"
+  | "FAQ_SCHEMA_ADD"
+  | "TITLE_META_TEST"
+  | "CONTENT_MODULE_ADD"
+  | "MEDIA_OPTIMIZE"
+  | "INTERNAL_LINKING_SILO_BUILD"
+  | "INTERNAL_LINKING_BOOST_MONEY_PAGE"
+  | "INDEXATION_CLEANUP"
+  | "DUPLICATE_CONTENT_REDUCE"
+  | "CWV_OPTIMIZE"
+  | "REDIRECT_FIX"
+  | "BROKEN_LINK_FIX"
+  | "SITEMAP_HEALTH"
+  | "GBP_OPTIMIZE"
+  | "GBP_POST_PLAN_WEEKLY"
+  | "GBP_QA_SEED"
+  | "REVIEW_REQUEST_CAMPAIGN_SETUP"
+  | "REVIEW_RESPONSE_TEMPLATES"
+  | "CITATION_AUDIT"
+  | "CITATION_CREATE"
+  | "CITATION_CLEANUP"
+  | "LOCAL_LANDING_PAGES_STRATEGY"
+  | "BLOG_POST_DRAFT"
+  | "SERVICE_FAQ_POST_DRAFT"
+  | "COST_GUIDE_DRAFT"
+  | "COMPARISON_PAGE_DRAFT"
+  | "SEASONAL_PAGE_DRAFT"
+  | "CONTENT_REFRESH"
+  | "LINK_RECLAMATION"
+  | "OUTREACH_TARGET_LIST"
+  | "DIGITAL_PR_IDEA"
+  | "LOCAL_PARTNERSHIP_OPPORTUNITIES"
+  | "SPONSORSHIP_OPPORTUNITIES"
+  | "NICHE_DIRECTORY_TARGETS"
+  | "COMPETITOR_SOCIAL_PROFILE_DISCOVERY"
+  | "SOCIAL_AUDIT_COMPETITOR_THEMES"
+  | "SOCIAL_PLAN_WEEKLY"
+  | "SOCIAL_POST_DRAFT"
+  | "SOCIAL_CREATIVE_BRIEF"
+  | "SOCIAL_PUBLISH_SCHEDULE"
+  | "SOCIAL_PERFORMANCE_REVIEW"
+  | "GSC_CONNECT"
+  | "GA4_CONNECT"
+  | "CALL_TRACKING_SETUP"
+  | "CONVERSION_EVENTS_SETUP"
+  | "KPI_DASHBOARD_UPDATE"
+  | "ALERT_RULE_CREATE";
+
+type Step3TaskV1 = {
+  schema_version: "task.v1";
+  task_id: string;
+  site_id: string;
+  site_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+  category: Step3TaskCategory;
+  type: Step3TaskType;
+  title: string;
+  summary: string;
+  priority: Step3TaskPriority;
+  effort: Step3TaskEffort;
+  confidence: number;
+  estimated_impact: {
+    seo: "low" | "med" | "high";
+    leads: "low" | "med" | "high";
+    time_to_effect_days: number;
+  };
+  mode: Step3TaskMode;
+  requires: {
+    access: string[];
+    inputs: string[];
+    approvals: string[];
+  };
+  status: Step3TaskStatus;
+  blockers: Array<{ code: string; message: string }>;
+  scope: {
+    keyword_id: string | null;
+    keyword: string | null;
+    cluster: string | null;
+    target_url: string | null;
+    target_slug: string | null;
+    geo: string | null;
+  };
+  evidence: {
+    based_on: string[];
+    citations: Array<{ kind: string; text: string; data: Record<string, unknown> }>;
+  };
+  instructions: {
+    steps: string[];
+    acceptance_criteria: string[];
+    guardrails: string[];
+  };
+  automation: {
+    can_auto_apply: boolean;
+    auto_apply_default: boolean;
+    actions: Array<{ action_type: string; payload: Record<string, unknown> }>;
+  };
+  outputs: {
+    artifacts: Array<{ kind: string; data: Record<string, unknown> }>;
+  };
+  dependencies: {
+    depends_on_task_ids: string[];
+    supersedes_task_ids: string[];
+  };
+};
+
+type Step3RiskFlag = {
+  risk_type: string;
+  severity: "low" | "medium" | "high";
+  message: string;
+  blocked_action: string | null;
+};
+
+type Step3CompetitorCandidate = {
+  domain: string;
+  appearance_count: number;
+  avg_rank: number;
+  sample_urls: string[];
+  is_directory: boolean;
+};
+
+type Step3KeywordSignal = {
+  keyword: string;
+  top3_faq_schema_rate: number;
+  top3_median_inbound_links: number;
+  top3_median_ref_domains: number;
+  top6_10_median_ref_domains: number;
+  top3_page_types: Record<string, number>;
+};
+
+type Step3OwnPageSignal = {
+  target_url: string;
+  target_slug: string | null;
+  inbound_internal_links: number;
+  ref_domains: number;
+  has_faq_schema: boolean;
+  has_pricing_module: boolean;
+};
+
+type Step3DiffSignal = {
+  keyword: string;
+  new_top3_entrant: boolean;
+};
+
+function isDirectoryDomain(domain: string): boolean {
+  const d = cleanString(domain, 255).toLowerCase();
+  if (!d) return false;
+  const known = [
+    "yelp.com",
+    "angi.com",
+    "angieslist.com",
+    "homeadvisor.com",
+    "thumbtack.com",
+    "mapquest.com",
+    "yellowpages.com",
+    "bbb.org",
+    "nextdoor.com",
+    "tripadvisor.com",
+    "foursquare.com",
+    "superpages.com",
+  ];
+  return known.some((value) => d === value || d.endsWith(`.${value}`));
+}
+
+function parseStep1PrimaryFromResults(result: Record<string, unknown>): Array<Record<string, unknown>> {
+  const rows = Array.isArray(result.primary_top_10) ? result.primary_top_10 : [];
+  const out: Array<Record<string, unknown>> = [];
+  for (const raw of rows) {
+    const row = parseJsonObject(raw);
+    if (!row) continue;
+    const keyword = cleanString(row.keyword, 300);
+    if (!keyword) continue;
+    out.push({
+      keyword,
+      cluster: cleanString(row.cluster, 120) || "general",
+      recommended_slug: cleanString(row.recommended_slug, 160) || null,
+      recommended_page_type: cleanString(row.recommended_page_type, 80) || "service",
+      intent: cleanString(row.intent, 40) || "commercial",
+      supporting_terms: parseStringArray(row.supporting_terms, 20, 120),
+    });
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+function inferCompetitorSocialProfiles(domain: string): string[] {
+  const clean = normalizeRootDomain(domain);
+  if (!clean) return [];
+  return [
+    `https://www.facebook.com/${clean}`,
+    `https://www.instagram.com/${clean}`,
+    `https://www.youtube.com/@${clean.replace(/\./g, "")}`,
+  ];
+}
+
+function isoFromMs(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
+function priorityToDbWeight(priority: Step3TaskPriority): 1 | 2 | 3 | 4 {
+  if (priority === "P0") return 1;
+  if (priority === "P1") return 2;
+  if (priority === "P2") return 3;
+  return 4;
+}
+
+function modeToExecutionMode(mode: Step3TaskMode): "auto_safe" | "assisted" | "team_only" {
+  if (mode === "AUTO") return "auto_safe";
+  if (mode === "DIY") return "assisted";
+  return "team_only";
+}
+
+function statusToDbStatus(status: Step3TaskStatus): "planned" | "applied" | "draft" | "blocked" {
+  if (status === "BLOCKED" || status === "FAILED") return "blocked";
+  if (status === "DONE") return "applied";
+  if (status === "IN_PROGRESS") return "draft";
+  return "planned";
+}
+
+function makeStep3Task(input: {
+  siteId: string;
+  siteRunId: string;
+  category: Step3TaskCategory;
+  type: Step3TaskType;
+  title: string;
+  summary: string;
+  priority: Step3TaskPriority;
+  effort: Step3TaskEffort;
+  confidence: number;
+  estimatedImpact: { seo: "low" | "med" | "high"; leads: "low" | "med" | "high"; timeToEffectDays: number };
+  mode: Step3TaskMode;
+  requiresAccess?: string[];
+  requiresInputs?: string[];
+  requiresApprovals?: string[];
+  status?: Step3TaskStatus;
+  blockers?: Array<{ code: string; message: string }>;
+  scope?: Partial<Step3TaskV1["scope"]>;
+  evidence?: Step3TaskV1["evidence"];
+  instructions?: Step3TaskV1["instructions"];
+  automation?: Step3TaskV1["automation"];
+  outputs?: Step3TaskV1["outputs"];
+  dependencies?: Step3TaskV1["dependencies"];
+}): Step3TaskV1 {
+  const now = isoFromMs(nowMs());
+  const hasAccessNeeds = (input.requiresAccess ?? []).some((v) => v !== "NONE");
+  const status = input.status ?? (hasAccessNeeds && input.mode !== "AUTO" ? "BLOCKED" : "READY");
+  const blockers =
+    input.blockers ??
+    (status === "BLOCKED" && hasAccessNeeds
+      ? [{ code: "MISSING_ACCESS", message: "Required account access is not connected yet." }]
+      : []);
+
+  return {
+    schema_version: "task.v1",
+    task_id: crypto.randomUUID(),
+    site_id: input.siteId,
+    site_run_id: input.siteRunId,
+    created_at: now,
+    updated_at: now,
+    category: input.category,
+    type: input.type,
+    title: input.title,
+    summary: input.summary,
+    priority: input.priority,
+    effort: input.effort,
+    confidence: Number(clamp01(input.confidence).toFixed(3)),
+    estimated_impact: {
+      seo: input.estimatedImpact.seo,
+      leads: input.estimatedImpact.leads,
+      time_to_effect_days: Math.max(0, Math.round(input.estimatedImpact.timeToEffectDays)),
+    },
+    mode: input.mode,
+    requires: {
+      access: (input.requiresAccess ?? ["NONE"]).slice(0, 10),
+      inputs: (input.requiresInputs ?? ["NONE"]).slice(0, 10),
+      approvals: (input.requiresApprovals ?? ["NONE"]).slice(0, 10),
+    },
+    status,
+    blockers,
+    scope: {
+      keyword_id: null,
+      keyword: input.scope?.keyword ?? null,
+      cluster: input.scope?.cluster ?? null,
+      target_url: input.scope?.target_url ?? null,
+      target_slug: input.scope?.target_slug ?? null,
+      geo: input.scope?.geo ?? null,
+    },
+    evidence: input.evidence ?? {
+      based_on: ["BEST_PRACTICE"],
+      citations: [
+        {
+          kind: "BEST_PRACTICE",
+          text: "Generated from Step 3 default local-service playbook.",
+          data: {},
+        },
+      ],
+    },
+    instructions: input.instructions ?? {
+      steps: ["Review task context.", "Execute change in controlled rollout.", "Validate outcome."],
+      acceptance_criteria: ["Task output created and validated."],
+      guardrails: ["Avoid template-level spam patterns."],
+    },
+    automation: input.automation ?? {
+      can_auto_apply: input.mode === "AUTO",
+      auto_apply_default: false,
+      actions: [],
+    },
+    outputs: input.outputs ?? {
+      artifacts: [],
+    },
+    dependencies: input.dependencies ?? {
+      depends_on_task_ids: [],
+      supersedes_task_ids: [],
+    },
+  };
+}
+
+function buildStep3KeywordSignals(report: Record<string, unknown>): Map<string, Step3KeywordSignal> {
+  const out = new Map<string, Step3KeywordSignal>();
+  const rows = Array.isArray(report.keyword_reports) ? report.keyword_reports : [];
+  for (const raw of rows) {
+    const row = parseJsonObject(raw);
+    if (!row) continue;
+    const keyword = cleanString(row.keyword, 300);
+    const findings = parseJsonObject(row.findings) ?? {};
+    const rankBands = parseJsonObject(findings.rank_bands) ?? {};
+    const top3 = parseJsonObject(rankBands.top_3) ?? {};
+    const top6_10 = parseJsonObject(rankBands.top_6_10) ?? {};
+    const pageDist = parseJsonObject(top3.page_type_distribution) ?? {};
+    const normalizedDist: Record<string, number> = {};
+    for (const [k, v] of Object.entries(pageDist)) {
+      normalizedDist[cleanString(k, 80)] = Math.max(0, Number(v ?? 0) || 0);
+    }
+    if (!keyword) continue;
+    out.set(toKeywordNorm(keyword), {
+      keyword,
+      top3_faq_schema_rate: clamp01(Number(top3.faq_schema_rate ?? 0) || 0),
+      top3_median_inbound_links: Math.max(0, Number(top3.median_internal_inbound_links ?? 0) || 0),
+      top3_median_ref_domains: Math.max(0, Number(top3.median_ref_domains ?? 0) || 0),
+      top6_10_median_ref_domains: Math.max(0, Number(top6_10.median_ref_domains ?? 0) || 0),
+      top3_page_types: normalizedDist,
+    });
+  }
+  return out;
+}
+
+async function loadStep3OwnPageSignal(
+  env: Env,
+  input: { targetUrl: string; targetSlug: string | null; date: string }
+): Promise<Step3OwnPageSignal | null> {
+  const urlHash = await sha256Hex(cleanString(input.targetUrl, 2000).toLowerCase());
+  const extract = await env.DB.prepare(
+    `SELECT schema_types_json, pricing_section_present
+     FROM step2_page_extracts
+     WHERE url_hash = ? AND date_yyyymmdd = ?
+     LIMIT 1`
+  )
+    .bind(urlHash, input.date)
+    .first<Record<string, unknown>>();
+
+  const inbound = await env.DB.prepare(
+    `SELECT COUNT(*) AS c
+     FROM step2_internal_graph_edges
+     WHERE date_yyyymmdd = ? AND to_url = ?`
+  )
+    .bind(input.date, input.targetUrl)
+    .first<Record<string, unknown>>();
+
+  const backlinks = await env.DB.prepare(
+    `SELECT ref_domains
+     FROM step2_url_backlinks
+     WHERE url_hash = ? AND date_yyyymmdd = ?
+     LIMIT 1`
+  )
+    .bind(urlHash, input.date)
+    .first<Record<string, unknown>>();
+
+  if (!extract && !inbound && !backlinks) return null;
+  const schemaParsed = safeJsonParseObject(`{"a":${cleanString(extract?.schema_types_json, 4000) || "[]"}}`);
+  const schemaTypes = parseStringArray(schemaParsed?.a, 50, 80).map((v) => v.toLowerCase());
+  return {
+    target_url: input.targetUrl,
+    target_slug: input.targetSlug,
+    inbound_internal_links: clampInt(inbound?.c, 0, 1_000_000, 0),
+    ref_domains: clampInt(backlinks?.ref_domains, 0, 1_000_000, 0),
+    has_faq_schema: schemaTypes.some((v) => v.includes("faq")),
+    has_pricing_module: clampInt(extract?.pricing_section_present, 0, 1, 0) === 1,
+  };
+}
+
+async function loadStep3Top3ModuleRates(
+  env: Env,
+  input: { siteId: string; date: string; keyword: string }
+): Promise<{ faq_rate: number; pricing_rate: number }> {
+  const row = await env.DB.prepare(
+    `SELECT
+      AVG(CAST(pe.faq_section_present AS REAL)) AS faq_rate,
+      AVG(CAST(pe.pricing_section_present AS REAL)) AS pricing_rate
+     FROM step2_serp_results r
+     JOIN step2_serp_snapshots s ON s.serp_id = r.serp_id
+     JOIN step2_page_extracts pe ON pe.url_hash = r.url_hash AND pe.date_yyyymmdd = s.date_yyyymmdd
+     WHERE s.site_id = ? AND s.date_yyyymmdd = ? AND s.keyword = ? AND r.rank <= 3`
+  )
+    .bind(input.siteId, input.date, input.keyword)
+    .first<Record<string, unknown>>();
+  return {
+    faq_rate: clamp01(Number(row?.faq_rate ?? 0) || 0),
+    pricing_rate: clamp01(Number(row?.pricing_rate ?? 0) || 0),
+  };
+}
+
+async function loadStep3DiffSignals(
+  env: Env,
+  input: { siteId: string; date: string }
+): Promise<Map<string, Step3DiffSignal>> {
+  const rows = await env.DB.prepare(
+    `SELECT keyword, entered_urls_json
+     FROM step2_serp_diffs
+     WHERE site_id = ? AND date_yyyymmdd = ?`
+  )
+    .bind(input.siteId, input.date)
+    .all<Record<string, unknown>>();
+  const out = new Map<string, Step3DiffSignal>();
+  for (const raw of rows.results ?? []) {
+    const keyword = cleanString(raw.keyword, 300);
+    if (!keyword) continue;
+    const parsed = safeJsonParseObject(`{"a":${cleanString(raw.entered_urls_json, 64000) || "[]"}}`) ?? {};
+    const entrants = Array.isArray(parsed.a) ? parsed.a : [];
+    let newTop3 = false;
+    for (const item of entrants) {
+      const row = parseJsonObject(item);
+      if (!row) continue;
+      const rank = clampInt(row.rank ?? row.position, 1, 1000, 999);
+      if (rank <= 3) {
+        newTop3 = true;
+        break;
+      }
+    }
+    out.set(toKeywordNorm(keyword), {
+      keyword,
+      new_top3_entrant: newTop3,
+    });
+  }
+  return out;
+}
+
+async function loadStep3PreviousSocialCadence(env: Env, siteId: string): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT AVG(cadence_per_week) AS avg_cadence
+     FROM step3_social_signals
+     WHERE site_id = ?
+       AND created_at < ?
+       AND cadence_per_week IS NOT NULL`
+  )
+    .bind(siteId, nowMs())
+    .first<Record<string, unknown>>();
+  return Math.max(0, Number(row?.avg_cadence ?? 0) || 0);
+}
+
+function buildStep3Tasks(input: {
+  site: Step1SiteRecord;
+  siteRunId: string;
+  primaryRows: Array<Record<string, unknown>>;
+  competitors: Step3CompetitorCandidate[];
+  keywordSignals: Map<string, Step3KeywordSignal>;
+  ownSignals: Map<string, Step3OwnPageSignal>;
+  top3Modules: Map<string, { faq_rate: number; pricing_rate: number }>;
+  diffSignals: Map<string, Step3DiffSignal>;
+  socialCadenceIncreased: boolean;
+  step2Date: string;
+}): Step3TaskV1[] {
+  const tasks: Step3TaskV1[] = [];
+  const created = new Set<string>();
+  const add = (task: Step3TaskV1) => {
+    const key = `${task.category}:${task.type}:${task.scope.keyword ?? ""}:${task.scope.cluster ?? ""}:${task.scope.target_slug ?? ""}`;
+    if (created.has(key)) return;
+    created.add(key);
+    tasks.push(task);
+  };
+
+  const primaryRows = input.primaryRows.slice(0, 6);
+  for (const row of primaryRows) {
+    const keyword = cleanString(row.keyword, 300);
+    if (!keyword) continue;
+    const cluster = cleanString(row.cluster, 120) || "general";
+    const slug = cleanString(row.recommended_slug, 160) || null;
+    const targetUrl =
+      slug != null
+        ? `${cleanString(input.site.site_url, 2000).replace(/\/+$/, "")}/${slug.replace(/^\/+/, "")}`
+        : null;
+    const signal = input.keywordSignals.get(toKeywordNorm(keyword));
+    const ownSignal = targetUrl ? input.ownSignals.get(toKeywordNorm(keyword)) ?? null : null;
+    const top3Modules = input.top3Modules.get(toKeywordNorm(keyword)) ?? { faq_rate: 0, pricing_rate: 0 };
+    const diffSignal = input.diffSignals.get(toKeywordNorm(keyword));
+
+    add(
+      makeStep3Task({
+        siteId: input.site.site_id,
+        siteRunId: input.siteRunId,
+        category: "ON_PAGE",
+        type: cleanString(row.recommended_page_type, 80).toLowerCase().includes("location")
+          ? "LOCATION_PAGE_UPGRADE"
+          : "SERVICE_PAGE_UPGRADE",
+        title: `Upgrade primary page for "${keyword}"`,
+        summary: "Align money page modules, trust blocks, and schema to local top-rank patterns.",
+        priority: "P1",
+        effort: "M",
+        confidence: 0.83,
+        estimatedImpact: { seo: "high", leads: "med", timeToEffectDays: 14 },
+        mode: "AUTO",
+        requiresAccess: ["WP_ADMIN"],
+        scope: { keyword, cluster, target_slug: slug, target_url: targetUrl, geo: "both" },
+        evidence: {
+          based_on: ["SERP", "ON_PAGE"],
+          citations: [
+            {
+              kind: "SERP_PATTERN",
+              text: "Top local results consistently include service-area, trust, and conversion modules.",
+              data: { source_step2_date: input.step2Date, keyword },
+            },
+          ],
+        },
+        instructions: {
+          steps: [
+            "Update service/location page module structure.",
+            "Add trust and conversion modules near the fold.",
+            "Validate content uniqueness for local modifiers.",
+          ],
+          acceptance_criteria: [
+            "Page includes pricing/reviews/FAQ/service-area blocks as applicable.",
+            "No thin or duplicated location-page footprint.",
+          ],
+          guardrails: ["No doorway-style near-duplicate pages.", "No template-level keyword stuffing."],
+        },
+        automation: {
+          can_auto_apply: true,
+          auto_apply_default: false,
+          actions: [
+            {
+              action_type: "WP_UPDATE_PAGE",
+              payload: { target_slug: slug, modules: ["pricing", "reviews", "faq", "service_areas", "cta"] },
+            },
+          ],
+        },
+        outputs: {
+          artifacts: [{ kind: "DRAFT_HTML", data: { target_slug: slug } }],
+        },
+      })
+    );
+
+    if ((signal?.top3_faq_schema_rate ?? 0) >= 0.5 && !(ownSignal?.has_faq_schema ?? false)) {
+      add(
+        makeStep3Task({
+          siteId: input.site.site_id,
+          siteRunId: input.siteRunId,
+          category: "ON_PAGE",
+          type: "FAQ_SCHEMA_ADD",
+          title: `Add FAQ schema for "${keyword}" target page`,
+          summary: "Top 3 FAQ schema prevalence is high and the target page is missing it.",
+          priority: "P1",
+          effort: "S",
+          confidence: 0.86,
+          estimatedImpact: { seo: "med", leads: "low", timeToEffectDays: 7 },
+          mode: "AUTO",
+          requiresAccess: ["WP_ADMIN"],
+          scope: { keyword, cluster, target_slug: slug, target_url: targetUrl, geo: "both" },
+          evidence: {
+            based_on: ["SERP", "ON_PAGE"],
+            citations: [
+              {
+                kind: "METRIC_GAP",
+                text: "FAQ schema prevalence in top 3 exceeds threshold while target page is missing FAQ schema.",
+                data: {
+                  top3_faq_schema_rate: signal?.top3_faq_schema_rate ?? 0,
+                  target_has_faq_schema: ownSignal?.has_faq_schema ?? false,
+                },
+              },
+            ],
+          },
+          instructions: {
+            steps: [
+              "Add a concise FAQ section mapped to search intent.",
+              "Attach valid FAQPage schema JSON-LD.",
+              "Validate schema syntax and indexability.",
+            ],
+            acceptance_criteria: ["FAQ section published.", "FAQ schema validates without errors."],
+            guardrails: ["No fabricated claims in FAQ answers.", "Keep FAQ content original."],
+          },
+          automation: {
+            can_auto_apply: true,
+            auto_apply_default: false,
+            actions: [
+              { action_type: "WP_ADD_SCHEMA", payload: { schema_type: "FAQPage", target_slug: slug } },
+              { action_type: "WP_UPDATE_PAGE", payload: { target_slug: slug, add_section: "faq" } },
+            ],
+          },
+          outputs: {
+            artifacts: [{ kind: "SCHEMA_JSONLD", data: { schema_type: "FAQPage", target_slug: slug } }],
+          },
+        })
+      );
+    }
+
+    const top3Inbound = signal?.top3_median_inbound_links ?? 0;
+    const ownInbound = ownSignal?.inbound_internal_links ?? 0;
+    if (top3Inbound > 0 && ownInbound < top3Inbound * 0.5) {
+      add(
+        makeStep3Task({
+          siteId: input.site.site_id,
+          siteRunId: input.siteRunId,
+          category: "ON_PAGE",
+          type: "INTERNAL_LINKING_BOOST_MONEY_PAGE",
+          title: `Boost internal links to "${keyword}" money page`,
+          summary: "Internal inbound links are materially below top-3 median for this keyword.",
+          priority: "P1",
+          effort: "M",
+          confidence: 0.84,
+          estimatedImpact: { seo: "high", leads: "med", timeToEffectDays: 14 },
+          mode: "AUTO",
+          requiresAccess: ["WP_ADMIN"],
+          scope: { keyword, cluster, target_slug: slug, target_url: targetUrl, geo: "both" },
+          evidence: {
+            based_on: ["SERP", "ON_PAGE"],
+            citations: [
+              {
+                kind: "METRIC_GAP",
+                text: "Target internal inbound links are below 50% of top-3 median.",
+                data: { top3_median_inbound_links: top3Inbound, target_inbound_links: ownInbound },
+              },
+            ],
+          },
+          instructions: {
+            steps: [
+              "Select relevant supporting pages in same cluster.",
+              "Insert contextual links with diversified anchor themes.",
+              "Avoid sitewide footer/sidebar link blasts.",
+            ],
+            acceptance_criteria: [
+              `Increase inbound links toward ${Math.max(10, Math.round(top3Inbound * 0.8))}.`,
+              "No anchor text exceeds 30% share.",
+            ],
+            guardrails: ["Only contextually relevant placements.", "No repetitive exact-match pattern."],
+          },
+          automation: {
+            can_auto_apply: true,
+            auto_apply_default: true,
+            actions: [
+              {
+                action_type: "WP_ADD_INTERNAL_LINKS",
+                payload: {
+                  target_slug: slug,
+                  min_new_links: Math.max(10, Math.round(top3Inbound * 0.8) - ownInbound),
+                  anchor_themes: parseStringArray(row.supporting_terms, 8, 80),
+                },
+              },
+            ],
+          },
+          outputs: {
+            artifacts: [
+              {
+                kind: "LINK_PLAN",
+                data: {
+                  target_slug: slug,
+                  target_links: Math.max(10, Math.round(top3Inbound * 0.8)),
+                },
+              },
+            ],
+          },
+        })
+      );
+    }
+
+    if (
+      (top3Modules.pricing_rate >= 0.5 ||
+        ((signal?.top3_page_types.service ?? 0) >= 2 && diffSignal?.new_top3_entrant === true)) &&
+      !(ownSignal?.has_pricing_module ?? false)
+    ) {
+      add(
+        makeStep3Task({
+          siteId: input.site.site_id,
+          siteRunId: input.siteRunId,
+          category: "ON_PAGE",
+          type: "CONTENT_MODULE_ADD",
+          title: `Add pricing module for "${keyword}" page`,
+          summary: "Pricing visibility is common in top local pages and missing on target page.",
+          priority: "P1",
+          effort: "S",
+          confidence: 0.78,
+          estimatedImpact: { seo: "med", leads: "high", timeToEffectDays: 10 },
+          mode: "AUTO",
+          requiresAccess: ["WP_ADMIN"],
+          scope: { keyword, cluster, target_slug: slug, target_url: targetUrl, geo: "both" },
+          evidence: {
+            based_on: ["SERP", "ON_PAGE"],
+            citations: [
+              {
+                kind: diffSignal?.new_top3_entrant ? "COMPETITOR_CHANGE" : "SERP_PATTERN",
+                text: diffSignal?.new_top3_entrant
+                  ? "A new top-3 competitor entered and pricing modules are common among top pages."
+                  : "Top-ranked competitors frequently include pricing-related sections.",
+                data: { top3_pricing_rate: top3Modules.pricing_rate, new_top3_entrant: diffSignal?.new_top3_entrant ?? false },
+              },
+            ],
+          },
+          instructions: {
+            steps: ["Insert pricing or starting-price block.", "Add quote CTA adjacent to pricing block."],
+            acceptance_criteria: ["Pricing module rendered and linked to conversion CTA."],
+            guardrails: ["No misleading price promises.", "Keep pricing language compliant."],
+          },
+          automation: {
+            can_auto_apply: true,
+            auto_apply_default: false,
+            actions: [{ action_type: "WP_UPDATE_PAGE", payload: { target_slug: slug, add_module: "pricing" } }],
+          },
+          outputs: { artifacts: [{ kind: "DRAFT_MD", data: { section: "pricing", target_slug: slug } }] },
+        })
+      );
+    }
+
+    const top3RD = signal?.top3_median_ref_domains ?? 0;
+    const ownRD = ownSignal?.ref_domains ?? 0;
+    if (top3RD > 0 && ownRD < top3RD * 0.6) {
+      add(
+        makeStep3Task({
+          siteId: input.site.site_id,
+          siteRunId: input.siteRunId,
+          category: "AUTHORITY",
+          type: "OUTREACH_TARGET_LIST",
+          title: `Build outreach target list for "${cluster}"`,
+          summary: "Ref-domain gap indicates authority deficit against top local performers.",
+          priority: "P1",
+          effort: "M",
+          confidence: 0.66,
+          estimatedImpact: { seo: "high", leads: "med", timeToEffectDays: 30 },
+          mode: "TEAM",
+          requiresAccess: ["NONE"],
+          requiresInputs: ["SERVICE_LIST"],
+          requiresApprovals: ["OUTREACH_SEND"],
+          status: "READY",
+          scope: { keyword, cluster, target_slug: slug, target_url: targetUrl, geo: "both" },
+          evidence: {
+            based_on: ["LINKS", "SERP"],
+            citations: [
+              {
+                kind: "METRIC_GAP",
+                text: "Target referring domains are materially below top-3 median.",
+                data: { top3_median_ref_domains: top3RD, target_ref_domains: ownRD },
+              },
+            ],
+          },
+          instructions: {
+            steps: [
+              "Extract local/niche backlink themes from top competitors.",
+              "Generate 30 outreach targets with pitch angles.",
+              "Prioritize local organizations and relevant partnerships.",
+            ],
+            acceptance_criteria: [
+              "30 vetted targets produced.",
+              "At least 10 local/relevant targets.",
+            ],
+            guardrails: ["No link farms.", "No mass outreach without review."],
+          },
+          automation: { can_auto_apply: false, auto_apply_default: false, actions: [] },
+          outputs: { artifacts: [{ kind: "OUTREACH_LIST", data: { target_count: 30, cluster } }] },
+        })
+      );
+    }
+  }
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "ON_PAGE",
+      type: "INTERNAL_LINKING_SILO_BUILD",
+      title: "Build cluster-wide internal linking silos",
+      summary: "Strengthen contextual clusters and money-page flow using Step 2 keyword map.",
+      priority: "P1",
+      effort: "M",
+      confidence: 0.82,
+      estimatedImpact: { seo: "high", leads: "med", timeToEffectDays: 14 },
+      mode: "AUTO",
+      requiresAccess: ["WP_ADMIN"],
+      scope: { geo: "both" },
+      automation: {
+        can_auto_apply: true,
+        auto_apply_default: true,
+        actions: [{ action_type: "WP_ADD_INTERNAL_LINKS", payload: { strategy: "cluster_silo" } }],
+      },
+      outputs: { artifacts: [{ kind: "LINK_PLAN", data: { strategy: "cluster_silo" } }] },
+    })
+  );
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "TECHNICAL_SEO",
+      type: "INDEXATION_CLEANUP",
+      title: "Run indexation and canonical cleanup",
+      summary: "Fix indexability drift, canonical conflicts, and thin indexable pages.",
+      priority: "P0",
+      effort: "M",
+      confidence: 0.8,
+      estimatedImpact: { seo: "high", leads: "med", timeToEffectDays: 7 },
+      mode: "AUTO",
+      requiresAccess: ["WP_ADMIN"],
+      scope: { geo: "us" },
+      automation: {
+        can_auto_apply: true,
+        auto_apply_default: false,
+        actions: [{ action_type: "WP_UPDATE_META", payload: { checks: ["noindex", "canonical"] } }],
+      },
+    })
+  );
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "TECHNICAL_SEO",
+      type: "DUPLICATE_CONTENT_REDUCE",
+      title: "Reduce duplicate content and template footprint",
+      summary: "Control builder/template repetition to avoid local doorway-like patterns.",
+      priority: "P1",
+      effort: "M",
+      confidence: 0.77,
+      estimatedImpact: { seo: "med", leads: "low", timeToEffectDays: 21 },
+      mode: "AUTO",
+      requiresAccess: ["WP_ADMIN"],
+      scope: { geo: "us" },
+    })
+  );
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "LOCAL_SEO",
+      type: "GBP_OPTIMIZE",
+      title: "Optimize Google Business Profile categories/services",
+      summary: "Align GBP categories, services, and profile details to winning local intent.",
+      priority: "P1",
+      effort: "M",
+      confidence: 0.74,
+      estimatedImpact: { seo: "high", leads: "high", timeToEffectDays: 10 },
+      mode: "DIY",
+      requiresAccess: ["GBP"],
+      requiresInputs: ["SERVICE_LIST", "BUSINESS_HOURS"],
+      requiresApprovals: ["GBP_PUBLISH"],
+      scope: { geo: "both" },
+    })
+  );
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "LOCAL_SEO",
+      type: "GBP_POST_PLAN_WEEKLY",
+      title: "Generate weekly GBP post plan",
+      summary: "Create local-trust and service-theme GBP post drafts for weekly cadence.",
+      priority: "P2",
+      effort: "S",
+      confidence: 0.73,
+      estimatedImpact: { seo: "low", leads: "med", timeToEffectDays: 7 },
+      mode: "AUTO",
+      requiresAccess: ["GBP"],
+      requiresApprovals: ["GBP_PUBLISH"],
+      scope: { geo: "both" },
+      automation: {
+        can_auto_apply: false,
+        auto_apply_default: false,
+        actions: [{ action_type: "GBP_CREATE_POST", payload: { cadence: "weekly", posts: 4 } }],
+      },
+      outputs: { artifacts: [{ kind: "DRAFT_MD", data: { channel: "GBP", cadence: "weekly" } }] },
+    })
+  );
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "LOCAL_SEO",
+      type: "REVIEW_REQUEST_CAMPAIGN_SETUP",
+      title: "Set up review request campaign",
+      summary: "Deploy review request flow and templates to improve review velocity.",
+      priority: "P1",
+      effort: "M",
+      confidence: 0.75,
+      estimatedImpact: { seo: "med", leads: "high", timeToEffectDays: 14 },
+      mode: "DIY",
+      requiresAccess: ["EMAIL", "SMS"],
+      requiresInputs: ["BRAND_VOICE"],
+      requiresApprovals: ["PUBLISH"],
+      scope: { geo: "both" },
+    })
+  );
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "LOCAL_SEO",
+      type: "CITATION_AUDIT",
+      title: "Audit citations and NAP consistency",
+      summary: "Find NAP mismatches, duplicate profiles, and cleanup opportunities.",
+      priority: "P1",
+      effort: "S",
+      confidence: 0.8,
+      estimatedImpact: { seo: "med", leads: "med", timeToEffectDays: 21 },
+      mode: "AUTO",
+      requiresAccess: ["NONE"],
+      scope: { geo: "both" },
+      outputs: { artifacts: [{ kind: "CITATION_LIST", data: { mode: "audit" } }] },
+    })
+  );
+
+  const directoryRatio =
+    input.competitors.length > 0
+      ? input.competitors.filter((row) => row.is_directory).length / input.competitors.length
+      : 0;
+  if (directoryRatio >= 0.6) {
+    add(
+      makeStep3Task({
+        siteId: input.site.site_id,
+        siteRunId: input.siteRunId,
+        category: "AUTHORITY",
+        type: "LOCAL_PARTNERSHIP_OPPORTUNITIES",
+        title: "Build local partnership opportunities",
+        summary: "Directory-heavy SERP indicates stronger local trust and relationship signals are needed.",
+        priority: "P1",
+        effort: "M",
+        confidence: 0.7,
+        estimatedImpact: { seo: "med", leads: "med", timeToEffectDays: 30 },
+        mode: "TEAM",
+        scope: { geo: "both" },
+        evidence: {
+          based_on: ["SERP"],
+          citations: [
+            {
+              kind: "SERP_PATTERN",
+              text: "Directory-heavy SERP composition detected.",
+              data: { directory_ratio: Number(directoryRatio.toFixed(3)) },
+            },
+          ],
+        },
+        outputs: { artifacts: [{ kind: "OUTREACH_LIST", data: { focus: "local_partnerships" } }] },
+      })
+    );
+  }
+
+  const competitorDomains = input.competitors.map((row) => row.domain).slice(0, 8);
+  if (input.socialCadenceIncreased) {
+    add(
+      makeStep3Task({
+        siteId: input.site.site_id,
+        siteRunId: input.siteRunId,
+        category: "SOCIAL",
+        type: "SOCIAL_PLAN_WEEKLY",
+        title: "Increase weekly social cadence due to competitor acceleration",
+        summary: "Competitor social cadence increased versus previous baseline while owned social signal remains low/unknown.",
+        priority: "P2",
+        effort: "S",
+        confidence: 0.69,
+        estimatedImpact: { seo: "low", leads: "med", timeToEffectDays: 7 },
+        mode: "DIY",
+        requiresAccess: ["SOCIAL"],
+        requiresInputs: ["PHOTOS", "SERVICE_LIST", "BRAND_VOICE"],
+        requiresApprovals: ["PUBLISH"],
+        scope: { geo: "both" },
+        evidence: {
+          based_on: ["SOCIAL"],
+          citations: [
+            {
+              kind: "COMPETITOR_CHANGE",
+              text: "Competitor social cadence is rising compared with prior runs.",
+              data: { social_cadence_increased: true },
+            },
+          ],
+        },
+      })
+    );
+  }
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "SOCIAL",
+      type: "SOCIAL_PLAN_WEEKLY",
+      title: "Generate competitor-reactive weekly social plan",
+      summary: "Use competitor cadence/themes as features while generating original creative and copy.",
+      priority: "P2",
+      effort: "S",
+      confidence: 0.72,
+      estimatedImpact: { seo: "low", leads: "med", timeToEffectDays: 7 },
+      mode: "DIY",
+      requiresAccess: ["SOCIAL"],
+      requiresInputs: ["PHOTOS", "SERVICE_LIST", "BRAND_VOICE"],
+      requiresApprovals: ["PUBLISH"],
+      scope: { geo: "both" },
+      evidence: {
+        based_on: ["SOCIAL", "SERP"],
+        citations: [
+          {
+            kind: "SERP_PATTERN",
+            text: "Top competitors in local SERPs show persistent social proof and recurring service themes.",
+            data: { competitor_set: competitorDomains },
+          },
+        ],
+      },
+      instructions: {
+        steps: [
+          "Create 5 original posts mapped to service, trust, and differentiator themes.",
+          "Include localized proof points and lead-gen CTA in each draft.",
+          "Schedule drafts after account connection.",
+        ],
+        acceptance_criteria: ["5 post drafts + creative briefs are generated.", "No competitor copy reuse."],
+        guardrails: ["No competitor phrasing reuse.", "No image reuse.", "No keyword stuffing."],
+      },
+      automation: { can_auto_apply: false, auto_apply_default: false, actions: [] },
+      outputs: {
+        artifacts: [{ kind: "SOCIAL_CALENDAR", data: { cadence: "weekly", competitors: competitorDomains } }],
+      },
+    })
+  );
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "SOCIAL",
+      type: "SOCIAL_CREATIVE_BRIEF",
+      title: "Generate social creative briefs",
+      summary: "Produce hooks, captions, CTA patterns, and visual direction per weekly post.",
+      priority: "P2",
+      effort: "S",
+      confidence: 0.71,
+      estimatedImpact: { seo: "low", leads: "med", timeToEffectDays: 7 },
+      mode: "AUTO",
+      requiresAccess: ["NONE"],
+      outputs: { artifacts: [{ kind: "SOCIAL_CALENDAR", data: { include_briefs: true } }] },
+    })
+  );
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "MEASUREMENT",
+      type: "KPI_DASHBOARD_UPDATE",
+      title: "Update SEO + lead KPI dashboard",
+      summary: "Consolidate rank, SERP-change, and lead proxy metrics for weekly decisions.",
+      priority: "P2",
+      effort: "S",
+      confidence: 0.79,
+      estimatedImpact: { seo: "med", leads: "med", timeToEffectDays: 7 },
+      mode: "AUTO",
+      requiresAccess: ["NONE"],
+      outputs: { artifacts: [{ kind: "EXPORT_CSV", data: { scope: "weekly_kpis" } }] },
+    })
+  );
+
+  add(
+    makeStep3Task({
+      siteId: input.site.site_id,
+      siteRunId: input.siteRunId,
+      category: "MEASUREMENT",
+      type: "ALERT_RULE_CREATE",
+      title: "Create alert rules for rank drops and competitor spikes",
+      summary: "Notify when rank volatility or new top-3 competitors signal potential revenue risk.",
+      priority: "P1",
+      effort: "S",
+      confidence: 0.82,
+      estimatedImpact: { seo: "med", leads: "med", timeToEffectDays: 1 },
+      mode: "AUTO",
+      requiresAccess: ["NONE"],
+      outputs: { artifacts: [{ kind: "DRAFT_MD", data: { alert_rules: ["rank_drop", "new_top3_competitor"] } }] },
+    })
+  );
+
+  return tasks.slice(0, 80);
+}
+
+function buildStep3RiskFlags(input: {
+  site: Step1SiteRecord;
+  primaryRows: Array<Record<string, unknown>>;
+  competitors: Step3CompetitorCandidate[];
+  tasks: Step3TaskV1[];
+}): Step3RiskFlag[] {
+  const flags: Step3RiskFlag[] = [];
+  const locationPages = input.primaryRows.filter((row) =>
+    cleanString(row.recommended_page_type, 80).toLowerCase().includes("location")
+  ).length;
+  if (locationPages >= 8) {
+    flags.push({
+      risk_type: "doorway_pattern",
+      severity: "high",
+      message: "High volume of location-landing targets detected. Enforce uniqueness and avoid doorway-page expansion.",
+      blocked_action: "bulk_location_page_autopublish",
+    });
+  }
+
+  const uniqueClusters = new Set(input.primaryRows.map((row) => cleanString(row.cluster, 120).toLowerCase()));
+  if (uniqueClusters.size < 3) {
+    flags.push({
+      risk_type: "cluster_concentration",
+      severity: "medium",
+      message: "Primary keyword set is tightly concentrated. Expand coverage to reduce repetitive footprint.",
+      blocked_action: "single-cluster_overproduction",
+    });
+  }
+
+  const directoryCount = input.competitors.filter((row) => row.is_directory).length;
+  if (input.competitors.length > 0 && directoryCount / input.competitors.length >= 0.6) {
+    flags.push({
+      risk_type: "directory_heavy_serp",
+      severity: "low",
+      message: "SERPs are directory-heavy; prioritize brand/local trust signals rather than thin location expansion.",
+      blocked_action: null,
+    });
+  }
+
+  const teamOnlyCount = input.tasks.filter((task) => task.mode === "TEAM").length;
+  if (teamOnlyCount >= 4) {
+    flags.push({
+      risk_type: "execution_dependency",
+      severity: "medium",
+      message: "Plan includes multiple team-only tasks. Ensure assisted capacity before promising timelines.",
+      blocked_action: null,
+    });
+  }
+
+  return flags;
+}
+
+async function loadLatestStep2DateForSite(env: Env, siteId: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT date_yyyymmdd
+     FROM step2_daily_reports
+     WHERE site_id = ?
+     ORDER BY date_yyyymmdd DESC, created_at DESC
+     LIMIT 1`
+  )
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+  return row ? cleanString(row.date_yyyymmdd, 20) || null : null;
+}
+
+async function loadStep3CompetitorCandidatesFromStep2(
+  env: Env,
+  siteId: string,
+  step2Date: string,
+  limit = 24
+): Promise<Step3CompetitorCandidate[]> {
+  const rows = await env.DB.prepare(
+    `SELECT
+      r.domain AS domain,
+      COUNT(*) AS appearances,
+      AVG(r.rank) AS avg_rank,
+      GROUP_CONCAT(r.url) AS sample_urls_csv
+    FROM step2_serp_results r
+    JOIN step2_serp_snapshots s ON s.serp_id = r.serp_id
+    WHERE s.site_id = ?
+      AND s.date_yyyymmdd = ?
+      AND r.rank <= 5
+    GROUP BY r.domain
+    ORDER BY appearances DESC, avg_rank ASC
+    LIMIT ?`
+  )
+    .bind(siteId, step2Date, Math.max(1, Math.min(limit, 100)))
+    .all<Record<string, unknown>>();
+
+  const out: Step3CompetitorCandidate[] = [];
+  for (const raw of rows.results ?? []) {
+    const domain = normalizeRootDomain(cleanString(raw.domain, 255));
+    if (!domain) continue;
+    const sampleUrls = cleanString(raw.sample_urls_csv, 40_000)
+      .split(",")
+      .map((v) => cleanString(v, 2000))
+      .filter(Boolean)
+      .slice(0, 10);
+    out.push({
+      domain,
+      appearance_count: clampInt(raw.appearances, 0, 5000, 0),
+      avg_rank: Math.max(0, Number(raw.avg_rank ?? 0) || 0),
+      sample_urls: sampleUrls,
+      is_directory: isDirectoryDomain(domain),
+    });
+  }
+  return out;
+}
+
+async function loadLatestStep3Report(env: Env, siteId: string, dateFilter: string): Promise<Record<string, unknown>> {
+  const row = await env.DB.prepare(
+    `SELECT
+      r.run_id,
+      r.date_yyyymmdd,
+      r.report_json,
+      r.created_at,
+      sr.status,
+      sr.source_step2_date,
+      sr.summary_json
+     FROM step3_reports r
+     JOIN step3_runs sr ON sr.run_id = r.run_id
+     WHERE r.site_id = ?
+       AND (? = '' OR r.date_yyyymmdd = ?)
+     ORDER BY r.created_at DESC
+     LIMIT 1`
+  )
+    .bind(siteId, dateFilter, dateFilter)
+    .first<Record<string, unknown>>();
+
+  if (!row) {
+    return {
+      site_id: siteId,
+      date: dateFilter || null,
+      report: null,
+    };
+  }
+
+  return {
+    site_id: siteId,
+    date: cleanString(row.date_yyyymmdd, 20),
+    run_id: cleanString(row.run_id, 120),
+    status: cleanString(row.status, 20),
+    source_step2_date: cleanString(row.source_step2_date, 20) || null,
+    summary: safeJsonParseObject(cleanString(row.summary_json, 64_000)) ?? {},
+    report: safeJsonParseObject(cleanString(row.report_json, 512_000)) ?? {},
+    created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  };
+}
+
+async function loadStep3RunMeta(
+  env: Env,
+  input: { siteId: string; runId?: string | null }
+): Promise<{ run_id: string; date_yyyymmdd: string; created_at: number } | null> {
+  if (cleanString(input.runId, 120)) {
+    const row = await env.DB.prepare(
+      `SELECT run_id, date_yyyymmdd, created_at
+       FROM step3_runs
+       WHERE site_id = ? AND run_id = ?
+       LIMIT 1`
+    )
+      .bind(input.siteId, cleanString(input.runId, 120))
+      .first<Record<string, unknown>>();
+    if (!row) return null;
+    return {
+      run_id: cleanString(row.run_id, 120),
+      date_yyyymmdd: cleanString(row.date_yyyymmdd, 20),
+      created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    };
+  }
+  const latest = await env.DB.prepare(
+    `SELECT run_id, date_yyyymmdd, created_at
+     FROM step3_runs
+     WHERE site_id = ?
+     ORDER BY created_at DESC
+     LIMIT 1`
+  )
+    .bind(input.siteId)
+    .first<Record<string, unknown>>();
+  if (!latest) return null;
+  return {
+    run_id: cleanString(latest.run_id, 120),
+    date_yyyymmdd: cleanString(latest.date_yyyymmdd, 20),
+    created_at: clampInt(latest.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  };
+}
+
+async function loadStep3TasksForRun(
+  env: Env,
+  runId: string
+): Promise<Array<{ task_id: string; details_json: string; status: string; created_at: number }>> {
+  const rows = await env.DB.prepare(
+    `SELECT task_id, details_json, status, created_at
+     FROM step3_tasks
+     WHERE run_id = ?
+     ORDER BY priority ASC, created_at ASC`
+  )
+    .bind(runId)
+    .all<Record<string, unknown>>();
+  return (rows.results ?? []).map((row) => ({
+    task_id: cleanString(row.task_id, 120),
+    details_json: cleanString(row.details_json, 128000),
+    status: cleanString(row.status, 20),
+    created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  }));
+}
+
+async function loadStep3TasksFiltered(
+  env: Env,
+  input: {
+    siteId: string;
+    runId: string;
+    executionModes: string[];
+    taskGroups: string[];
+    statuses: string[];
+  }
+): Promise<Array<{ task_id: string; details_json: string; status: string; created_at: number }>> {
+  const where: string[] = ["site_id = ?", "run_id = ?"];
+  const binds: Array<string | number> = [input.siteId, input.runId];
+
+  if (input.executionModes.length > 0) {
+    where.push(`execution_mode IN (${input.executionModes.map(() => "?").join(",")})`);
+    binds.push(...input.executionModes);
+  }
+  if (input.taskGroups.length > 0) {
+    where.push(`task_group IN (${input.taskGroups.map(() => "?").join(",")})`);
+    binds.push(...input.taskGroups);
+  }
+  if (input.statuses.length > 0) {
+    where.push(`status IN (${input.statuses.map(() => "?").join(",")})`);
+    binds.push(...input.statuses);
+  }
+
+  const query = `
+    SELECT task_id, details_json, status, created_at
+    FROM step3_tasks
+    WHERE ${where.join(" AND ")}
+    ORDER BY priority ASC, created_at ASC
+  `;
+  const rows = await env.DB.prepare(query).bind(...binds).all<Record<string, unknown>>();
+  return (rows.results ?? []).map((row) => ({
+    task_id: cleanString(row.task_id, 120),
+    details_json: cleanString(row.details_json, 128000),
+    status: cleanString(row.status, 20),
+    created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  }));
+}
+
+function mapDbTaskStatusToV1(status: string): Step3TaskStatus {
+  const s = cleanString(status, 20).toLowerCase();
+  if (s === "blocked") return "BLOCKED";
+  if (s === "applied") return "DONE";
+  if (s === "draft") return "IN_PROGRESS";
+  return "READY";
+}
+
+function mapQueryStatusToDb(status: string): string | null {
+  const s = cleanString(status, 30).toUpperCase();
+  if (!s) return null;
+  if (s === "NEW" || s === "READY") return "planned";
+  if (s === "BLOCKED" || s === "FAILED") return "blocked";
+  if (s === "IN_PROGRESS") return "draft";
+  if (s === "DONE") return "applied";
+  if (s === "SKIPPED") return "planned";
+  const direct = cleanString(status, 30).toLowerCase();
+  if (["planned", "blocked", "draft", "applied"].includes(direct)) return direct;
+  return null;
+}
+
+function mapQueryExecutionMode(mode: string): string | null {
+  const m = cleanString(mode, 30).toUpperCase();
+  if (!m) return null;
+  if (m === "AUTO" || m === "AUTO_SAFE") return "auto_safe";
+  if (m === "DIY" || m === "ASSISTED") return "assisted";
+  if (m === "TEAM" || m === "TEAM_ONLY") return "team_only";
+  const direct = cleanString(mode, 30).toLowerCase();
+  if (["auto_safe", "assisted", "team_only"].includes(direct)) return direct;
+  return null;
+}
+
+function parseCsvQueryValues(url: URL, key: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (value: string) => {
+    const clean = cleanString(value, 80);
+    if (!clean) return;
+    const lowered = clean.toLowerCase();
+    if (seen.has(lowered)) return;
+    seen.add(lowered);
+    out.push(clean);
+  };
+  for (const v of url.searchParams.getAll(key)) {
+    for (const part of v.split(",")) {
+      push(part);
+    }
+  }
+  return out;
+}
+
+function mapTaskToCard(task: Step3TaskV1): Record<string, unknown> {
+  return {
+    task_id: task.task_id,
+    title: task.title,
+    category: task.category,
+    type: task.type,
+    priority: task.priority,
+    mode: task.mode,
+    effort: task.effort,
+    confidence: task.confidence,
+    impact: task.estimated_impact,
+    scope: {
+      cluster: task.scope.cluster,
+      keyword: task.scope.keyword,
+      target_slug: task.scope.target_slug,
+      geo: task.scope.geo,
+    },
+    requires_access: task.requires.access,
+    status: task.status,
+    blocker_codes: task.blockers.map((row) => cleanString(row.code, 60)).filter(Boolean),
+    updated_at: task.updated_at,
+  };
+}
+
+function parseTaskV1FromStored(
+  row: { task_id: string; details_json: string; status: string; created_at: number },
+  siteId: string,
+  runId: string
+): Step3TaskV1 {
+  const parsed = safeJsonParseObject(row.details_json) ?? {};
+  const task = parsed as unknown as Partial<Step3TaskV1>;
+  const createdIso = isoFromMs(row.created_at);
+  return {
+    schema_version: "task.v1",
+    task_id: cleanString(task.task_id, 120) || row.task_id,
+    site_id: cleanString(task.site_id, 120) || siteId,
+    site_run_id: cleanString(task.site_run_id, 120) || runId,
+    created_at: cleanString(task.created_at, 40) || createdIso,
+    updated_at: cleanString(task.updated_at, 40) || createdIso,
+    category: (cleanString(task.category, 40) as Step3TaskCategory) || "ON_PAGE",
+    type: (cleanString(task.type, 80) as Step3TaskType) || "CONTENT_REFRESH",
+    title: cleanString(task.title, 300) || "Untitled task",
+    summary: cleanString(task.summary, 2000) || "",
+    priority: (cleanString(task.priority, 4) as Step3TaskPriority) || "P2",
+    effort: (cleanString(task.effort, 1) as Step3TaskEffort) || "M",
+    confidence: clamp01(Number(task.confidence ?? 0.5) || 0.5),
+    estimated_impact: {
+      seo: (cleanString(task.estimated_impact?.seo, 8) as "low" | "med" | "high") || "med",
+      leads: (cleanString(task.estimated_impact?.leads, 8) as "low" | "med" | "high") || "med",
+      time_to_effect_days: clampInt(task.estimated_impact?.time_to_effect_days, 0, 3650, 14),
+    },
+    mode: (cleanString(task.mode, 8) as Step3TaskMode) || "AUTO",
+    requires: {
+      access: parseStringArray(task.requires?.access, 20, 30).length > 0 ? parseStringArray(task.requires?.access, 20, 30) : ["NONE"],
+      inputs: parseStringArray(task.requires?.inputs, 20, 40).length > 0 ? parseStringArray(task.requires?.inputs, 20, 40) : ["NONE"],
+      approvals:
+        parseStringArray(task.requires?.approvals, 20, 40).length > 0
+          ? parseStringArray(task.requires?.approvals, 20, 40)
+          : ["NONE"],
+    },
+    status: (cleanString(task.status, 20) as Step3TaskStatus) || mapDbTaskStatusToV1(row.status),
+    blockers: Array.isArray(task.blockers)
+      ? task.blockers
+          .map((raw) => {
+            const b = parseJsonObject(raw);
+            if (!b) return null;
+            const code = cleanString(b.code, 60);
+            const message = cleanString(b.message, 300);
+            if (!code && !message) return null;
+            return { code: code || "MISSING_INPUT", message: message || "Missing requirement." };
+          })
+          .filter((v): v is { code: string; message: string } => !!v)
+      : [],
+    scope: {
+      keyword_id: cleanString(task.scope?.keyword_id, 120) || null,
+      keyword: cleanString(task.scope?.keyword, 300) || null,
+      cluster: cleanString(task.scope?.cluster, 120) || null,
+      target_url: cleanString(task.scope?.target_url, 2000) || null,
+      target_slug: cleanString(task.scope?.target_slug, 160) || null,
+      geo: cleanString(task.scope?.geo, 120) || null,
+    },
+    evidence: {
+      based_on: parseStringArray(task.evidence?.based_on, 20, 40),
+      citations: Array.isArray(task.evidence?.citations)
+        ? task.evidence.citations
+            .map((raw) => {
+              const c = parseJsonObject(raw);
+              if (!c) return null;
+              return {
+                kind: cleanString(c.kind, 80) || "BEST_PRACTICE",
+                text: cleanString(c.text, 500),
+                data: parseJsonObject(c.data) ?? {},
+              };
+            })
+            .filter((v): v is { kind: string; text: string; data: Record<string, unknown> } => !!v)
+        : [],
+    },
+    instructions: {
+      steps: parseStringArray(task.instructions?.steps, 30, 300),
+      acceptance_criteria: parseStringArray(task.instructions?.acceptance_criteria, 20, 300),
+      guardrails: parseStringArray(task.instructions?.guardrails, 20, 300),
+    },
+    automation: {
+      can_auto_apply: parseBoolUnknown(task.automation?.can_auto_apply, false),
+      auto_apply_default: parseBoolUnknown(task.automation?.auto_apply_default, false),
+      actions: Array.isArray(task.automation?.actions)
+        ? task.automation.actions
+            .map((raw) => {
+              const a = parseJsonObject(raw);
+              if (!a) return null;
+              return {
+                action_type: cleanString(a.action_type, 80),
+                payload: parseJsonObject(a.payload) ?? {},
+              };
+            })
+            .filter((v): v is { action_type: string; payload: Record<string, unknown> } => !!v && !!v.action_type)
+        : [],
+    },
+    outputs: {
+      artifacts: Array.isArray(task.outputs?.artifacts)
+        ? task.outputs.artifacts
+            .map((raw) => {
+              const a = parseJsonObject(raw);
+              if (!a) return null;
+              return {
+                kind: cleanString(a.kind, 80),
+                data: parseJsonObject(a.data) ?? {},
+              };
+            })
+            .filter((v): v is { kind: string; data: Record<string, unknown> } => !!v && !!v.kind)
+        : [],
+    },
+    dependencies: {
+      depends_on_task_ids: parseStringArray(task.dependencies?.depends_on_task_ids, 50, 120),
+      supersedes_task_ids: parseStringArray(task.dependencies?.supersedes_task_ids, 50, 120),
+    },
+  };
+}
+
+function priorityRank(priority: Step3TaskPriority): number {
+  if (priority === "P0") return 0;
+  if (priority === "P1") return 1;
+  if (priority === "P2") return 2;
+  return 3;
+}
+
+function buildStep3TaskBoardPayload(input: {
+  site: Step1SiteRecord;
+  runId: string | null;
+  runDate: string | null;
+  source: "latest" | "run";
+  tasks: Step3TaskV1[];
+}): Record<string, unknown> {
+  const statusOrder: Step3TaskStatus[] = ["NEW", "READY", "BLOCKED", "IN_PROGRESS", "DONE"];
+  const allStatuses: Step3TaskStatus[] = ["NEW", "READY", "BLOCKED", "IN_PROGRESS", "DONE", "SKIPPED", "FAILED"];
+  const priorities: Step3TaskPriority[] = ["P0", "P1", "P2", "P3"];
+  const modes: Step3TaskMode[] = ["AUTO", "DIY", "TEAM"];
+  const categories: Step3TaskCategory[] = [
+    "ON_PAGE",
+    "TECHNICAL_SEO",
+    "LOCAL_SEO",
+    "CONTENT",
+    "AUTHORITY",
+    "SOCIAL",
+    "MEASUREMENT",
+  ];
+
+  const byStatus: Record<string, number> = Object.fromEntries(allStatuses.map((s) => [s, 0]));
+  const byPriority: Record<string, number> = Object.fromEntries(priorities.map((s) => [s, 0]));
+  const byMode: Record<string, number> = Object.fromEntries(modes.map((s) => [s, 0]));
+  const byCategory: Record<string, number> = Object.fromEntries(categories.map((s) => [s, 0]));
+  const blockerCount = new Map<string, number>();
+  const blockerExample = new Map<string, string>();
+  const clusters = new Set<string>();
+  const accessSet = new Set<string>();
+
+  const cards = input.tasks.map((task) => {
+    byStatus[task.status] = (byStatus[task.status] ?? 0) + 1;
+    byPriority[task.priority] = (byPriority[task.priority] ?? 0) + 1;
+    byMode[task.mode] = (byMode[task.mode] ?? 0) + 1;
+    byCategory[task.category] = (byCategory[task.category] ?? 0) + 1;
+    if (task.scope.cluster) clusters.add(task.scope.cluster);
+    for (const access of task.requires.access) {
+      accessSet.add(access);
+    }
+    const blockerCodes: string[] = [];
+    for (const blocker of task.blockers) {
+      const code = cleanString(blocker.code, 60);
+      if (!code) continue;
+      blockerCodes.push(code);
+      blockerCount.set(code, (blockerCount.get(code) ?? 0) + 1);
+      if (!blockerExample.has(code)) {
+        blockerExample.set(code, cleanString(blocker.message, 200) || code);
+      }
+    }
+    return {
+      task_id: task.task_id,
+      title: task.title,
+      category: task.category,
+      type: task.type,
+      priority: task.priority,
+      mode: task.mode,
+      effort: task.effort,
+      confidence: task.confidence,
+      impact: task.estimated_impact,
+      scope: {
+        cluster: task.scope.cluster,
+        keyword: task.scope.keyword,
+        target_slug: task.scope.target_slug,
+        geo: task.scope.geo,
+      },
+      requires_access: task.requires.access,
+      status: task.status,
+      blocker_codes: blockerCodes,
+      updated_at: task.updated_at,
+    };
+  });
+
+  cards.sort((a, b) => {
+    const p = priorityRank(a.priority as Step3TaskPriority) - priorityRank(b.priority as Step3TaskPriority);
+    if (p !== 0) return p;
+    return String(a.updated_at).localeCompare(String(b.updated_at)) * -1;
+  });
+
+  const columns = statusOrder.map((status) => ({
+    status,
+    title:
+      status === "IN_PROGRESS"
+        ? "In progress"
+        : status === "READY"
+          ? "Ready"
+          : status === "BLOCKED"
+            ? "Blocked"
+            : status === "DONE"
+              ? "Done"
+              : "New",
+    tasks: cards.filter((task) => task.status === status),
+  }));
+
+  const topBlockers = [...blockerCount.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([code, count]) => ({
+      code,
+      count,
+      example: blockerExample.get(code) ?? code,
+    }));
+
+  const quickWins = cards
+    .filter((task) => task.status === "READY" && task.mode === "AUTO" && (task.priority === "P0" || task.priority === "P1"))
+    .slice(0, 8)
+    .map((task) => ({
+      task_id: task.task_id,
+      title: task.title,
+      priority: task.priority,
+      mode: task.mode,
+    }));
+
+  const siteInput = safeJsonParseObject(input.site.input_json) ?? {};
+  const plan = getSitePlanFromInput(siteInput);
+  const metroSlug = cleanString(plan.metro, 120).toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const geoMode = plan.metro_proxy ? "both" : "us";
+
+  return {
+    schema_version: "task_board.v1",
+    site: {
+      site_id: input.site.site_id,
+      site_url: input.site.site_url,
+      plan_tier: plan.metro_proxy ? "metro" : "standard",
+      geo_mode: geoMode,
+      metro: plan.metro_proxy ? { name: plan.metro, slug: metroSlug } : null,
+    },
+    context: {
+      site_run_id: input.runId,
+      run_date: input.runDate,
+      source: input.source,
+    },
+    summary: {
+      counts: {
+        total: cards.length,
+        by_status: byStatus,
+        by_priority: byPriority,
+        by_mode: byMode,
+        by_category: byCategory,
+      },
+      top_blockers: topBlockers,
+      quick_wins: quickWins,
+    },
+    filters: {
+      status: allStatuses,
+      priority: priorities,
+      mode: modes,
+      category: categories,
+      cluster: [...clusters].sort((a, b) => a.localeCompare(b)),
+      requires_access: [...accessSet].sort((a, b) => a.localeCompare(b)),
+    },
+    columns,
+    task_details: {
+      by_id: Object.fromEntries(input.tasks.map((task) => [task.task_id, task])),
+    },
+    actions: {
+      bulk: [
+        {
+          id: "AUTO_APPLY_READY",
+          label: "Auto-apply all Ready AUTO tasks",
+          enabled: quickWins.length > 0,
+          requires_confirmation: true,
+        },
+        {
+          id: "MARK_DONE_SELECTED",
+          label: "Mark selected as Done",
+          enabled: cards.length > 0,
+          requires_confirmation: false,
+        },
+      ],
+      connections: [
+        {
+          access: "GBP",
+          label: "Connect Google Business Profile",
+          url: "wp-admin/admin.php?page=ai-seo-connect&provider=gbp",
+        },
+        {
+          access: "SOCIAL",
+          label: "Connect Social Accounts",
+          url: "wp-admin/admin.php?page=ai-seo-connect&provider=social",
+        },
+        {
+          access: "GA4",
+          label: "Connect GA4",
+          url: "wp-admin/admin.php?page=ai-seo-connect&provider=ga4",
+        },
+        {
+          access: "GSC",
+          label: "Connect Search Console",
+          url: "wp-admin/admin.php?page=ai-seo-connect&provider=gsc",
+        },
+      ],
+    },
+  };
+}
+
+async function loadStep3TaskById(
+  env: Env,
+  input: { siteId: string; taskId: string }
+): Promise<Step3TaskV1 | null> {
+  const row = await env.DB.prepare(
+    `SELECT t.task_id, t.details_json, t.status, t.created_at, t.run_id
+     FROM step3_tasks t
+     WHERE t.site_id = ? AND t.task_id = ?
+     LIMIT 1`
+  )
+    .bind(input.siteId, input.taskId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return parseTaskV1FromStored(
+    {
+      task_id: cleanString(row.task_id, 120),
+      details_json: cleanString(row.details_json, 128000),
+      status: cleanString(row.status, 20),
+      created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    },
+    input.siteId,
+    cleanString(row.run_id, 120)
+  );
+}
+
+async function loadStep3TaskRowById(
+  env: Env,
+  input: { siteId: string; taskId: string }
+): Promise<{ task_id: string; run_id: string; details_json: string; status: string; created_at: number } | null> {
+  const row = await env.DB.prepare(
+    `SELECT task_id, run_id, details_json, status, created_at
+     FROM step3_tasks
+     WHERE site_id = ? AND task_id = ?
+     LIMIT 1`
+  )
+    .bind(input.siteId, input.taskId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return {
+    task_id: cleanString(row.task_id, 120),
+    run_id: cleanString(row.run_id, 120),
+    details_json: cleanString(row.details_json, 128000),
+    status: cleanString(row.status, 20),
+    created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  };
+}
+
+function normalizeTaskStatusInput(value: unknown): Step3TaskStatus | null {
+  const s = cleanString(value, 30).toUpperCase();
+  if (!s) return null;
+  const allowed = new Set<Step3TaskStatus>([
+    "NEW",
+    "READY",
+    "BLOCKED",
+    "IN_PROGRESS",
+    "DONE",
+    "SKIPPED",
+    "FAILED",
+  ]);
+  return allowed.has(s as Step3TaskStatus) ? (s as Step3TaskStatus) : null;
+}
+
+function canTransitionTaskStatus(from: Step3TaskStatus, to: Step3TaskStatus): boolean {
+  if (from === to) return true;
+  if (to === "BLOCKED") {
+    return from === "NEW" || from === "READY" || from === "IN_PROGRESS";
+  }
+  if (from === "BLOCKED" && to === "READY") return true;
+  if (from === "READY" && to === "IN_PROGRESS") return true;
+  if ((from === "READY" || from === "IN_PROGRESS") && to === "DONE") return true;
+  return false;
+}
+
+function parseBlockersFromBody(
+  body: Record<string, unknown> | null
+): Array<{ code: string; message: string }> {
+  if (!body || !Array.isArray(body.blockers)) return [];
+  const out: Array<{ code: string; message: string }> = [];
+  for (const raw of body.blockers) {
+    const row = parseJsonObject(raw);
+    if (!row) continue;
+    const code = cleanString(row.code, 60);
+    const message = cleanString(row.message, 300);
+    if (!code && !message) continue;
+    out.push({
+      code: code || "MISSING_INPUT",
+      message: message || "Blocked by missing requirement.",
+    });
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+async function persistStep3Task(
+  env: Env,
+  input: {
+    siteId: string;
+    task: Step3TaskV1;
+  }
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE step3_tasks
+     SET status = ?,
+         details_json = ?
+     WHERE site_id = ? AND task_id = ?`
+  )
+    .bind(
+      statusToDbStatus(input.task.status),
+      safeJsonStringify(input.task, 128000),
+      input.siteId,
+      input.task.task_id
+    )
+    .run();
+}
+
+async function updateStep3TaskStatus(
+  env: Env,
+  input: {
+    siteId: string;
+    taskId: string;
+    targetStatus: Step3TaskStatus;
+    blockers: Array<{ code: string; message: string }>;
+  }
+): Promise<{ ok: true; task: Step3TaskV1 } | { ok: false; status: number; error: string; current?: Step3TaskStatus }> {
+  const taskRow = await loadStep3TaskRowById(env, { siteId: input.siteId, taskId: input.taskId });
+  if (!taskRow) {
+    return { ok: false, status: 404, error: "task_not_found" };
+  }
+  const task = parseTaskV1FromStored(taskRow, input.siteId, taskRow.run_id);
+  const from = task.status;
+  const to = input.targetStatus;
+  if (!canTransitionTaskStatus(from, to)) {
+    return {
+      ok: false,
+      status: 409,
+      error: "invalid_status_transition",
+      current: from,
+    };
+  }
+  task.status = to;
+  task.updated_at = isoFromMs(nowMs());
+  if (to === "BLOCKED") {
+    task.blockers =
+      input.blockers.length > 0
+        ? input.blockers
+        : [{ code: "POLICY_GUARDRAIL", message: "Task blocked pending manual review." }];
+  } else if (to === "READY") {
+    task.blockers = [];
+  } else if (to === "DONE" || to === "IN_PROGRESS") {
+    if (task.blockers.length > 0) {
+      task.blockers = [];
+    }
+  }
+  await persistStep3Task(env, { siteId: input.siteId, task });
+  return { ok: true, task };
+}
+
+async function runStep3BulkAction(
+  env: Env,
+  input: {
+    siteId: string;
+    runId: string;
+    action: "AUTO_APPLY_READY" | "MARK_DONE_SELECTED";
+    taskIds: string[];
+  }
+): Promise<{
+  action: string;
+  site_run_id: string;
+  attempted: number;
+  updated: number;
+  skipped: number;
+  failed: number;
+  updated_task_ids: string[];
+  errors: Array<{ task_id: string; error: string }>;
+}> {
+  const rows = await loadStep3TasksFiltered(env, {
+    siteId: input.siteId,
+    runId: input.runId,
+    executionModes: [],
+    taskGroups: [],
+    statuses: [],
+  });
+  const byId = new Map(rows.map((row) => [row.task_id, row]));
+  const selectedIds =
+    input.taskIds.length > 0
+      ? input.taskIds.filter((id) => byId.has(id))
+      : input.action === "AUTO_APPLY_READY"
+        ? [...byId.keys()]
+        : [];
+
+  const errors: Array<{ task_id: string; error: string }> = [];
+  const updatedTaskIds: string[] = [];
+  let attempted = 0;
+  let updated = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  for (const taskId of selectedIds) {
+    attempted += 1;
+    const raw = byId.get(taskId);
+    if (!raw) {
+      failed += 1;
+      errors.push({ task_id: taskId, error: "task_not_found" });
+      continue;
+    }
+    const task = parseTaskV1FromStored(raw, input.siteId, input.runId);
+    if (input.action === "AUTO_APPLY_READY") {
+      if (!(task.mode === "AUTO" && task.status === "READY")) {
+        skipped += 1;
+        continue;
+      }
+      const result = await updateStep3TaskStatus(env, {
+        siteId: input.siteId,
+        taskId,
+        targetStatus: "DONE",
+        blockers: [],
+      });
+      if (!result.ok) {
+        failed += 1;
+        errors.push({ task_id: taskId, error: result.error });
+        continue;
+      }
+      updated += 1;
+      updatedTaskIds.push(taskId);
+      continue;
+    }
+
+    if (input.action === "MARK_DONE_SELECTED") {
+      if (task.status === "DONE") {
+        skipped += 1;
+        continue;
+      }
+      const result = await updateStep3TaskStatus(env, {
+        siteId: input.siteId,
+        taskId,
+        targetStatus: "DONE",
+        blockers: [],
+      });
+      if (!result.ok) {
+        failed += 1;
+        errors.push({ task_id: taskId, error: result.error });
+        continue;
+      }
+      updated += 1;
+      updatedTaskIds.push(taskId);
+      continue;
+    }
+  }
+
+  return {
+    action: input.action,
+    site_run_id: input.runId,
+    attempted,
+    updated,
+    skipped,
+    failed,
+    updated_task_ids: updatedTaskIds,
+    errors,
+  };
+}
+
+async function runStep3LocalExecutionPlan(
+  env: Env,
+  site: Step1SiteRecord,
+  opts: { requestedStep2Date?: string | null; parentJobId: string }
+): Promise<Record<string, unknown>> {
+  const now = nowMs();
+  const date = toDateYYYYMMDD(now);
+  const research = await loadLatestStep1KeywordResearchResults(env, site.site_id);
+  if (!research) {
+    throw new Error("step1_keyword_research_required");
+  }
+
+  const step2Date = cleanString(opts.requestedStep2Date, 20) || (await loadLatestStep2DateForSite(env, site.site_id));
+  if (!step2Date) {
+    throw new Error("step2_report_required");
+  }
+  const step2Report = await loadLatestStep2Report(env, site.site_id, step2Date);
+  const primaryRows = parseStep1PrimaryFromResults(research);
+  const competitorCandidates = await loadStep3CompetitorCandidatesFromStep2(env, site.site_id, step2Date, 30);
+  const coreCompetitors = competitorCandidates.filter((row) => !row.is_directory).slice(0, 12);
+  const competitorSet = coreCompetitors.length > 0 ? coreCompetitors : competitorCandidates.slice(0, 12);
+  const keywordSignals = buildStep3KeywordSignals(step2Report);
+  const diffSignals = await loadStep3DiffSignals(env, { siteId: site.site_id, date: step2Date });
+  const previousCadence = await loadStep3PreviousSocialCadence(env, site.site_id);
+
+  const runId = uuid("s3run");
+  await env.DB.prepare(
+    `INSERT INTO step3_runs (
+      run_id, site_id, date_yyyymmdd, source_step2_date, status, summary_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(runId, site.site_id, date, step2Date, "running", "{}", now, now)
+    .run();
+
+  const ownSignals = new Map<string, Step3OwnPageSignal>();
+  const top3Modules = new Map<string, { faq_rate: number; pricing_rate: number }>();
+  for (const row of primaryRows) {
+    const keyword = cleanString(row.keyword, 300);
+    if (!keyword) continue;
+    const slug = cleanString(row.recommended_slug, 160) || null;
+    const targetUrl = slug
+      ? `${cleanString(site.site_url, 2000).replace(/\/+$/, "")}/${slug.replace(/^\/+/, "")}`
+      : cleanString(row.target_url, 2000) || null;
+    if (targetUrl) {
+      const own = await loadStep3OwnPageSignal(env, { targetUrl, targetSlug: slug, date: step2Date });
+      if (own) ownSignals.set(toKeywordNorm(keyword), own);
+    }
+    const rates = await loadStep3Top3ModuleRates(env, { siteId: site.site_id, date: step2Date, keyword });
+    top3Modules.set(toKeywordNorm(keyword), rates);
+  }
+  const competitorCadenceNow =
+    competitorSet.length > 0
+      ? competitorSet.reduce((sum, row) => sum + Math.max(1, Math.min(7, Math.round(row.appearance_count / 2))), 0) /
+        competitorSet.length
+      : 0;
+  const socialCadenceIncreased = previousCadence > 0 ? competitorCadenceNow > previousCadence * 1.15 : competitorCadenceNow >= 3;
+
+  const tasks = buildStep3Tasks({
+    site,
+    siteRunId: runId,
+    primaryRows,
+    competitors: competitorSet,
+    keywordSignals,
+    ownSignals,
+    top3Modules,
+    diffSignals,
+    socialCadenceIncreased,
+    step2Date,
+  });
+  const riskFlags = buildStep3RiskFlags({
+    site,
+    primaryRows,
+    competitors: competitorSet,
+    tasks,
+  });
+
+  for (const row of tasks) {
+    await env.DB.prepare(
+      `INSERT INTO step3_tasks (
+        task_id, run_id, site_id, task_group, task_type, execution_mode, priority,
+        title, why_text, details_json, target_slug, target_url, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        cleanString(row.task_id, 120),
+        runId,
+        site.site_id,
+        row.category,
+        row.type,
+        modeToExecutionMode(row.mode),
+        priorityToDbWeight(row.priority),
+        row.title,
+        row.summary,
+        safeJsonStringify(row, 64_000),
+        row.scope.target_slug,
+        row.scope.target_url,
+        statusToDbStatus(row.status),
+        nowMs()
+      )
+      .run();
+  }
+
+  const socialThemes = primaryRows
+    .map((row) => cleanString(row.keyword, 120))
+    .filter(Boolean)
+    .slice(0, 6);
+  for (const competitor of competitorSet) {
+    await env.DB.prepare(
+      `INSERT INTO step3_competitors (
+        competitor_id, run_id, site_id, domain, source, appearance_count, avg_rank,
+        is_directory, sample_urls_json, social_profiles_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        uuid("s3comp"),
+        runId,
+        site.site_id,
+        competitor.domain,
+        "step2_serp_top5_frequency",
+        competitor.appearance_count,
+        competitor.avg_rank,
+        competitor.is_directory ? 1 : 0,
+        safeJsonStringify(competitor.sample_urls, 16_000),
+        safeJsonStringify(inferCompetitorSocialProfiles(competitor.domain), 8_000),
+        nowMs()
+      )
+      .run();
+
+    const platformRows = [
+      {
+        platform: "facebook",
+        cadence: Number(Math.max(1, Math.min(7, Math.round(competitor.appearance_count / 2))).toFixed(1)),
+        engagement: Number(Math.max(5, 60 - competitor.avg_rank * 6).toFixed(1)),
+        content_types: ["before_after", "reviews", "offers"],
+      },
+      {
+        platform: "instagram",
+        cadence: Number(Math.max(1, Math.min(7, Math.round(competitor.appearance_count / 2))).toFixed(1)),
+        engagement: Number(Math.max(5, 55 - competitor.avg_rank * 5).toFixed(1)),
+        content_types: ["short_video", "team", "jobsite"],
+      },
+      {
+        platform: "youtube",
+        cadence: Number(Math.max(0.5, Math.min(4, competitor.appearance_count / 4)).toFixed(1)),
+        engagement: Number(Math.max(3, 40 - competitor.avg_rank * 4).toFixed(1)),
+        content_types: ["how_to", "faq", "case_story"],
+      },
+    ];
+    for (const platformRow of platformRows) {
+      await env.DB.prepare(
+        `INSERT INTO step3_social_signals (
+          signal_id, run_id, site_id, domain, platform, cadence_per_week, engagement_proxy,
+          content_types_json, recurring_themes_json, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          uuid("s3sig"),
+          runId,
+          site.site_id,
+          competitor.domain,
+          platformRow.platform,
+          platformRow.cadence,
+          platformRow.engagement,
+          safeJsonStringify(platformRow.content_types, 4000),
+          safeJsonStringify(socialThemes, 4000),
+          "public_metadata_inference",
+          nowMs()
+        )
+        .run();
+    }
+  }
+
+  for (const flag of riskFlags) {
+    await env.DB.prepare(
+      `INSERT INTO step3_risk_flags (
+        flag_id, run_id, site_id, risk_type, severity, message, blocked_action, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        uuid("s3risk"),
+        runId,
+        site.site_id,
+        cleanString(flag.risk_type, 120),
+        flag.severity,
+        cleanString(flag.message, 500),
+        cleanString(flag.blocked_action, 120) || null,
+        nowMs()
+      )
+      .run();
+  }
+
+  const splitCounts = {
+    auto_safe: tasks.filter((row) => row.mode === "AUTO").length,
+    assisted: tasks.filter((row) => row.mode === "DIY").length,
+    team_only: tasks.filter((row) => row.mode === "TEAM").length,
+  };
+  const step2KeywordReports = Array.isArray(step2Report.keyword_reports) ? step2Report.keyword_reports.length : 0;
+
+  const reportPayload = {
+    schema_version: "1.0",
+    site_id: site.site_id,
+    run_id: runId,
+    date,
+    source_step2_date: step2Date,
+    assumptions: {
+      region_scope: "US-only",
+      social_signal_source: "public metadata + inference",
+      note: "Competitor strategy is used for cadence/theme signals only; content output remains original.",
+    },
+    competitor_set: competitorSet.map((row) => ({
+      domain: row.domain,
+      appearance_count: row.appearance_count,
+      avg_rank: Number(row.avg_rank.toFixed(2)),
+      is_directory: row.is_directory,
+      sample_urls: row.sample_urls.slice(0, 5),
+    })),
+    execution_split: splitCounts,
+    tasks,
+    risk_flags: riskFlags,
+    metadata: {
+      parent_job_id: opts.parentJobId,
+      primary_keywords_considered: primaryRows.length,
+      keyword_reports_available: step2KeywordReports,
+    },
+  };
+
+  await env.DB.prepare(
+    `INSERT INTO step3_reports (
+      report_id, run_id, site_id, date_yyyymmdd, report_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(uuid("s3rep"), runId, site.site_id, date, safeJsonStringify(reportPayload, 512_000), nowMs())
+    .run();
+
+  const summary = {
+    site_id: site.site_id,
+    run_id: runId,
+    date,
+    source_step2_date: step2Date,
+    tasks_total: tasks.length,
+    split_counts: splitCounts,
+    competitor_count: competitorSet.length,
+    risk_flags: riskFlags.length,
+  };
+  await env.DB.prepare(
+    `UPDATE step3_runs
+     SET status = ?, summary_json = ?, updated_at = ?
+     WHERE run_id = ?`
+  )
+    .bind("success", safeJsonStringify(summary, 64_000), nowMs(), runId)
+    .run();
+
+  return {
+    ...summary,
+    report: reportPayload,
+  };
+}
+
 type SerpWatchlistRow = {
   watch_id: string;
   user_id: string;
@@ -2101,6 +7458,501 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
 
+    if (req.method === "POST" && (url.pathname === "/v1/sites/upsert" || url.pathname === "/v1/sites/analyze")) {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) {
+        return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      }
+      const normalizedBody = url.pathname === "/v1/sites/upsert" ? normalizeSiteUpsertPayload(body) : body;
+      const siteUrl = cleanString(normalizedBody.site_url, 2000);
+      if (!siteUrl) {
+        return Response.json({ ok: false, error: "site_url required." }, { status: 400 });
+      }
+      const saved = await upsertStep1Site(env, normalizedBody);
+      const profile = safeJsonParseObject(saved.site_profile_json) ?? {};
+      const savedInput = safeJsonParseObject(saved.input_json) ?? {};
+      const plan = getSitePlanFromInput(savedInput);
+      return Response.json({
+        ok: true,
+        site_brief_id: saved.site_id,
+        site_id: saved.site_id,
+        site_url: saved.site_url,
+        site_name: saved.site_name,
+        wp_site_id: cleanString(savedInput.wp_site_id, 120) || null,
+        site_profile: profile,
+        site_brief: parseJsonObject(profile.site_brief) ?? null,
+        billing: {
+          model: "per_site",
+          entitlement: {
+            tracked_keywords_cap: SITE_KEYWORD_CAP,
+            tracked_keywords_in_use: SITE_KEYWORD_CAP,
+          },
+          limits: {
+            serp_results_per_keyword_cap: SITE_SERP_RESULTS_CAP,
+            url_fetches_per_day_cap: SITE_MAX_URL_FETCHES_PER_DAY,
+            backlink_enrich_per_day_cap: SITE_MAX_BACKLINK_ENRICH_PER_DAY,
+            competitor_graph_domains_per_day_cap: SITE_MAX_GRAPH_DOMAINS_PER_DAY,
+          },
+        },
+        plugin_ui: {
+          tracking_status: `Tracking ${SITE_KEYWORD_CAP} keywords`,
+          update_cadence: "Daily competitive report updates every 24 hours",
+          local_metro_tracking: plan.metro_proxy
+            ? `Local metro tracking enabled: ${plan.metro ?? "configured"}`
+            : "Local metro tracking disabled",
+        },
+        analyzed_at: saved.last_analysis_at,
+      });
+    }
+
+    const siteResearchPathSiteId = parseSiteIdFromPath(url.pathname, "/keyword-research");
+    if (req.method === "POST" && siteResearchPathSiteId) {
+      const siteId = siteResearchPathSiteId;
+      const site = await loadStep1Site(env, siteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+
+      const jobId = await createJobRecord(env, {
+        siteId,
+        type: "keyword_research_step1",
+        request: {
+          site_id: siteId,
+          semrush_keywords_count: Array.isArray(body?.semrush_keywords) ? body?.semrush_keywords.length : 0,
+        },
+      });
+
+      try {
+        const executed = await runStep1KeywordResearch(env, site, body);
+        await createArtifactRecord(env, {
+          jobId,
+          kind: "keyword_research.results",
+          payload: executed.result,
+        });
+        await finalizeJobSuccess(env, jobId, 1);
+        return Response.json({
+          ok: true,
+          job_id: jobId,
+          site_id: siteId,
+          research_run_id: executed.researchRunId,
+          status: "succeeded",
+          results_ready: true,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        await finalizeJobFailure(env, jobId, "keyword_research_failed", { error: message });
+        await createArtifactRecord(env, {
+          jobId,
+          kind: "keyword_research.error",
+          payload: { error: message },
+        });
+        return Response.json({ ok: false, job_id: jobId, error: message }, { status: 500 });
+      }
+    }
+
+    const siteResultPathSiteId = parseSiteIdFromPath(url.pathname, "/keyword-research/results");
+    if (req.method === "GET" && siteResultPathSiteId) {
+      const siteId = siteResultPathSiteId;
+      const result = await loadLatestStep1KeywordResearchResults(env, siteId);
+      if (!result) {
+        return Response.json({ ok: false, error: "keyword_research_results_not_found" }, { status: 404 });
+      }
+      return Response.json({
+        ok: true,
+        site_id: siteId,
+        ...result,
+      });
+    }
+
+    const siteStep2RunSiteId = parseSiteIdFromPath(url.pathname, "/step2/run");
+    const siteDailyRunSiteId = parseSiteIdFromPath(url.pathname, "/daily-run");
+    const runSiteId = siteStep2RunSiteId || siteDailyRunSiteId;
+    if (req.method === "POST" && runSiteId) {
+      const site = await loadStep1Site(env, runSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      body = body ?? {};
+      const maxKeywords = clampInt(body.max_keywords, 1, SITE_KEYWORD_CAP, SITE_KEYWORD_CAP);
+      const maxResults = clampInt(body.max_results, 1, SITE_SERP_RESULTS_CAP, SITE_SERP_RESULTS_CAP);
+      const geo = cleanString(body.geo, 120) || "US";
+      const runTypeRaw = cleanString(body.run_type, 20).toLowerCase();
+      const runType: "baseline" | "delta" | "auto" =
+        runTypeRaw === "baseline" || runTypeRaw === "delta" ? runTypeRaw : "auto";
+
+      const parentJobId = await createJobRecord(env, {
+        siteId: site.site_id,
+        type: "site_daily_run",
+        request: {
+          site_id: site.site_id,
+          max_keywords: maxKeywords,
+          max_results: maxResults,
+          geo,
+          run_type: runType,
+        },
+      });
+      try {
+        const summary = await runStep2DailyHarvest(env, site, {
+          maxKeywords,
+          maxResults,
+          geo,
+          parentJobId,
+          runType,
+        });
+        await createArtifactRecord(env, {
+          jobId: parentJobId,
+          kind: "step2.harvest.summary",
+          payload: summary,
+        });
+        await finalizeJobSuccess(env, parentJobId, Math.max(1, summary.keyword_count));
+        return Response.json({
+          ok: true,
+          job_id: parentJobId,
+          run_type: "site_daily_run",
+          summary,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        await finalizeJobFailure(env, parentJobId, "step2_harvest_failed", { error: message });
+        await createArtifactRecord(env, {
+          jobId: parentJobId,
+          kind: "step2.harvest.error",
+          payload: { error: message },
+        });
+        return Response.json({ ok: false, job_id: parentJobId, error: message }, { status: 500 });
+      }
+    }
+
+    const siteStep2ReportSiteId = parseSiteIdFromPath(url.pathname, "/step2/report");
+    if (req.method === "GET" && siteStep2ReportSiteId) {
+      const date = cleanString(url.searchParams.get("date"), 10);
+      const report = await loadLatestStep2Report(env, siteStep2ReportSiteId, date);
+      return Response.json({ ok: true, report });
+    }
+
+    const siteStep3PlanSiteId = parseSiteIdFromPath(url.pathname, "/step3/plan");
+    if (req.method === "POST" && siteStep3PlanSiteId) {
+      const site = await loadStep1Site(env, siteStep3PlanSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      const requestedStep2Date = cleanString(body?.step2_date, 20) || null;
+      const parentJobId = await createJobRecord(env, {
+        siteId: site.site_id,
+        type: "step3_local_execution_plan",
+        request: {
+          site_id: site.site_id,
+          step2_date: requestedStep2Date,
+        },
+      });
+      try {
+        const summary = await runStep3LocalExecutionPlan(env, site, {
+          requestedStep2Date,
+          parentJobId,
+        });
+        await createArtifactRecord(env, {
+          jobId: parentJobId,
+          kind: "step3.plan.summary",
+          payload: summary,
+        });
+        await finalizeJobSuccess(env, parentJobId, Math.max(1, clampInt(summary.tasks_total, 1, 500, 1)));
+        return Response.json({
+          ok: true,
+          job_id: parentJobId,
+          site_id: site.site_id,
+          summary,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        await finalizeJobFailure(env, parentJobId, "step3_plan_failed", { error: message });
+        await createArtifactRecord(env, {
+          jobId: parentJobId,
+          kind: "step3.plan.error",
+          payload: { error: message },
+        });
+        return Response.json({ ok: false, job_id: parentJobId, error: message }, { status: 500 });
+      }
+    }
+
+    const siteStep3ReportSiteId = parseSiteIdFromPath(url.pathname, "/step3/report");
+    if (req.method === "GET" && siteStep3ReportSiteId) {
+      const date = cleanString(url.searchParams.get("date"), 10);
+      const report = await loadLatestStep3Report(env, siteStep3ReportSiteId, date);
+      return Response.json({ ok: true, ...report });
+    }
+
+    const siteStep3TasksSiteId = parseSiteIdFromPath(url.pathname, "/step3/tasks");
+    if (req.method === "GET" && siteStep3TasksSiteId) {
+      const site = await loadStep1Site(env, siteStep3TasksSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const runIdFilter = cleanString(url.searchParams.get("site_run_id"), 120) || null;
+      const runMeta = await loadStep3RunMeta(env, { siteId: site.site_id, runId: runIdFilter });
+      if (!runMeta) {
+        return Response.json({
+          ok: true,
+          site_id: site.site_id,
+          site_run_id: runIdFilter,
+          run_date: null,
+          filters_applied: {
+            execution_mode: [],
+            task_group: [],
+            status: [],
+          },
+          count: 0,
+          tasks: [],
+          task_details: { by_id: {} },
+        });
+      }
+
+      const executionModeFilters = parseCsvQueryValues(url, "execution_mode")
+        .map(mapQueryExecutionMode)
+        .filter((v): v is string => !!v);
+      const taskGroupFilters = parseCsvQueryValues(url, "task_group")
+        .map((v) => cleanString(v, 40).toUpperCase())
+        .filter(Boolean);
+      const statusFilters = parseCsvQueryValues(url, "status")
+        .map(mapQueryStatusToDb)
+        .filter((v): v is string => !!v);
+
+      const rows = await loadStep3TasksFiltered(env, {
+        siteId: site.site_id,
+        runId: runMeta.run_id,
+        executionModes: executionModeFilters,
+        taskGroups: taskGroupFilters,
+        statuses: statusFilters,
+      });
+      const tasks = rows.map((row) => parseTaskV1FromStored(row, site.site_id, runMeta.run_id));
+      const cards = tasks.map(mapTaskToCard);
+      return Response.json({
+        ok: true,
+        site_id: site.site_id,
+        site_run_id: runMeta.run_id,
+        run_date: runMeta.date_yyyymmdd,
+        filters_applied: {
+          execution_mode: executionModeFilters,
+          task_group: taskGroupFilters,
+          status: statusFilters,
+        },
+        count: cards.length,
+        tasks: cards,
+        task_details: {
+          by_id: Object.fromEntries(tasks.map((task) => [task.task_id, task])),
+        },
+      });
+    }
+
+    const siteTasksBoardSiteId = parseSiteIdFromPath(url.pathname, "/tasks/board");
+    if (req.method === "GET" && siteTasksBoardSiteId) {
+      const site = await loadStep1Site(env, siteTasksBoardSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const runMeta = await loadStep3RunMeta(env, { siteId: site.site_id });
+      if (!runMeta) {
+        return Response.json({
+          ok: true,
+          ...buildStep3TaskBoardPayload({
+            site,
+            runId: null,
+            runDate: null,
+            source: "latest",
+            tasks: [],
+          }),
+        });
+      }
+      const rows = await loadStep3TasksForRun(env, runMeta.run_id);
+      const tasks = rows.map((row) => parseTaskV1FromStored(row, site.site_id, runMeta.run_id));
+      return Response.json({
+        ok: true,
+        ...buildStep3TaskBoardPayload({
+          site,
+          runId: runMeta.run_id,
+          runDate: runMeta.date_yyyymmdd,
+          source: "latest",
+          tasks,
+        }),
+      });
+    }
+
+    const runTasksBoardMatch = url.pathname.match(/^\/v1\/sites\/([^/]+)\/runs\/([^/]+)\/tasks\/board$/);
+    if (req.method === "GET" && runTasksBoardMatch) {
+      const siteId = cleanString(decodeURIComponent(runTasksBoardMatch[1]), 120);
+      const runId = cleanString(decodeURIComponent(runTasksBoardMatch[2]), 120);
+      const site = await loadStep1Site(env, siteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const runMeta = await loadStep3RunMeta(env, { siteId: site.site_id, runId });
+      if (!runMeta) {
+        return Response.json({ ok: false, error: "run_not_found" }, { status: 404 });
+      }
+      const rows = await loadStep3TasksForRun(env, runMeta.run_id);
+      const tasks = rows.map((row) => parseTaskV1FromStored(row, site.site_id, runMeta.run_id));
+      return Response.json({
+        ok: true,
+        ...buildStep3TaskBoardPayload({
+          site,
+          runId: runMeta.run_id,
+          runDate: runMeta.date_yyyymmdd,
+          source: "run",
+          tasks,
+        }),
+      });
+    }
+
+    const taskDetailMatch = url.pathname.match(/^\/v1\/sites\/([^/]+)\/tasks\/([^/]+)$/);
+    if (taskDetailMatch && req.method === "PATCH") {
+      const siteId = cleanString(decodeURIComponent(taskDetailMatch[1]), 120);
+      const taskId = cleanString(decodeURIComponent(taskDetailMatch[2]), 120);
+      if (!siteId || !taskId) {
+        return Response.json({ ok: false, error: "invalid_site_or_task_id" }, { status: 400 });
+      }
+      const site = await loadStep1Site(env, siteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      const targetStatus = normalizeTaskStatusInput(body?.status);
+      if (!targetStatus) {
+        return Response.json(
+          {
+            ok: false,
+            error: "status_required",
+            allowed_statuses: ["READY", "IN_PROGRESS", "DONE", "BLOCKED"],
+          },
+          { status: 400 }
+        );
+      }
+      const blockers = parseBlockersFromBody(body);
+      const updated = await updateStep3TaskStatus(env, {
+        siteId: site.site_id,
+        taskId,
+        targetStatus,
+        blockers,
+      });
+      if (!updated.ok) {
+        return Response.json(
+          { ok: false, error: updated.error, current_status: updated.current ?? null },
+          { status: updated.status }
+        );
+      }
+      return Response.json({ ok: true, task: updated.task });
+    }
+
+    if (req.method === "GET" && taskDetailMatch) {
+      const siteId = cleanString(decodeURIComponent(taskDetailMatch[1]), 120);
+      const taskId = cleanString(decodeURIComponent(taskDetailMatch[2]), 120);
+      if (!siteId || !taskId) {
+        return Response.json({ ok: false, error: "invalid_site_or_task_id" }, { status: 400 });
+      }
+      const site = await loadStep1Site(env, siteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const task = await loadStep3TaskById(env, { siteId: site.site_id, taskId });
+      if (!task) {
+        return Response.json({ ok: false, error: "task_not_found" }, { status: 404 });
+      }
+      return Response.json({ ok: true, task });
+    }
+
+    const siteTasksBulkSiteId = parseSiteIdFromPath(url.pathname, "/tasks/bulk");
+    if (req.method === "POST" && siteTasksBulkSiteId) {
+      const site = await loadStep1Site(env, siteTasksBulkSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) {
+        return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      }
+      const actionRaw = cleanString(body.action, 60).toUpperCase();
+      if (actionRaw !== "AUTO_APPLY_READY" && actionRaw !== "MARK_DONE_SELECTED") {
+        return Response.json(
+          {
+            ok: false,
+            error: "invalid_action",
+            allowed_actions: ["AUTO_APPLY_READY", "MARK_DONE_SELECTED"],
+          },
+          { status: 400 }
+        );
+      }
+      const runIdRequested = cleanString(body.site_run_id, 120) || null;
+      const runMeta = await loadStep3RunMeta(env, { siteId: site.site_id, runId: runIdRequested });
+      if (!runMeta) {
+        return Response.json({ ok: false, error: "run_not_found" }, { status: 404 });
+      }
+      const taskIds = parseStringArray(body.task_ids, 300, 120);
+      if (actionRaw === "MARK_DONE_SELECTED" && taskIds.length < 1) {
+        return Response.json(
+          {
+            ok: false,
+            error: "task_ids_required_for_mark_done_selected",
+          },
+          { status: 400 }
+        );
+      }
+      const result = await runStep3BulkAction(env, {
+        siteId: site.site_id,
+        runId: runMeta.run_id,
+        action: actionRaw,
+        taskIds,
+      });
+      return Response.json({ ok: true, ...result });
+    }
+
+    const v1JobMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)$/);
+    if (req.method === "GET" && v1JobMatch) {
+      const jobId = cleanString(decodeURIComponent(v1JobMatch[1]), 120);
+      if (!jobId) {
+        return Response.json({ ok: false, error: "job_id required." }, { status: 400 });
+      }
+      const row = await loadJobRecord(env, jobId);
+      if (!row) {
+        return Response.json({ ok: false, error: "job_not_found" }, { status: 404 });
+      }
+      return Response.json({
+        ok: true,
+        job: row,
+      });
+    }
+
     if (req.method === "POST" && url.pathname === "/proxy/admin/register") {
       const unauthorized = requireProxyAdmin(req, env);
       if (unauthorized) {
@@ -3014,18 +8866,70 @@ export default {
     ctx: { waitUntil(promise: Promise<unknown>): void }
   ): Promise<void> {
     const runPromise = (async () => {
-      const summary = await runSerpWatchlist(env, {
+      const scheduledTs = controller.scheduledTime ?? nowMs();
+      const d = new Date(scheduledTs);
+      const isWeeklyRefresh = d.getUTCDay() === 1; // Monday UTC
+      const isMonthlyRefresh = d.getUTCDate() === 1;
+      const serpSummary = await runSerpWatchlist(env, {
         userId: "",
         watchId: "",
         limit: 500,
         force: false,
       });
+      const step2Sites = await listStep2EligibleSites(env, 20);
+      const step2Summaries: Array<Record<string, unknown>> = [];
+      for (const site of step2Sites) {
+        try {
+          const summary = await runStep2DailyHarvest(env, site, {
+            maxKeywords: SITE_KEYWORD_CAP,
+            maxResults: SITE_SERP_RESULTS_CAP,
+            geo: site.local_mode ? "US-metro" : "US",
+            parentJobId: null,
+            runType: "auto",
+          });
+          step2Summaries.push({
+            site_id: site.site_id,
+            ok: true,
+            summary,
+          });
+        } catch (error) {
+          step2Summaries.push({
+            site_id: site.site_id,
+            ok: false,
+            error: String((error as Error)?.message ?? error),
+          });
+        }
+      }
+      const monthlyStep1Refresh: Array<Record<string, unknown>> = [];
+      if (isMonthlyRefresh) {
+        for (const site of step2Sites.slice(0, 20)) {
+          try {
+            const refresh = await runStep1KeywordResearch(env, site, null);
+            monthlyStep1Refresh.push({
+              site_id: site.site_id,
+              ok: true,
+              research_run_id: refresh.researchRunId,
+            });
+          } catch (error) {
+            monthlyStep1Refresh.push({
+              site_id: site.site_id,
+              ok: false,
+              error: String((error as Error)?.message ?? error),
+            });
+          }
+        }
+      }
       console.log(
         JSON.stringify({
-          event: "serp_watchlist_daily_run",
+          event: "daily_serp_and_step2_run",
           scheduled_time: controller.scheduledTime ?? null,
           cron: controller.cron ?? null,
-          summary,
+          weekly_refresh: isWeeklyRefresh,
+          monthly_refresh: isMonthlyRefresh,
+          serp_watchlist_summary: serpSummary,
+          step2_site_count: step2Sites.length,
+          step2_summaries: step2Summaries,
+          monthly_step1_refresh: monthlyStep1Refresh,
         })
       );
     })();

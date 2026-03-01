@@ -20,3 +20,6 @@ htmlcov/
 # IDE
 .idea/
 .vscode/
+
+# macOS
+.DS_Store

@@ -1,0 +1,833 @@
+AI_SEO_BACKEND_SPEC_V1.txt
+=========================
+
+This file contains:
+1) Postgres schema + indexes for “site daily run” + all entities (baseline + daily delta)
+2) BullMQ queue layout (concurrency + retries + idempotency keys)
+3) Sample “daily report JSON” payload that WP plugin can render
+
+Assumptions
+-----------
+- US only. Optional metro proxy add-on.
+- Each site is capped at exactly 20 keywords (10 primary + 10 secondary).
+- Step 2 runs daily for SERP + basic items; deeper items are delta-driven after baseline.
+- Backend is self-hosted (Node.js/TypeScript). WP plugin collects signals + renders results.
+
+============================================================
+1) POSTGRES SCHEMA + INDEXES
+============================================================
+
+Recommended extensions
+----------------------
+CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS citext;     -- case-insensitive text (optional)
+
+Core: sites + signals + briefs
+------------------------------
+
+-- sites: one row per paying WordPress install / site
+CREATE TABLE sites (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  wp_site_id         text UNIQUE,                       -- WP install identifier (stable)
+  site_url           citext NOT NULL,
+  site_host          citext NOT NULL,                   -- normalized host (example.com)
+  plan_tier          text NOT NULL DEFAULT 'standard',  -- standard|metro
+  metro_name         text,                              -- "Los Angeles, CA"
+  metro_slug         text,                              -- "los-angeles-ca" (optional)
+  timezone           text NOT NULL DEFAULT 'America/Los_Angeles',
+  is_active          boolean NOT NULL DEFAULT true,
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  updated_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX sites_host_idx ON sites(site_host);
+CREATE INDEX sites_active_idx ON sites(is_active) WHERE is_active = true;
+
+-- site_signals: latest extracted signals from WP crawl (sitemap + top pages + detected NAP + etc.)
+CREATE TABLE site_signals (
+  site_id            uuid PRIMARY KEY REFERENCES sites(id) ON DELETE CASCADE,
+  signals_json       jsonb NOT NULL,
+  content_hash       text NOT NULL,         -- hash of normalized signals to detect changes
+  updated_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX site_signals_updated_idx ON site_signals(updated_at);
+
+-- site_briefs: structured brief produced by LLM for keyword research
+CREATE TABLE site_briefs (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  site_id            uuid NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  brief_json         jsonb NOT NULL,
+  confidence         numeric(4,3) NOT NULL DEFAULT 0,
+  created_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX site_briefs_site_created_idx ON site_briefs(site_id, created_at DESC);
+
+
+Step 1: keyword sets + keywords + metrics
+-----------------------------------------
+
+-- keyword_sets: a versioned set of 20 tracked keywords
+CREATE TABLE keyword_sets (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  site_id            uuid NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  source             text NOT NULL DEFAULT 'auto',      -- auto|manual (future)
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  is_active          boolean NOT NULL DEFAULT true
+);
+
+CREATE INDEX keyword_sets_site_active_idx ON keyword_sets(site_id, is_active) WHERE is_active = true;
+CREATE INDEX keyword_sets_site_created_idx ON keyword_sets(site_id, created_at DESC);
+
+-- keywords: exactly 20 per active keyword_set (enforced in application; optional DB trigger below)
+CREATE TABLE keywords (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  keyword_set_id      uuid NOT NULL REFERENCES keyword_sets(id) ON DELETE CASCADE,
+  keyword            text NOT NULL,
+  priority           smallint NOT NULL,      -- 1=primary, 2=secondary
+  cluster            text,
+  intent             text,                  -- informational|commercial|transactional|navigational
+  is_local_intent    boolean NOT NULL DEFAULT false,
+  target_page_type   text,                  -- service|category|product|location|blog|guide|comparison
+  target_slug        text,                  -- "/water-heater-repair-los-angeles"
+  created_at         timestamptz NOT NULL DEFAULT now()
+);
+
+-- prevent duplicate keyword strings within the same set
+CREATE UNIQUE INDEX keywords_set_keyword_uq ON keywords(keyword_set_id, lower(keyword));
+
+CREATE INDEX keywords_set_priority_idx ON keywords(keyword_set_id, priority);
+CREATE INDEX keywords_set_cluster_idx ON keywords(keyword_set_id, cluster);
+
+-- keyword_metrics: Semrush metrics (can be refreshed occasionally)
+CREATE TABLE keyword_metrics (
+  keyword_id          uuid PRIMARY KEY REFERENCES keywords(id) ON DELETE CASCADE,
+  volume_us           integer,
+  kd                  numeric(5,2),
+  cpc_usd             numeric(10,2),
+  semrush_updated_at  timestamptz,
+  metrics_json        jsonb
+);
+
+CREATE INDEX keyword_metrics_updated_idx ON keyword_metrics(semrush_updated_at);
+
+OPTIONAL (DB enforcement): exactly 20 keywords per active keyword_set
+--------------------------------------------------------------------
+This is optional; many teams enforce in application code + tests. If you want DB-level enforcement:
+
+-- 1) Ensure a keyword_set cannot be marked active unless it has 20 keywords
+-- 2) Ensure inserts do not exceed 20 (for active sets)
+
+You can do this via triggers; omitted here for simplicity unless requested.
+
+
+Step 2: run tracking (baseline + daily)
+---------------------------------------
+
+-- site_runs: parent job per site per day (billing/fairness unit)
+CREATE TABLE site_runs (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  site_id            uuid NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  keyword_set_id      uuid NOT NULL REFERENCES keyword_sets(id) ON DELETE RESTRICT,
+  run_type           text NOT NULL,  -- baseline|daily
+  run_date           date NOT NULL,  -- local date in site timezone
+  geo_mode           text NOT NULL DEFAULT 'us', -- us|metro|both
+  status             text NOT NULL DEFAULT 'queued', -- queued|running|partial|success|failed
+  started_at         timestamptz,
+  finished_at        timestamptz,
+  stats_json         jsonb NOT NULL DEFAULT '{}'::jsonb, -- counts: serps, urls_refreshed, etc.
+  error_json         jsonb
+);
+
+-- idempotency: one run per site per date per type
+CREATE UNIQUE INDEX site_runs_uq ON site_runs(site_id, run_date, run_type);
+
+CREATE INDEX site_runs_site_date_idx ON site_runs(site_id, run_date DESC);
+CREATE INDEX site_runs_status_idx ON site_runs(status) WHERE status IN ('queued','running','partial');
+
+
+SERP snapshots + results
+------------------------
+
+-- serp_snapshots: one per keyword per geo for a specific site_run
+CREATE TABLE serp_snapshots (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  site_run_id         uuid NOT NULL REFERENCES site_runs(id) ON DELETE CASCADE,
+  keyword_id          uuid NOT NULL REFERENCES keywords(id) ON DELETE CASCADE,
+  geo                text NOT NULL,     -- "us" or "metro:<metro_slug>"
+  fetched_at          timestamptz NOT NULL DEFAULT now(),
+  features_json       jsonb NOT NULL DEFAULT '{}'::jsonb,
+  raw_json            jsonb              -- optional: raw provider payload
+);
+
+CREATE UNIQUE INDEX serp_snapshots_uq ON serp_snapshots(site_run_id, keyword_id, geo);
+CREATE INDEX serp_snapshots_keyword_geo_time_idx ON serp_snapshots(keyword_id, geo, fetched_at DESC);
+
+-- serp_results: top 20 organic results for the snapshot
+CREATE TABLE serp_results (
+  serp_snapshot_id    uuid NOT NULL REFERENCES serp_snapshots(id) ON DELETE CASCADE,
+  position            smallint NOT NULL,     -- 1..20
+  url                 text NOT NULL,
+  canonical_url       text,
+  domain              citext NOT NULL,
+  title_snippet       text,
+  desc_snippet        text,
+  page_type           text,                 -- classified: home|service|category|product|blog|directory|forum|etc.
+  is_new              boolean NOT NULL DEFAULT false, -- computed vs prior day
+  PRIMARY KEY (serp_snapshot_id, position)
+);
+
+CREATE INDEX serp_results_domain_idx ON serp_results(domain);
+CREATE INDEX serp_results_urlhash_idx ON serp_results((md5(url)));
+
+
+URL normalization + page snapshots (only when refreshed)
+--------------------------------------------------------
+
+-- urls: global dedupe for URLs across snapshots
+CREATE TABLE urls (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  url                text NOT NULL,
+  domain             citext NOT NULL,
+  url_hash           text NOT NULL,        -- md5(url)
+  created_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX urls_urlhash_uq ON urls(url_hash);
+CREATE INDEX urls_domain_idx ON urls(domain);
+
+-- page_snapshots: extracted on-page signals at a point in time
+CREATE TABLE page_snapshots (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  url_id             uuid NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
+  fetched_at         timestamptz NOT NULL DEFAULT now(),
+  http_status        integer,
+  content_hash       text,                 -- hash of normalized HTML/text for change detection
+  extracted_json     jsonb NOT NULL,        -- title/meta/h1/headings/schema/links/images/alt coverage/etc
+  raw_html_path      text                  -- optional pointer to object storage
+);
+
+CREATE INDEX page_snapshots_url_time_idx ON page_snapshots(url_id, fetched_at DESC);
+CREATE INDEX page_snapshots_contenthash_idx ON page_snapshots(content_hash);
+
+-- serp_result_page_map: connect SERP positions to url_id + which page_snapshot was used
+CREATE TABLE serp_result_page_map (
+  serp_snapshot_id    uuid NOT NULL REFERENCES serp_snapshots(id) ON DELETE CASCADE,
+  position            smallint NOT NULL,
+  url_id              uuid NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
+  page_snapshot_id    uuid REFERENCES page_snapshots(id) ON DELETE SET NULL,
+  PRIMARY KEY (serp_snapshot_id, position)
+);
+
+CREATE INDEX srpm_page_snapshot_idx ON serp_result_page_map(page_snapshot_id);
+
+
+Backlinks + authority (Semrush/provider-agnostic)
+------------------------------------------------
+
+-- backlink_url_metrics: backlink summary for a URL at a point in time (refreshed on schedule or for top ranks)
+CREATE TABLE backlink_url_metrics (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  url_id             uuid NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
+  collected_at       timestamptz NOT NULL DEFAULT now(),
+  provider           text NOT NULL DEFAULT 'semrush',
+  backlinks          integer,
+  referring_domains  integer,
+  follow_count       integer,
+  nofollow_count     integer,
+  top_anchors_json   jsonb,   -- [{anchor:"...", count:n}, ...]
+  metrics_json       jsonb    -- raw or additional fields
+);
+
+CREATE INDEX backlink_url_metrics_url_time_idx ON backlink_url_metrics(url_id, collected_at DESC);
+CREATE INDEX backlink_url_metrics_provider_idx ON backlink_url_metrics(provider);
+
+-- backlink_domain_metrics: authority & backlink summary for a domain
+CREATE TABLE backlink_domain_metrics (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  domain             citext NOT NULL,
+  collected_at       timestamptz NOT NULL DEFAULT now(),
+  provider           text NOT NULL DEFAULT 'semrush',
+  authority_score    numeric(6,2),
+  referring_domains  integer,
+  backlinks          integer,
+  topical_categories_json jsonb,
+  metrics_json       jsonb
+);
+
+CREATE INDEX backlink_domain_metrics_domain_time_idx ON backlink_domain_metrics(domain, collected_at DESC);
+CREATE INDEX backlink_domain_metrics_provider_idx ON backlink_domain_metrics(provider);
+
+-- Optional: top linking pages to a URL (limit stored rows to control volume)
+CREATE TABLE backlink_url_top_links (
+  url_metric_id       uuid NOT NULL REFERENCES backlink_url_metrics(id) ON DELETE CASCADE,
+  linking_url         text NOT NULL,
+  linking_domain      citext NOT NULL,
+  follow              boolean,
+  anchor_text         text,
+  link_type           text,      -- text|image|redirect|etc (provider-specific)
+  relevance_score     numeric(4,3),  -- optional AI label 0..1
+  PRIMARY KEY (url_metric_id, linking_url)
+);
+
+CREATE INDEX backlink_top_links_domain_idx ON backlink_url_top_links(linking_domain);
+
+
+Competitor internal link graph (cached)
+---------------------------------------
+
+-- internal_graph_runs: one per domain crawl build
+CREATE TABLE internal_graph_runs (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  domain             citext NOT NULL,
+  started_at         timestamptz NOT NULL DEFAULT now(),
+  finished_at        timestamptz,
+  status             text NOT NULL DEFAULT 'queued', -- queued|running|success|failed
+  stats_json         jsonb NOT NULL DEFAULT '{}'::jsonb,
+  error_json         jsonb
+);
+
+CREATE INDEX internal_graph_runs_domain_time_idx ON internal_graph_runs(domain, started_at DESC);
+
+-- internal_graph_edges: store edges in a compact form (can also store as jsonb blob per domain if preferred)
+-- For large domains, consider storing only inbound counts + top anchors per target URL (less volume).
+CREATE TABLE internal_graph_edges (
+  graph_run_id        uuid NOT NULL REFERENCES internal_graph_runs(id) ON DELETE CASCADE,
+  from_url            text NOT NULL,
+  to_url              text NOT NULL,
+  anchor_text         text,
+  PRIMARY KEY (graph_run_id, from_url, to_url, anchor_text)
+);
+
+CREATE INDEX internal_graph_edges_to_idx ON internal_graph_edges(graph_run_id, to_url);
+
+-- internal_graph_url_stats: per target URL within a domain (inbound internal links, depth, etc.)
+CREATE TABLE internal_graph_url_stats (
+  graph_run_id        uuid NOT NULL REFERENCES internal_graph_runs(id) ON DELETE CASCADE,
+  url                text NOT NULL,
+  inbound_count       integer NOT NULL DEFAULT 0,
+  depth_from_home     integer, -- shortest-path estimate
+  top_internal_anchors_json jsonb,
+  PRIMARY KEY (graph_run_id, url)
+);
+
+CREATE INDEX internal_graph_url_stats_inbound_idx ON internal_graph_url_stats(graph_run_id, inbound_count DESC);
+
+
+Diffs + AI reports (daily deltas)
+---------------------------------
+
+-- serp_diffs: changes vs previous day (and/or vs baseline)
+CREATE TABLE serp_diffs (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  site_run_id         uuid NOT NULL REFERENCES site_runs(id) ON DELETE CASCADE,
+  keyword_id          uuid NOT NULL REFERENCES keywords(id) ON DELETE CASCADE,
+  geo                text NOT NULL,
+  diff_json           jsonb NOT NULL, -- rank deltas, new entrants, dropped, feature changes
+  created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX serp_diffs_uq ON serp_diffs(site_run_id, keyword_id, geo);
+CREATE INDEX serp_diffs_keyword_geo_time_idx ON serp_diffs(keyword_id, geo, created_at DESC);
+
+-- page_diffs: on-page diffs for refreshed URLs (title/meta/H1/schema/etc changes)
+CREATE TABLE page_diffs (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  site_run_id         uuid NOT NULL REFERENCES site_runs(id) ON DELETE CASCADE,
+  url_id              uuid NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
+  diff_json           jsonb NOT NULL,
+  created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX page_diffs_run_idx ON page_diffs(site_run_id);
+CREATE INDEX page_diffs_url_time_idx ON page_diffs(url_id, created_at DESC);
+
+-- link_diffs: backlink diffs for refreshed URLs/domains
+CREATE TABLE link_diffs (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  site_run_id         uuid NOT NULL REFERENCES site_runs(id) ON DELETE CASCADE,
+  scope              text NOT NULL, -- url|domain
+  url_id              uuid,
+  domain             citext,
+  diff_json           jsonb NOT NULL,
+  created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX link_diffs_run_idx ON link_diffs(site_run_id);
+CREATE INDEX link_diffs_scope_time_idx ON link_diffs(scope, created_at DESC);
+CREATE INDEX link_diffs_domain_time_idx ON link_diffs(domain, created_at DESC);
+
+-- ai_reports: per keyword + per site summaries
+CREATE TABLE ai_reports (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  site_run_id         uuid NOT NULL REFERENCES site_runs(id) ON DELETE CASCADE,
+  scope              text NOT NULL, -- keyword|cluster|site
+  keyword_id          uuid,
+  cluster            text,
+  rank_band          text,          -- top3|top5|top10|11_20|all
+  report_json         jsonb NOT NULL,
+  created_at          timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ai_reports_run_scope_idx ON ai_reports(site_run_id, scope);
+CREATE INDEX ai_reports_keyword_time_idx ON ai_reports(keyword_id, created_at DESC);
+CREATE INDEX ai_reports_cluster_time_idx ON ai_reports(cluster, created_at DESC);
+
+============================================================
+2) BULLMQ QUEUE LAYOUT (CONCURRENCY + RETRIES + IDEMPOTENCY)
+============================================================
+
+Overview
+--------
+Billing fairness is per-site (20 keywords). Execution is fan-out jobs for reliability.
+
+Use BullMQ (Redis) with:
+- One parent job per site-run (baseline or daily)
+- Child jobs per keyword (SERP) and per URL refresh (fetch/parse/enrich)
+- Deterministic idempotency keys using jobId
+
+Common settings (recommended)
+-----------------------------
+- attempts: 3 (SERP), 3 (fetch), 2 (LLM), 5 (transient provider)
+- backoff: exponential (e.g., 5s, 30s, 2m)
+- removeOnComplete: true (or keep minimal)
+- removeOnFail: false (keep for debugging)
+- rate limiting: use BullMQ limiter per queue if Semrush quotas require
+
+Idempotency strategy
+--------------------
+Use jobId strings that guarantee “same work runs once”, e.g.:
+- site_run parent:      siteRun:{siteRunId}
+- serp fetch:           serp:{siteRunId}:{keywordId}:{geo}
+- url upsert:           urlUpsert:{md5(url)}
+- page fetch+parse:     page:{siteRunId}:{urlId}  (or include fetched_at bucket for forced refresh)
+- backlink refresh url: blUrl:{siteRunId}:{urlId}
+- backlink refresh dom: blDom:{siteRunId}:{domain}
+- internal graph crawl: graph:{domain}:{yyyymmdd_bucket}
+- diffs:                diffs:{siteRunId}:{keywordId}:{geo}
+- ai keyword report:    aiKw:{siteRunId}:{keywordId}:{geo}
+- ai site report:       aiSite:{siteRunId}
+
+Queues and workers
+------------------
+
+A) Parent orchestrator
+- Queue: site-run
+  - Job: siteRun:{siteRunId}
+  - Concurrency: 20 (depends on server size)
+  - attempts: 2
+  - responsibility:
+    1) mark site_runs.status=running
+    2) enqueue serp-fetch jobs for each keyword+geo
+    3) wait/aggregate completion (or poll DB status)
+    4) enqueue diff + refresh planners
+    5) enqueue page refresh jobs + backlink jobs as needed
+    6) enqueue AI analysis jobs
+    7) mark status success/partial/failed
+
+B) SERP fetching
+- Queue: serp-fetch
+  - Concurrency: 50 (tune to Semrush limits)
+  - attempts: 3
+  - backoff: exponential(5000)
+  - limiter (optional): e.g., max 10/s
+  - jobId: serp:{siteRunId}:{keywordId}:{geo}
+  - output: serp_snapshots + serp_results + serp_result_page_map (url_id may be created via urls table)
+
+C) URL normalization / upsert (optional as separate queue)
+- Queue: url-upsert
+  - Concurrency: 100
+  - attempts: 5
+  - jobId: urlUpsert:{url_hash}
+  - output: urls row
+
+(You can also do URL upsert inline inside serp-fetch worker to simplify.)
+
+D) Refresh planning (decide which URLs to refetch today)
+- Queue: refresh-plan
+  - Concurrency: 20
+  - attempts: 2
+  - jobId: refreshPlan:{siteRunId}:{keywordId}:{geo}
+  - input: serp snapshot + prior snapshot + baseline
+  - output: enqueue page-fetch jobs for:
+      - new entrants
+      - URLs moved into top5/top3
+      - URLs whose last page_snapshot older than N days
+      - URLs with changed headers via ETag/Last-Modified (if you track)
+
+E) Page fetch + parse
+- Queue: page-fetch
+  - Concurrency: 80 (network bound; tune)
+  - attempts: 3
+  - jobId: page:{siteRunId}:{urlId}
+  - output: stores raw HTML (optional) + page_snapshots (extracted_json)
+  - if http_status non-200: still store snapshot with status
+
+- Queue: page-parse (optional if separated from fetch)
+  - Concurrency: 80
+  - attempts: 2
+  - jobId: parse:{pageSnapshotId}
+  - output: extracted_json updates (if parse happens after fetch)
+
+(Recommended: combine fetch+parse in one worker for simplicity; keep separate only if you use a headless browser.)
+
+F) Backlink enrichment
+- Queue: backlinks-url
+  - Concurrency: 20 (provider limited)
+  - attempts: 3
+  - jobId: blUrl:{siteRunId}:{urlId}
+  - runs when:
+      - URL in top5 (daily/weekly rule)
+      - new entrant
+      - stale backlink_url_metrics older than 7-14 days
+  - output: backlink_url_metrics (+ optional backlink_url_top_links)
+
+- Queue: backlinks-domain
+  - Concurrency: 20
+  - attempts: 3
+  - jobId: blDom:{siteRunId}:{domain}
+  - runs when:
+      - domain is new OR stale older than 14-30 days
+  - output: backlink_domain_metrics
+
+G) Competitor internal graph crawl (cached)
+- Queue: internal-graph
+  - Concurrency: 5 (can be heavy)
+  - attempts: 2
+  - jobId: graph:{domain}:{bucket}  (bucket = YYYYMM or YYYYMMDD depending on cache policy)
+  - output: internal_graph_runs + internal_graph_edges/url_stats
+  - policy: monthly refresh; run immediately for newly seen domains (but cap per day per site)
+
+H) Diff computation
+- Queue: diff-serp
+  - Concurrency: 50
+  - attempts: 2
+  - jobId: diffs:{siteRunId}:{keywordId}:{geo}
+  - output: serp_diffs (rank changes, new/dropped, SERP feature changes)
+
+- Queue: diff-page
+  - Concurrency: 50
+  - attempts: 2
+  - jobId: pageDiff:{siteRunId}:{urlId}
+  - output: page_diffs (only for refreshed pages)
+
+- Queue: diff-links
+  - Concurrency: 20
+  - attempts: 2
+  - jobId: linkDiff:{siteRunId}:{scope}:{id}
+  - output: link_diffs
+
+I) AI analysis
+- Queue: ai-keyword
+  - Concurrency: 10 (cost bound; tune)
+  - attempts: 2
+  - jobId: aiKw:{siteRunId}:{keywordId}:{geo}
+  - input: serp snapshot + relevant page_snapshots + backlink/internal stats
+  - output: ai_reports(scope=keyword, rank bands)
+
+- Queue: ai-site
+  - Concurrency: 5
+  - attempts: 2
+  - jobId: aiSite:{siteRunId}
+  - input: all keyword reports + diffs
+  - output: ai_reports(scope=site)
+
+Retries & failure policy
+------------------------
+- If some keyword jobs fail but most succeed:
+  - site_runs.status = partial
+  - report_json includes warnings + what is missing
+- If SERP fails for many keywords:
+  - site_runs.status = failed
+- Always store error_json per job/run for debugging.
+
+Concurrency tuning (starting point)
+-----------------------------------
+- site-run: 10-20
+- serp-fetch: 30-50 (subject to Semrush quotas)
+- page-fetch: 50-100
+- backlinks-url: 10-20
+- internal-graph: 2-5
+- ai-keyword: 5-15
+- ai-site: 2-5
+
+============================================================
+3) SAMPLE “DAILY REPORT JSON” FOR WP PLUGIN
+============================================================
+
+Notes
+-----
+- This payload is designed for rendering a daily report dashboard in WP.
+- It includes:
+  - keyword list and SERP changes
+  - rank-band pattern summary (Top 3/5/10)
+  - actionable recommendations for the user’s target pages
+  - refresh timestamps (so deltas are transparent)
+
+Example JSON (abbreviated but realistic)
+----------------------------------------
+{
+  "schema_version": "1.0",
+  "site": {
+    "site_id": "b5c2f760-4e5a-4b7d-9df9-0e7b7d5d4a9b",
+    "site_url": "https://example.com",
+    "plan_tier": "metro",
+    "geo_mode": "both",
+    "metro": { "name": "Los Angeles, CA", "slug": "los-angeles-ca" }
+  },
+  "run": {
+    "site_run_id": "6d0a2c1d-8c68-4f7b-8d5a-3c1b3bf0d72f",
+    "run_type": "daily",
+    "run_date": "2026-02-28",
+    "status": "success",
+    "started_at": "2026-02-28T10:00:12Z",
+    "finished_at": "2026-02-28T10:14:41Z",
+    "stats": {
+      "keywords_total": 20,
+      "serps_fetched": 40,
+      "urls_in_serps": 800,
+      "urls_refreshed": 92,
+      "backlinks_refreshed_urls": 28,
+      "domains_refreshed": 14,
+      "internal_graph_domains_refreshed": 3
+    }
+  },
+  "highlights": {
+    "biggest_rank_moves": [
+      {
+        "keyword": "water heater repair los angeles",
+        "geo": "metro:los-angeles-ca",
+        "moves": [
+          { "domain": "competitor-a.com", "url": "https://competitor-a.com/water-heater-repair/", "from": 6, "to": 3 },
+          { "domain": "directory-example.com", "url": "https://directory-example.com/...", "from": 3, "to": 7 }
+        ]
+      }
+    ],
+    "new_competitors": [
+      {
+        "keyword": "water heater repair los angeles",
+        "geo": "metro:los-angeles-ca",
+        "domain": "new-entrant.com",
+        "url": "https://new-entrant.com/service/water-heaters/"
+      }
+    ],
+    "serp_feature_changes": [
+      {
+        "keyword": "plumber near me",
+        "geo": "metro:los-angeles-ca",
+        "change": { "local_pack": "appeared", "paa": "unchanged", "featured_snippet": "lost" }
+      }
+    ]
+  },
+  "keywords": [
+    {
+      "keyword_id": "f8a9d8c0-2c49-4c73-8f18-0c9a3c0b2c7d",
+      "keyword": "water heater repair los angeles",
+      "priority": "primary",
+      "cluster": "Water Heater Repair",
+      "intent": "transactional",
+      "is_local_intent": true,
+      "target": {
+        "page_type": "service",
+        "target_slug": "/water-heater-repair-los-angeles"
+      },
+      "metrics": {
+        "volume_us": 1300,
+        "kd": 41.2,
+        "cpc_usd": 18.40,
+        "last_updated": "2026-02-27T05:00:00Z"
+      },
+      "serp": [
+        {
+          "geo": "us",
+          "snapshot_id": "3c0d0b44-2b4c-4c9a-8d52-0df2af4e17f6",
+          "features": { "local_pack": true, "paa": true, "featured_snippet": false },
+          "top20": [
+            {
+              "position": 1,
+              "domain": "competitor-a.com",
+              "url": "https://competitor-a.com/water-heater-repair-los-angeles/",
+              "page_type": "service",
+              "title_snippet": "Water Heater Repair Los Angeles | Same-Day Service",
+              "desc_snippet": "Fast repairs. Licensed techs. Call today.",
+              "position_change_vs_yesterday": 0,
+              "is_new": false,
+              "page_last_refreshed": "2026-02-28T10:06:11Z",
+              "link_last_refreshed": "2026-02-23T00:00:00Z"
+            }
+          ]
+        },
+        {
+          "geo": "metro:los-angeles-ca",
+          "snapshot_id": "e2a8221a-0b1f-4f67-8ac3-6f6d2f9e2b73",
+          "features": { "local_pack": true, "paa": true, "featured_snippet": false },
+          "top20": [
+            {
+              "position": 1,
+              "domain": "competitor-a.com",
+              "url": "https://competitor-a.com/water-heater-repair-los-angeles/",
+              "page_type": "service",
+              "position_change_vs_yesterday": 0,
+              "is_new": false
+            },
+            {
+              "position": 2,
+              "domain": "competitor-b.com",
+              "url": "https://competitor-b.com/services/water-heater-repair/",
+              "page_type": "service",
+              "position_change_vs_yesterday": 0,
+              "is_new": false
+            },
+            {
+              "position": 3,
+              "domain": "competitor-c.com",
+              "url": "https://competitor-c.com/water-heater-repair/",
+              "page_type": "service",
+              "position_change_vs_yesterday": 3,
+              "is_new": false
+            }
+          ]
+        }
+      ],
+      "diffs": {
+        "serp_diff": {
+          "geo": "metro:los-angeles-ca",
+          "new_urls": [
+            { "position": 9, "domain": "new-entrant.com", "url": "https://new-entrant.com/service/water-heaters/" }
+          ],
+          "dropped_urls": [
+            { "position": 17, "domain": "old-competitor.com", "url": "https://old-competitor.com/repair/" }
+          ],
+          "biggest_moves": [
+            { "domain": "competitor-c.com", "url": "https://competitor-c.com/water-heater-repair/", "from": 6, "to": 3 }
+          ]
+        },
+        "page_diffs": [
+          {
+            "url": "https://competitor-c.com/water-heater-repair/",
+            "changes": {
+              "title": { "from": "Water Heater Repair | Competitor C", "to": "Water Heater Repair Los Angeles | 24/7 Service" },
+              "schema": { "added": ["FAQPage"], "removed": [] },
+              "h1": { "from": "Water Heater Repair", "to": "Water Heater Repair in Los Angeles" }
+            }
+          }
+        ],
+        "link_diffs": [
+          {
+            "scope": "url",
+            "url": "https://competitor-c.com/water-heater-repair/",
+            "changes": {
+              "referring_domains": { "from": 22, "to": 27 },
+              "top_anchor_themes": {
+                "added": ["water heater repair los angeles", "24/7 plumber"],
+                "removed": []
+              }
+            }
+          }
+        ]
+      },
+      "patterns": {
+        "rank_bands": {
+          "top3": {
+            "common_page_types": ["service"],
+            "median_word_count": 1450,
+            "schema_prevalence": { "FAQPage": 0.67, "LocalBusiness": 0.33 },
+            "median_ref_domains": 38,
+            "median_internal_inbound_links": 24,
+            "title_patterns": [
+              "{SERVICE} {CITY} | Same-Day",
+              "{SERVICE} in {CITY} | 24/7"
+            ],
+            "common_sections": ["Pricing", "Service Areas", "FAQ", "Reviews"]
+          },
+          "top10": {
+            "median_word_count": 980,
+            "schema_prevalence": { "FAQPage": 0.40, "LocalBusiness": 0.30 },
+            "median_ref_domains": 14
+          }
+        }
+      },
+      "recommendations": {
+        "for_target_page": "/water-heater-repair-los-angeles",
+        "priority_actions": [
+          {
+            "type": "on_page",
+            "title": "Add FAQ section + FAQ schema",
+            "why": "FAQPage appears on 67% of top 3 results in this metro SERP.",
+            "details": {
+              "suggested_faq_topics": ["cost", "time to repair", "warranty", "emergency service"],
+              "schema": "FAQPage"
+            }
+          },
+          {
+            "type": "content_structure",
+            "title": "Add pricing & service-area modules near the top",
+            "why": "Top 3 commonly include Pricing + Service Areas + Reviews.",
+            "details": { "recommended_sections_order": ["Intro", "Service Areas", "Pricing", "FAQ", "Reviews", "CTA"] }
+          },
+          {
+            "type": "internal_links",
+            "title": "Increase internal links pointing to this page",
+            "why": "Top 3 median inbound internal links is 24 vs your current 6 (estimated).",
+            "details": {
+              "target_inbound_count": 20,
+              "anchor_themes": ["water heater repair los angeles", "water heater service", "emergency water heater repair"]
+            }
+          },
+          {
+            "type": "off_page",
+            "title": "Close the referring-domain gap (target +15 relevant RDs)",
+            "why": "Top 3 median referring domains is 38; your page currently has 12.",
+            "details": {
+              "target_ref_domains": 27,
+              "anchor_theme_guidance": ["service + city", "brand + service", "emergency repair"],
+              "link_types_preferred": ["contextual editorial", "local citations (if local)", "niche directories"]
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "site_level_summary": {
+    "clusters": [
+      {
+        "cluster": "Water Heater Repair",
+        "keywords": ["water heater repair los angeles", "water heater repair near me"],
+        "what_top3_share": [
+          "FAQPage schema is common",
+          "Titles include city + urgency modifiers (Same-Day/24-7)",
+          "Median ref domains substantially higher than positions 6-20"
+        ],
+        "what_to_build": [
+          "Pillar service page + supporting FAQ post + pricing explainer"
+        ]
+      }
+    ],
+    "warnings": [
+      {
+        "type": "data_freshness",
+        "message": "Backlink data for most URLs is refreshed weekly; some link deltas may lag by up to 7 days."
+      }
+    ]
+  }
+}
+
+============================================================
+IMPLEMENTATION NOTES (SHORT)
+============================================================
+
+Baseline vs Daily Delta
+-----------------------
+- Baseline run stores deep page snapshots for (20 keywords x top 20 URLs) and initial link/internal graph metrics.
+- Daily run always stores SERP snapshots; refreshes only selected URLs (new entrants, moved into top ranks, stale snapshots).
+- Daily report computes diffs vs yesterday and uses baseline for “what top 3/5/10 share” pattern comparisons.
+
+WP Rendering Suggestions
+------------------------
+- Show per keyword: rank changes, new entrants, SERP feature changes, top actions list.
+- Show cluster summary: what top results share + what to build next.
+- Always show “last refreshed” timestamps for page/link data to keep delta logic transparent.
+
+End of file
+-----------

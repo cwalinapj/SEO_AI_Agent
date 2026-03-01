@@ -1,5 +1,38 @@
 ## SEO_AI_Agent
 
+### Cloudflare Agents + Bright Data MCP Worker
+
+- A dedicated Agents SDK worker has been added at `cloudflare-agents-worker/`.
+- Bright Data hosted MCP is wired in `cloudflare-agents-worker/src/server.ts` via `BRIGHT_DATA_API_TOKEN`.
+- Setup guide: `cloudflare-agents-worker/README.md`
+
+### Unified D1 Step2/Step3 migration
+
+- Canonical D1 schema migration for site/run/keyword/page/link/task pipeline:
+  - `migrations/0015_unified_d1_step2_step3.sql`
+- Adds:
+  - `site_signals`, `site_briefs`, `keyword_sets`, `keyword_metrics`
+  - `site_runs`, `site_run_jobs`
+  - `urls`, `serp_result_url_map`, `page_snapshots`, `page_diffs`
+  - `backlink_url_metrics`, `backlink_domain_metrics`, `link_diffs`
+  - `internal_graph_runs`, `internal_graph_url_stats`
+  - `tasks`, `task_status_events`, `task_board_cache`
+  - `competitor_sets`, `competitor_social_profiles`
+
+Backfill legacy Step 3 tasks into canonical `tasks` table:
+
+```bash
+./.venv/bin/python scripts/backfill_step3_tasks_to_tasks.py --db ./local.sqlite --dry-run
+./.venv/bin/python scripts/backfill_step3_tasks_to_tasks.py --db ./local.sqlite
+```
+
+Optional filters:
+
+- `--site-id <site_id>`
+- `--run-id <run_id>`
+- `--limit <n>`
+- `--no-events` (skip `task_status_events` inserts)
+
 ### Database migrations include support for
 
 #### SERP sampling & persistence
@@ -40,6 +73,22 @@
 
 Worker endpoints:
 
+- `POST /v1/sites/analyze`
+- `POST /v1/sites/upsert`
+- `POST /v1/sites/{id}/keyword-research`
+- `GET /v1/jobs/{id}`
+- `GET /v1/sites/{id}/keyword-research/results`
+- `POST /v1/sites/{id}/step2/run`
+- `POST /v1/sites/{id}/daily-run`
+- `GET /v1/sites/{id}/step2/report?date=YYYY-MM-DD`
+- `POST /v1/sites/{id}/step3/plan`
+- `GET /v1/sites/{id}/step3/report?date=YYYY-MM-DD`
+- `GET /v1/sites/{id}/step3/tasks?execution_mode=...&task_group=...&status=...`
+- `GET /v1/sites/{id}/tasks/board`
+- `GET /v1/sites/{id}/runs/{site_run_id}/tasks/board`
+- `GET /v1/sites/{id}/tasks/{task_id}`
+- `PATCH /v1/sites/{id}/tasks/{task_id}`
+- `POST /v1/sites/{id}/tasks/bulk`
 - `POST /serp/google/top20`
 - `POST /serp/sample` (alias)
 - `GET /serp/results?serp_id=...`
@@ -52,6 +101,128 @@ Worker endpoints:
 - `POST /serp/watchlist/run`
 - `GET /jobs/status?job_id=...`
 - `GET /jobs/artifacts?job_id=...`
+
+`POST /v1/sites/upsert` payload (WP plugin contract):
+
+```json
+{
+  "site_url": "https://example.com",
+  "wp_site_id": "abc123",
+  "plan": { "metro_proxy": true, "metro": "Los Angeles, CA" },
+  "signals": {
+    "site_name": "Example Co",
+    "detected_address": "123 Main St, Los Angeles, CA",
+    "detected_phone": "+1-555-000-0000",
+    "industry_hint": null,
+    "is_woocommerce": true,
+    "sitemap_urls": ["https://example.com/sitemap.xml"],
+    "top_pages": [
+      {
+        "url": "https://example.com/water-heater-repair",
+        "title": "Water Heater Repair",
+        "h1": "Water Heater Repair",
+        "meta": "Fast local service",
+        "text_extract": "Same-day water heater repair in Los Angeles."
+      }
+    ]
+  }
+}
+```
+
+`POST /v1/sites/{id}/daily-run` optional body:
+
+```json
+{
+  "run_type": "auto",
+  "max_keywords": 20,
+  "max_results": 20,
+  "geo": "US"
+}
+```
+
+`run_type` can be `auto` (default), `baseline`, or `delta`.
+
+`POST /v1/sites/{id}/step3/plan` optional body:
+
+```json
+{
+  "step2_date": "2026-02-28"
+}
+```
+
+Step 3 output includes:
+
+- Local-service execution tasks split by mode: `auto_safe`, `assisted`, `team_only`
+- Competitor set derived from Step 2 top-5 SERP frequency
+- Competitor-reactive social plan briefs (strategy signals only)
+- Footprint/spam risk flags (doorway and repetitive-pattern guardrails)
+- `task.v1` payload format with taxonomy categories:
+  `ON_PAGE`, `TECHNICAL_SEO`, `LOCAL_SEO`, `CONTENT`, `AUTHORITY`, `SOCIAL`, `MEASUREMENT`
+- `task_board.v1` payload for WP Kanban rendering:
+  - summary counters (`by_status`, `by_priority`, `by_mode`, `by_category`)
+  - Kanban columns (`NEW`, `READY`, `BLOCKED`, `IN_PROGRESS`, `DONE`)
+  - filter sets (status/priority/mode/category/cluster/requires_access)
+  - `task_details.by_id` embedded full task objects
+
+Deterministic Step2 → Step3 triggers currently implemented:
+
+- FAQ schema prevalence threshold (`top3 faq_schema_rate >= 0.5`) → `FAQ_SCHEMA_ADD`
+- Internal-link gap (`target inbound < 50% of top3 median`) → `INTERNAL_LINKING_BOOST_MONEY_PAGE`
+- New top-3 entrant + pricing-module prevalence → `CONTENT_MODULE_ADD`
+- Directory-heavy SERP composition → `LOCAL_PARTNERSHIP_OPPORTUNITIES`
+- Ref-domain gap vs top3 median → `OUTREACH_TARGET_LIST`
+- Competitor social cadence increase vs prior baseline → `SOCIAL_PLAN_WEEKLY`
+
+Task status transition endpoint:
+
+`PATCH /v1/sites/{id}/tasks/{task_id}`
+
+```json
+{
+  "status": "IN_PROGRESS"
+}
+```
+
+Supported transitions:
+
+- `READY -> IN_PROGRESS -> DONE`
+- blocking/unblocking:
+  - `READY|NEW|IN_PROGRESS -> BLOCKED`
+  - `BLOCKED -> READY`
+
+You may pass blockers when setting `BLOCKED`:
+
+```json
+{
+  "status": "BLOCKED",
+  "blockers": [
+    { "code": "MISSING_ACCESS", "message": "Connect Google Business Profile" }
+  ]
+}
+```
+
+Bulk task actions:
+
+`POST /v1/sites/{id}/tasks/bulk`
+
+`AUTO_APPLY_READY` (all READY `AUTO` tasks in a run, marks as `DONE`):
+
+```json
+{
+  "action": "AUTO_APPLY_READY",
+  "site_run_id": "s3run_xxx"
+}
+```
+
+`MARK_DONE_SELECTED` (requires task IDs):
+
+```json
+{
+  "action": "MARK_DONE_SELECTED",
+  "site_run_id": "s3run_xxx",
+  "task_ids": ["task_1", "task_2"]
+}
+```
 
 `POST /serp/google/top20` request:
 
