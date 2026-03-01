@@ -11739,7 +11739,8 @@ export default {
       }
       if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
       const collectedDay = normalizeDayString(body.collected_day);
-      const cluster = cleanString(body.cluster, 160) || null;
+      const cluster = cleanString(body.cluster, 160);
+      const geoKey = parseMozGeoKey(body.geo_key);
       const siteId = cleanString(body.site_id, 120) || null;
       const payload = parseJsonObject(body.intersect) ?? {};
       const siteRunId = cleanString(body.site_run_id, 120) || null;
@@ -11748,18 +11749,26 @@ export default {
         userId: cleanString(body.user_id, 120) || null,
         siteId,
         type: "moz_link_intersect",
-        request: { cluster, collected_day: collectedDay },
+        request: { cluster, collected_day: collectedDay, geo_key: geoKey },
       });
       await env.DB.prepare(
         `INSERT INTO moz_link_intersect_snapshots (
-          snapshot_id, site_id, cluster, collected_day, intersect_json, totals_json, rows_used, site_run_id, job_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          snapshot_id, site_id, cluster, collected_day, geo_key, intersect_json, totals_json, rows_used, site_run_id, job_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(site_id, cluster, collected_day, geo_key) DO UPDATE SET
+          intersect_json = excluded.intersect_json,
+          totals_json = excluded.totals_json,
+          rows_used = excluded.rows_used,
+          site_run_id = excluded.site_run_id,
+          job_id = excluded.job_id,
+          created_at = excluded.created_at`
       )
         .bind(
           uuid("mozint"),
           siteId,
           cluster,
           collectedDay,
+          geoKey,
           safeJsonStringify(payload, 32000),
           safeJsonStringify(parseJsonObject(body.totals) ?? {}, 8000),
           rowsUsed,
@@ -11789,7 +11798,7 @@ export default {
         profile: usageProfile,
       });
       await finalizeJobSuccess(env, jobId, 1);
-      return Response.json({ ok: true, job_id: jobId, collected_day: collectedDay, cluster, site_id: siteId });
+      return Response.json({ ok: true, job_id: jobId, collected_day: collectedDay, cluster, geo_key: geoKey, site_id: siteId });
     }
 
     if (req.method === "POST" && url.pathname === "/moz/usage-data") {

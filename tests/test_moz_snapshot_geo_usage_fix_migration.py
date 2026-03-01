@@ -26,7 +26,7 @@ def test_moz_snapshot_geo_usage_fix_migration() -> None:
     inter_cols = {row[1] for row in conn.execute("PRAGMA table_info(moz_link_intersect_snapshots)")}
     assert {"geo_key", "rows_used", "site_run_id"}.issubset(anchor_cols)
     assert {"geo_key", "rows_used", "site_run_id"}.issubset(root_cols)
-    assert {"rows_used", "site_run_id"}.issubset(inter_cols)
+    assert {"geo_key", "rows_used", "site_run_id"}.issubset(inter_cols)
 
     # UNIQUE now includes geo_key.
     conn.execute(
@@ -46,3 +46,17 @@ def test_moz_snapshot_geo_usage_fix_migration() -> None:
         VALUES ('s2','u1','2026-03-01','metro:los-angeles-ca','[]',0,'{}',0,0)
         """
     )
+    fk_rows = list(conn.execute("PRAGMA foreign_key_check"))
+    assert fk_rows == []
+
+
+def test_migration_succeeds_without_legacy_moz_job_row_usage() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    apply_sql(conn, Path("migrations/0010_step1_keyword_research.sql"))
+    apply_sql(conn, Path("migrations/0015_unified_d1_step2_step3.sql"))
+    apply_sql(conn, Path("migrations/0017_moz_snapshots_and_budgeting.sql"))
+    # intentionally skip 0018, so moz_job_row_usage does not exist
+    apply_sql(conn, Path("migrations/0021_moz_snapshot_geo_usage_fix.sql"))
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "moz_job_usage" in tables

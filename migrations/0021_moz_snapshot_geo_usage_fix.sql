@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS urls (
 CREATE INDEX IF NOT EXISTS idx_urls_domain
   ON urls(domain);
 
+-- Ensure canonical site key is enforceable for FK targets.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wp_ai_seo_sites_site_id_uq
+  ON wp_ai_seo_sites(site_id);
+
 -- Canonical usage ledger for budget explainability/enforcement.
 CREATE TABLE IF NOT EXISTS moz_job_usage (
   job_id TEXT PRIMARY KEY,
@@ -27,6 +31,23 @@ CREATE TABLE IF NOT EXISTS moz_job_usage (
 
 CREATE INDEX IF NOT EXISTS idx_moz_job_usage_site_day_v2
   ON moz_job_usage(site_id, collected_day DESC);
+CREATE INDEX IF NOT EXISTS idx_moz_job_usage_site_endpoint_day
+  ON moz_job_usage(site_id, endpoint, collected_day DESC);
+
+-- Legacy table may not exist in some environments; create a minimal stub to
+-- make backfill safe.
+CREATE TABLE IF NOT EXISTS moz_job_row_usage (
+  usage_id TEXT PRIMARY KEY,
+  site_id TEXT,
+  collected_day TEXT NOT NULL,
+  job_id TEXT,
+  job_type TEXT NOT NULL,
+  rows_used INTEGER NOT NULL DEFAULT 0,
+  degraded_mode INTEGER NOT NULL DEFAULT 0,
+  fallback_reason TEXT,
+  profile TEXT,
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 
 -- Backfill from legacy table when present.
 INSERT OR IGNORE INTO moz_job_usage (
@@ -71,7 +92,7 @@ CREATE TABLE moz_anchor_text_snapshots_new (
   UNIQUE(target_url_id, collected_day, geo_key)
 );
 
-INSERT INTO moz_anchor_text_snapshots_new (
+INSERT OR REPLACE INTO moz_anchor_text_snapshots_new (
   snapshot_id, target_url_id, collected_day, geo_key, top_anchors_json,
   total_anchor_rows, totals_json, rows_used, site_run_id, job_id, created_at
 )
@@ -96,6 +117,8 @@ CREATE INDEX IF NOT EXISTS idx_moz_anchor_target_day
   ON moz_anchor_text_snapshots(target_url_id, collected_day DESC);
 CREATE INDEX IF NOT EXISTS idx_moz_anchor_day
   ON moz_anchor_text_snapshots(collected_day, geo_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_moz_anchor_job
+  ON moz_anchor_text_snapshots(job_id);
 
 -- Rebuild root-domain snapshots with geo scoping + traceability.
 CREATE TABLE moz_linking_root_domains_snapshots_new (
@@ -113,7 +136,7 @@ CREATE TABLE moz_linking_root_domains_snapshots_new (
   UNIQUE(target_url_id, collected_day, geo_key)
 );
 
-INSERT INTO moz_linking_root_domains_snapshots_new (
+INSERT OR REPLACE INTO moz_linking_root_domains_snapshots_new (
   snapshot_id, target_url_id, collected_day, geo_key, top_domains_json,
   total_domain_rows, totals_json, rows_used, site_run_id, job_id, created_at
 )
@@ -138,33 +161,42 @@ CREATE INDEX IF NOT EXISTS idx_moz_root_domains_target_day
   ON moz_linking_root_domains_snapshots(target_url_id, collected_day DESC);
 CREATE INDEX IF NOT EXISTS idx_moz_root_domains_day
   ON moz_linking_root_domains_snapshots(collected_day, geo_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_moz_root_domains_job
+  ON moz_linking_root_domains_snapshots(job_id);
 
 -- Rebuild intersect snapshots with correct site FK + usage/traceability.
 CREATE TABLE moz_link_intersect_snapshots_new (
   snapshot_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   site_id TEXT REFERENCES wp_ai_seo_sites(site_id) ON DELETE SET NULL,
-  cluster TEXT,
+  cluster TEXT NOT NULL DEFAULT '',
   collected_day TEXT NOT NULL,
+  geo_key TEXT NOT NULL DEFAULT 'us',
   intersect_json TEXT NOT NULL,
   totals_json TEXT,
   rows_used INTEGER NOT NULL DEFAULT 0,
   site_run_id TEXT,
   job_id TEXT,
-  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  UNIQUE(site_id, cluster, collected_day, geo_key)
 );
 
-INSERT INTO moz_link_intersect_snapshots_new (
-  snapshot_id, site_id, cluster, collected_day, intersect_json, totals_json,
+INSERT OR REPLACE INTO moz_link_intersect_snapshots_new (
+  snapshot_id, site_id, cluster, collected_day, geo_key, intersect_json, totals_json,
   rows_used, site_run_id, job_id, created_at
 )
 SELECT
   snapshot_id,
   site_id,
-  cluster,
+  COALESCE(cluster, ''),
   collected_day,
+  'us',
   intersect_json,
   totals_json,
-  0,
+  COALESCE(
+    CAST(json_extract(totals_json, '$.rows_used') AS INTEGER),
+    CAST(json_extract(totals_json, '$.total_rows') AS INTEGER),
+    0
+  ),
   NULL,
   job_id,
   created_at
@@ -177,6 +209,10 @@ CREATE INDEX IF NOT EXISTS idx_moz_intersect_site_day
   ON moz_link_intersect_snapshots(site_id, collected_day DESC);
 CREATE INDEX IF NOT EXISTS idx_moz_intersect_cluster_day
   ON moz_link_intersect_snapshots(cluster, collected_day DESC);
+CREATE INDEX IF NOT EXISTS idx_moz_intersect_day_geo
+  ON moz_link_intersect_snapshots(collected_day, geo_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_moz_intersect_job
+  ON moz_link_intersect_snapshots(job_id);
 
 -- Rebuild URL metrics snapshots with usage/traceability columns.
 CREATE TABLE moz_url_metrics_snapshots_new (
@@ -197,7 +233,7 @@ CREATE TABLE moz_url_metrics_snapshots_new (
   UNIQUE(url_id, collected_day, geo_key)
 );
 
-INSERT INTO moz_url_metrics_snapshots_new (
+INSERT OR REPLACE INTO moz_url_metrics_snapshots_new (
   snapshot_id, url_id, collected_day, geo_key, page_authority, domain_authority,
   spam_score, linking_domains, external_links, metrics_json,
   rows_used, site_run_id, job_id, created_at
@@ -213,7 +249,7 @@ SELECT
   linking_domains,
   external_links,
   metrics_json,
-  0,
+  1,
   NULL,
   job_id,
   created_at
@@ -226,5 +262,7 @@ CREATE INDEX IF NOT EXISTS idx_moz_url_metrics_day_geo
   ON moz_url_metrics_snapshots(collected_day, geo_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_moz_url_metrics_url_day
   ON moz_url_metrics_snapshots(url_id, collected_day DESC);
+CREATE INDEX IF NOT EXISTS idx_moz_url_metrics_job
+  ON moz_url_metrics_snapshots(job_id);
 
 PRAGMA foreign_keys = ON;
