@@ -7,9 +7,9 @@ CREATE TABLE IF NOT EXISTS sites (
 );
 
 CREATE TABLE IF NOT EXISTS speed_snapshots (
-  snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_id TEXT PRIMARY KEY,
   site_id TEXT NOT NULL,
-  date INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
   strategy TEXT NOT NULL CHECK (strategy IN ('mobile', 'desktop')),
   lcp_ms INTEGER,
   cls REAL,
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS speed_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_speed_snapshots_site_strategy_date
-  ON speed_snapshots (site_id, strategy, date DESC);
+  ON speed_snapshots (site_id, strategy, created_at DESC);
 
 CREATE TRIGGER IF NOT EXISTS speed_snapshots_cooldown_bi
 BEFORE INSERT ON speed_snapshots
@@ -35,7 +35,7 @@ WHEN EXISTS (
   FROM speed_snapshots s
   WHERE s.site_id = NEW.site_id
     AND s.strategy = NEW.strategy
-    AND s.date > NEW.date - 43200
+    AND s.created_at > NEW.created_at - 43200000
 )
 BEGIN
   SELECT RAISE(ABORT, 'speed snapshot cooldown active');
@@ -46,7 +46,7 @@ WITH paired AS (
   SELECT
     curr.snapshot_id,
     curr.site_id,
-    curr.date,
+    curr.created_at,
     curr.strategy,
     curr.deploy_hash,
     curr.trigger_reason,
@@ -67,15 +67,15 @@ WITH paired AS (
       FROM speed_snapshots p
       WHERE p.site_id = curr.site_id
         AND p.strategy = curr.strategy
-        AND p.date < curr.date
-      ORDER BY p.date DESC
+        AND p.created_at < curr.created_at
+      ORDER BY p.created_at DESC
       LIMIT 1
     )
 )
 SELECT
   snapshot_id,
   site_id,
-  date,
+  created_at AS date,
   strategy,
   trigger_reason,
   deploy_hash,

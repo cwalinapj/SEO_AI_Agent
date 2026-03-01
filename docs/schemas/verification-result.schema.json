@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seo-ai-agent.local/schemas/verification-result.schema.json",
+  "title": "VerificationResult",
+  "type": "object",
+  "required": ["task_id", "evidence_id", "passed", "checked_at", "diffs"],
+  "properties": {
+    "task_id": { "type": "string" },
+    "evidence_id": { "type": "string" },
+    "passed": { "type": "boolean" },
+    "checked_at": { "type": "integer" },
+    "diffs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["rule", "path", "expected", "actual", "pass", "message"],
+        "properties": {
+          "rule": { "type": "string" },
+          "path": { "type": "string" },
+          "expected": { "type": "string" },
+          "actual": { "type": "string" },
+          "pass": { "type": "boolean" },
+          "message": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

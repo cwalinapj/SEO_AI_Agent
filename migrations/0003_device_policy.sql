@@ -1,5 +1,4 @@
 ALTER TABLE keywords ADD COLUMN vertical TEXT;
-ALTER TABLE keywords ADD COLUMN geo_bucket TEXT;
 ALTER TABLE keywords ADD COLUMN service_model TEXT CHECK (service_model IN ('emergency', 'appointment', 'walk-in'));
 ALTER TABLE keywords ADD COLUMN cta_type TEXT CHECK (cta_type IN ('call_now', 'book_now', 'get_quote'));
 ALTER TABLE keywords ADD COLUMN business_hours_profile TEXT CHECK (business_hours_profile IN ('24_7', '9_5'));

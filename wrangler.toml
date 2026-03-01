@@ -12,8 +12,8 @@ crons = ["0 9 * * *"]
 # D1 (fill database_id after creation)
 [[d1_databases]]
 binding = "DB"
-database_name = "tolldns_seo"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_name = "SEO_AI_Agent"
+database_id = "e5b22404-32e9-4a5c-a890-1effb9266c9c"
 
 # Workers AI (embeddings etc. later; safe to keep now)
 [ai]

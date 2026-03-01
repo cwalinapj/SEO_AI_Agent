@@ -1,0 +1,1107 @@
+openapi: 3.1.0
+info:
+  title: SEO AI Agent API
+  version: 1.0.0
+  description: |
+    API for Step1 keyword research, Step2 daily SERP harvesting, Step3 execution tasks, task board operations,
+    watchlist SERP collection, proxy leasing, and signed WordPress plugin integration.
+servers:
+  - url: http://127.0.0.1:8787
+    description: Local Wrangler dev
+  - url: https://<your-worker-domain>
+    description: Production Worker
+
+tags:
+  - name: Sites
+  - name: Step1
+  - name: Step2
+  - name: Step3
+  - name: Tasks
+  - name: SERP
+  - name: Watchlist
+  - name: Proxy
+  - name: Jobs
+  - name: Plugin Signed
+  - name: Marketplace
+  - name: Moz
+  - name: Providers
+
+paths:
+  /v1/tasks:
+    post:
+      tags: [Marketplace]
+      summary: Create a human-verified marketplace task spec/template
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskSpec'
+      responses:
+        '200':
+          description: Task created with signed spec hash
+
+  /v1/tasks/open:
+    get:
+      tags: [Marketplace]
+      summary: List open tasks (unclaimed + not expired)
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Open tasks list
+
+  /v1/tasks/{task_id}:
+    get:
+      tags: [Marketplace]
+      summary: Fetch full task spec/details
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Full task record
+
+  /v1/tasks/{task_id}/claim:
+    post:
+      tags: [Marketplace]
+      summary: Claim task (one active claim per task)
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_wallet]
+              properties:
+                worker_wallet: { type: string }
+                ttl_minutes: { type: integer, minimum: 1, maximum: 1440 }
+      responses:
+        '200':
+          description: Claim result
+
+  /v1/tasks/{task_id}/release:
+    post:
+      tags: [Marketplace]
+      summary: Release active claim (manual or timeout)
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                worker_wallet: { type: string }
+                reason: { type: string }
+                force: { type: boolean }
+      responses:
+        '200':
+          description: Release result
+
+  /v1/tasks/{task_id}/evidence:
+    post:
+      tags: [Marketplace]
+      summary: Submit evidence bundle and persist immutable evidence hash
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_wallet]
+              properties:
+                worker_wallet: { type: string }
+                evidence:
+                  $ref: '#/components/schemas/EvidenceBundle'
+      responses:
+        '200':
+          description: Evidence accepted
+
+  /v1/tasks/{task_id}/verify:
+    post:
+      tags: [Marketplace]
+      summary: Deterministically verify evidence against task spec
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                evidence_id: { type: string }
+      responses:
+        '200':
+          description: Verification result with signed hash
+
+  /v1/tasks/{task_id}/payout-authorize:
+    post:
+      tags: [Marketplace]
+      summary: Authorize payout after pass verification and claim-owner check
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_wallet]
+              properties:
+                worker_wallet: { type: string }
+      responses:
+        '200':
+          description: Signed payout authorization payload
+
+  /v1/sites/{site_id}/moz/budget:
+    get:
+      tags: [Moz]
+      summary: Estimate Moz daily/weekly/monthly row usage and cost budget
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+        - name: keywords
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 20 }
+        - name: daily_new_entrants
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+        - name: daily_top_movers
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 5000, default: 0 }
+        - name: baseline_mode
+          in: query
+          schema: { type: string, enum: [light, fuller], default: light }
+        - name: cost_per_1k_rows_usd
+          in: query
+          schema: { type: number, default: 5 }
+      responses:
+        '200':
+          description: Budget estimate payload
+
+  /v1/sites/{site_id}/providers:
+    get:
+      tags: [Providers]
+      summary: Get per-site provider profile (SERP/page/geo)
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      responses:
+        '200':
+          description: Provider profile
+    post:
+      tags: [Providers]
+      summary: Upsert per-site provider profile
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                serp_provider:
+                  type: string
+                  enum: [decodo_serp_api, headless_google]
+                page_provider:
+                  type: string
+                  enum: [decodo_web_api, direct_fetch]
+                geo_provider:
+                  type: string
+                  enum: [decodo_geo, proxy_lease_pool]
+      responses:
+        '200':
+          description: Provider profile saved
+
+  /v1/sites/{site_id}/moz/profile:
+    get:
+      tags: [Moz]
+      summary: Get Moz intensity profile and row-budget settings for a site
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      responses:
+        '200':
+          description: Moz profile config
+    post:
+      tags: [Moz]
+      summary: Upsert Moz intensity profile and row-budget settings for a site
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                moz_profile:
+                  type: string
+                  enum: [single_site_max, scalable_delta]
+                moz_monthly_rows_budget:
+                  type: integer
+                  minimum: 0
+                  default: 15000
+                weekly_focus_url_count:
+                  type: integer
+                  minimum: 1
+                  maximum: 500
+                  default: 20
+                daily_keyword_depth:
+                  type: integer
+                  minimum: 1
+                  maximum: 20
+                  default: 20
+      responses:
+        '200':
+          description: Moz profile saved
+
+  /v1/sites/{site_id}/moz/run:
+    post:
+      tags: [Moz]
+      summary: Execute Moz profile planner for a site (manual trigger)
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                day:
+                  type: string
+                  description: YYYY-MM-DD
+                is_weekly:
+                  type: boolean
+      responses:
+        '200':
+          description: Moz plan run summary
+
+  /moz/url-metrics:
+    post:
+      tags: [Moz]
+      summary: Persist moz_url_metrics snapshots (batched)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200': { description: Snapshot ingest result }
+
+  /moz/anchor-text:
+    post:
+      tags: [Moz]
+      summary: Persist moz_anchor_text snapshot for a target URL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200': { description: Snapshot ingest result }
+
+  /moz/linking-root-domains:
+    post:
+      tags: [Moz]
+      summary: Persist moz_linking_root_domains snapshot for a target URL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200': { description: Snapshot ingest result }
+
+  /moz/link-intersect:
+    post:
+      tags: [Moz]
+      summary: Persist moz_link_intersect snapshot for cluster/site outreach modeling
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200': { description: Snapshot ingest result }
+
+  /moz/usage-data:
+    post:
+      tags: [Moz]
+      summary: Persist Moz usage row limits and consumption data
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200': { description: Snapshot ingest result }
+
+  /moz/index-metadata:
+    post:
+      tags: [Moz]
+      summary: Persist Moz index metadata snapshot for refresh scheduling
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200': { description: Snapshot ingest result }
+
+  /page/fetch:
+    post:
+      tags: [Step2]
+      summary: Fetch one page via configured provider and persist canonical page snapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string }
+                site_id: { type: string }
+                user_id: { type: string }
+                page_provider:
+                  type: string
+                  enum: [decodo_web_api, direct_fetch]
+                geo_provider:
+                  type: string
+                  enum: [decodo_geo, proxy_lease_pool]
+                geo_label: { type: string, default: us }
+                timeout_ms: { type: integer, minimum: 1000, maximum: 20000, default: 8000 }
+      responses:
+        '200':
+          description: Job + snapshot references
+
+  /v1/sites/upsert:
+    post:
+      tags: [Sites]
+      summary: Create or update a site profile from WP/plugin signals
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SiteUpsertRequest'
+      responses:
+        '200':
+          description: Site upserted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SiteUpsertResponse'
+
+  /v1/sites/{site_id}/keyword-research:
+    post:
+      tags: [Step1]
+      summary: Run Step1 keyword research (always 10 primary + 10 secondary)
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Research job completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  job_id: { type: string }
+                  site_id: { type: string }
+                  research_run_id: { type: string }
+                  status: { type: string }
+
+  /v1/sites/{site_id}/keyword-research/results:
+    get:
+      tags: [Step1]
+      summary: Load latest Step1 results
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      responses:
+        '200':
+          description: Result payload
+
+  /v1/sites/{site_id}/step2/run:
+    post:
+      tags: [Step2]
+      summary: Run Step2 harvest (baseline/delta/auto)
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Step2RunRequest'
+      responses:
+        '200':
+          description: Step2 completed
+
+  /v1/sites/{site_id}/step2/report:
+    get:
+      tags: [Step2]
+      summary: Load latest Step2 report
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Step2 report
+
+  /v1/sites/{site_id}/step3/plan:
+    post:
+      tags: [Step3]
+      summary: Build Step3 execution plan from Step2 deltas
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                step2_date:
+                  type: string
+                  format: date
+      responses:
+        '200':
+          description: Step3 plan generated
+
+  /v1/sites/{site_id}/step3/report:
+    get:
+      tags: [Step3]
+      summary: Load latest Step3 report
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Step3 report
+
+  /v1/sites/{site_id}/step3/tasks:
+    get:
+      tags: [Tasks]
+      summary: Query tasks with filters for WP task list rendering
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+        - name: site_run_id
+          in: query
+          schema: { type: string }
+        - name: execution_mode
+          in: query
+          description: CSV or repeated query values
+          schema:
+            oneOf:
+              - type: string
+              - type: array
+                items: { type: string }
+        - name: task_group
+          in: query
+          schema:
+            oneOf:
+              - type: string
+              - type: array
+                items: { type: string }
+        - name: status
+          in: query
+          schema:
+            oneOf:
+              - type: string
+              - type: array
+                items: { type: string }
+      responses:
+        '200':
+          description: Filtered task cards + task_details
+
+  /v1/sites/{site_id}/tasks/board:
+    get:
+      tags: [Tasks]
+      summary: Get latest task board payload (task_board.v1)
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      responses:
+        '200':
+          description: Task board payload
+
+  /v1/sites/{site_id}/runs/{site_run_id}/tasks/board:
+    get:
+      tags: [Tasks]
+      summary: Get task board payload for a specific run
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+        - name: site_run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Task board payload
+
+  /v1/sites/{site_id}/tasks/{task_id}:
+    get:
+      tags: [Tasks]
+      summary: Load a single task
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Task detail
+    patch:
+      tags: [Tasks]
+      summary: Transition task status (READY -> IN_PROGRESS -> DONE, BLOCKED/unblocked)
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskPatchRequest'
+      responses:
+        '200':
+          description: Updated task
+
+  /v1/sites/{site_id}/tasks/bulk:
+    post:
+      tags: [Tasks]
+      summary: Bulk task actions (AUTO_APPLY_READY, MARK_DONE_SELECTED)
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskBulkRequest'
+      responses:
+        '200':
+          description: Bulk action result
+
+  /serp/google/top20:
+    post:
+      tags: [SERP]
+      summary: Collect and persist Google top-20 organic results
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SerpTop20Request'
+      responses:
+        '200':
+          description: SERP run and rows
+
+  /serp/sample:
+    post:
+      tags: [SERP]
+      summary: Alias for /serp/google/top20
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SerpTop20Request'
+      responses:
+        '200':
+          description: SERP run and rows
+
+  /serp/results:
+    get:
+      tags: [SERP]
+      summary: Get stored SERP results by serp_id
+      parameters:
+        - name: serp_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: SERP rows
+
+  /serp/graph:
+    get:
+      tags: [SERP]
+      summary: Read daily graph series from persisted SERP rows
+      parameters:
+        - name: keyword
+          in: query
+          required: true
+          schema: { type: string }
+        - name: days
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 365, default: 30 }
+        - name: device
+          in: query
+          schema: { type: string, enum: [desktop, mobile] }
+      responses:
+        '200':
+          description: Graph data grouped by URL
+
+  /serp/watchlist/save:
+    post:
+      tags: [Watchlist]
+      summary: Save or update a watchlist keyword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WatchlistSaveRequest'
+      responses:
+        '200':
+          description: Watchlist item
+
+  /serp/watchlist:
+    get:
+      tags: [Watchlist]
+      summary: List watchlist rows
+      parameters:
+        - name: user_id
+          in: query
+          schema: { type: string }
+        - name: active_only
+          in: query
+          schema: { type: boolean, default: false }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 200 }
+      responses:
+        '200':
+          description: Watchlist rows
+
+  /serp/watchlist/run:
+    post:
+      tags: [Watchlist]
+      summary: Run watchlist collection with optional proxy lease, plus graph-path readiness stats
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_id: { type: string }
+                watch_id: { type: string }
+                limit: { type: integer, minimum: 1, maximum: 500 }
+                force: { type: boolean }
+                proxy_lease_id: { type: string }
+      responses:
+        '200':
+          description: Watchlist run summary
+
+  /proxy/lease:
+    post:
+      tags: [Proxy]
+      summary: Lease a residential proxy from the pool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: { type: string }
+                keyword: { type: string }
+                country: { type: string }
+                region: { type: string }
+                metro_area: { type: string }
+                duration_minutes: { type: integer, minimum: 5, maximum: 180 }
+      responses:
+        '200':
+          description: Lease receipt
+
+  /proxy/release:
+    post:
+      tags: [Proxy]
+      summary: Release an active proxy lease
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lease_id, user_id]
+              properties:
+                lease_id: { type: string }
+                user_id: { type: string }
+      responses:
+        '200':
+          description: Release status
+
+  /jobs/status:
+    get:
+      tags: [Jobs]
+      summary: Get job status
+      parameters:
+        - name: job_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Job row
+
+  /jobs/artifacts:
+    get:
+      tags: [Jobs]
+      summary: Get job artifacts
+      parameters:
+        - name: job_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Artifact rows
+
+  /plugin/wp/v1/sites/upsert:
+    post:
+      tags: [Plugin Signed]
+      summary: Signed plugin upsert endpoint
+      security:
+        - PluginSignedHeaders: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SiteUpsertRequest'
+      responses:
+        '200':
+          description: Same as /v1/sites/upsert
+
+  /plugin/wp/v1/sites/{site_id}/keyword-research:
+    post:
+      tags: [Plugin Signed]
+      summary: Signed plugin Step1 endpoint
+      security:
+        - PluginSignedHeaders: []
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      responses:
+        '200':
+          description: Research result
+
+  /plugin/wp/v1/sites/{site_id}/step2/run:
+    post:
+      tags: [Plugin Signed]
+      summary: Signed plugin Step2 endpoint
+      security:
+        - PluginSignedHeaders: []
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Step2RunRequest'
+      responses:
+        '200':
+          description: Step2 result
+
+  /plugin/wp/v1/sites/{site_id}/step3/plan:
+    post:
+      tags: [Plugin Signed]
+      summary: Signed plugin Step3 plan endpoint
+      security:
+        - PluginSignedHeaders: []
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Step3 plan result
+
+  /plugin/wp/v1/sites/{site_id}/tasks/board:
+    post:
+      tags: [Plugin Signed]
+      summary: Signed plugin task board query endpoint
+      security:
+        - PluginSignedHeaders: []
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                site_run_id: { type: string }
+      responses:
+        '200':
+          description: task_board.v1 payload
+
+  /plugin/wp/v1/sites/{site_id}/step3/tasks:
+    post:
+      tags: [Plugin Signed]
+      summary: Signed plugin filtered task list endpoint
+      security:
+        - PluginSignedHeaders: []
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                site_run_id: { type: string }
+                execution_mode:
+                  oneOf: [{ type: string }, { type: array, items: { type: string } }]
+                task_group:
+                  oneOf: [{ type: string }, { type: array, items: { type: string } }]
+                status:
+                  oneOf: [{ type: string }, { type: array, items: { type: string } }]
+      responses:
+        '200':
+          description: Task list payload
+
+  /plugin/wp/v1/sites/{site_id}/tasks/{task_id}:
+    post:
+      tags: [Plugin Signed]
+      summary: Signed plugin task status transition endpoint
+      security:
+        - PluginSignedHeaders: []
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskPatchRequest'
+      responses:
+        '200':
+          description: Updated task
+
+  /plugin/wp/v1/sites/{site_id}/tasks/bulk:
+    post:
+      tags: [Plugin Signed]
+      summary: Signed plugin bulk task actions endpoint
+      security:
+        - PluginSignedHeaders: []
+      parameters:
+        - $ref: '#/components/parameters/SiteId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskBulkRequest'
+      responses:
+        '200':
+          description: Bulk action result
+
+components:
+  securitySchemes:
+    PluginSignedHeaders:
+      type: apiKey
+      in: header
+      name: x-plugin-signature
+      description: |
+        Plugin signed requests require both headers:
+        - x-plugin-timestamp
+        - x-plugin-signature
+        Signature = hex(HMAC_SHA256(WP_PLUGIN_SHARED_SECRET, `${timestamp}.${rawBody}`)).
+  parameters:
+    SiteId:
+      name: site_id
+      in: path
+      required: true
+      schema: { type: string }
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      schema: { type: string }
+  schemas:
+    SiteUpsertRequest:
+      type: object
+      required: [site_url]
+      properties:
+        site_url: { type: string, format: uri }
+        wp_site_id: { type: string }
+        plan:
+          type: object
+          properties:
+            metro_proxy: { type: boolean }
+            metro: { type: string }
+        signals:
+          type: object
+          properties:
+            site_name: { type: string }
+            detected_address: { type: string }
+            detected_phone: { type: string }
+            top_pages:
+              type: array
+              items:
+                type: object
+                properties:
+                  url: { type: string, format: uri }
+                  title: { type: string }
+                  h1: { type: string }
+                  meta: { type: string }
+                  text_extract: { type: string }
+    SiteUpsertResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        site_id: { type: string }
+        site_brief_id: { type: string }
+        site_url: { type: string }
+        site_name: { type: string, nullable: true }
+    Step2RunRequest:
+      type: object
+      properties:
+        run_type:
+          type: string
+          enum: [auto, baseline, delta]
+          default: auto
+        max_keywords:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 20
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 20
+        geo:
+          type: string
+          default: US
+    TaskPatchRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [READY, IN_PROGRESS, DONE, BLOCKED]
+        blockers:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              message: { type: string }
+    TaskBulkRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [AUTO_APPLY_READY, MARK_DONE_SELECTED]
+        site_run_id: { type: string }
+        task_ids:
+          type: array
+          items: { type: string }
+    SerpTop20Request:
+      type: object
+      required: [user_id, keyword]
+      properties:
+        user_id: { type: string }
+        keyword: { type: string }
+        region:
+          type: object
+          properties:
+            country: { type: string, default: US }
+            language: { type: string, default: en }
+            metro: { type: string }
+        device:
+          type: string
+          enum: [desktop, mobile]
+          default: desktop
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 20
+        proxy_lease_id:
+          type: string
+          description: Optional active proxy lease to run metro-local SERP capture.
+    WatchlistSaveRequest:
+      type: object
+      required: [user_id, keyword]
+      properties:
+        watch_id: { type: string }
+        user_id: { type: string }
+        keyword: { type: string }
+        region:
+          type: object
+          properties:
+            country: { type: string, default: US }
+            language: { type: string, default: en }
+            metro: { type: string }
+        device: { type: string, enum: [desktop, mobile], default: desktop }
+        max_results: { type: integer, minimum: 1, maximum: 20, default: 20 }
+        active: { type: boolean, default: true }
+    TaskSpec:
+      allOf:
+        - $ref: ./schemas/task-spec.schema.json
+    EvidenceBundle:
+      allOf:
+        - $ref: ./schemas/evidence-bundle.schema.json
+    VerificationResult:
+      allOf:
+        - $ref: ./schemas/verification-result.schema.json
+    PayoutAuthorization:
+      allOf:
+        - $ref: ./schemas/payout-authorization.schema.json

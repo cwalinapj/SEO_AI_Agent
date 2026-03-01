@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seo-ai-agent.local/schemas/payout-authorization.schema.json",
+  "title": "PayoutAuthorization",
+  "type": "object",
+  "required": [
+    "authorization_id",
+    "task_id",
+    "claim_id",
+    "worker_wallet",
+    "payout",
+    "verification_result_hash",
+    "authorized_at",
+    "expires_at",
+    "nonce"
+  ],
+  "properties": {
+    "authorization_id": { "type": "string" },
+    "task_id": { "type": "string" },
+    "claim_id": { "type": "string" },
+    "worker_wallet": { "type": "string" },
+    "payout": {
+      "type": "object",
+      "required": ["amount", "token"],
+      "properties": {
+        "amount": { "type": "string" },
+        "token": { "type": "string" },
+        "chain": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "verification_result_hash": { "type": "string" },
+    "authorized_at": { "type": "integer" },
+    "expires_at": { "type": "integer" },
+    "nonce": { "type": "string" }
+  },
+  "additionalProperties": false
+}

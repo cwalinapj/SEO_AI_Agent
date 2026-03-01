@@ -1,0 +1,30 @@
+{
+  "site_url": "https://example.com",
+  "wp_site_id": "example-site-001",
+  "plan": {
+    "metro_proxy": true,
+    "metro": "Los Angeles, CA",
+    "serp_provider": "decodo_serp_api",
+    "page_provider": "decodo_web_api",
+    "geo_provider": "decodo_geo"
+  },
+  "signals": {
+    "site_name": "Example Co",
+    "detected_address": "123 Main St, Los Angeles, CA 90001",
+    "detected_phone": "+1-555-555-0101",
+    "industry_hint": "local services",
+    "is_woocommerce": false,
+    "sitemap_urls": [
+      "https://example.com/sitemap.xml"
+    ],
+    "top_pages": [
+      {
+        "url": "https://example.com/water-heater-repair-los-angeles",
+        "title": "Water Heater Repair Los Angeles",
+        "h1": "Water Heater Repair in Los Angeles",
+        "meta": "Same-day water heater repair in Los Angeles.",
+        "text_extract": "Emergency water heater repair and replacement with same-day service."
+      }
+    ]
+  }
+}

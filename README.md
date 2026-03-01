@@ -10,6 +10,8 @@
 
 - Canonical D1 schema migration for site/run/keyword/page/link/task pipeline:
   - `migrations/0015_unified_d1_step2_step3.sql`
+- Moz snapshot and budgeting migration:
+  - `migrations/0017_moz_snapshots_and_budgeting.sql`
 - Adds:
   - `site_signals`, `site_briefs`, `keyword_sets`, `keyword_metrics`
   - `site_runs`, `site_run_jobs`
@@ -18,6 +20,11 @@
   - `internal_graph_runs`, `internal_graph_url_stats`
   - `tasks`, `task_status_events`, `task_board_cache`
   - `competitor_sets`, `competitor_social_profiles`
+  - `moz_url_metrics_snapshots`
+  - `moz_anchor_text_snapshots`
+  - `moz_linking_root_domains_snapshots`
+  - `moz_link_intersect_snapshots`
+  - `moz_usage_snapshots`, `moz_index_metadata_snapshots`
 
 Backfill legacy Step 3 tasks into canonical `tasks` table:
 
@@ -99,8 +106,50 @@ Worker endpoints:
 - `GET /serp/watchlist?user_id=...`
 - `POST /serp/watchlist/remove`
 - `POST /serp/watchlist/run`
+- `GET /v1/sites/{id}/moz/budget`
+- `GET /v1/sites/{id}/providers`
+- `POST /v1/sites/{id}/providers`
+- `GET /v1/sites/{id}/moz/profile`
+- `POST /v1/sites/{id}/moz/profile`
+- `POST /v1/sites/{id}/moz/run`
+- `POST /moz/url-metrics`
+- `POST /moz/anchor-text`
+- `POST /moz/linking-root-domains`
+- `POST /moz/link-intersect`
+- `POST /moz/usage-data`
+- `POST /moz/index-metadata`
+- `POST /page/fetch`
 - `GET /jobs/status?job_id=...`
 - `GET /jobs/artifacts?job_id=...`
+
+Signed WP plugin endpoint namespace (`x-plugin-timestamp` + `x-plugin-signature`):
+
+- `POST /plugin/wp/v1/sites/upsert`
+- `POST /plugin/wp/v1/sites/{id}/keyword-research`
+- `POST /plugin/wp/v1/sites/{id}/step2/run`
+- `POST /plugin/wp/v1/sites/{id}/step3/plan`
+- `POST /plugin/wp/v1/sites/{id}/tasks/board`
+- `POST /plugin/wp/v1/sites/{id}/step3/tasks`
+- `POST /plugin/wp/v1/sites/{id}/tasks/{task_id}`
+- `POST /plugin/wp/v1/sites/{id}/tasks/bulk`
+
+API and integration docs:
+
+- OpenAPI: `docs/openapi.yaml`
+- WP integration guide: `docs/wp-plugin-integration-guide.md`
+- Web Secrets Wallet marketplace contract: `docs/web-secrets-task-marketplace-contract.md`
+- Signed WP client helper: `scripts/wp_signed_client.py`
+
+Human-verified task marketplace endpoints:
+
+- `POST /v1/tasks`
+- `GET /v1/tasks/open`
+- `GET /v1/tasks/{task_id}`
+- `POST /v1/tasks/{task_id}/claim`
+- `POST /v1/tasks/{task_id}/release`
+- `POST /v1/tasks/{task_id}/evidence`
+- `POST /v1/tasks/{task_id}/verify`
+- `POST /v1/tasks/{task_id}/payout-authorize`
 
 `POST /v1/sites/upsert` payload (WP plugin contract):
 
@@ -266,6 +315,22 @@ Rows are persisted in D1 tables:
 }
 ```
 
+`POST /serp/watchlist/run` supports optional proxy lease and now reports graph-path readiness:
+
+```json
+{
+  "user_id": "user-123",
+  "force": true,
+  "proxy_lease_id": "lease_abc123"
+}
+```
+
+Summary fields include:
+
+- `proxy_lease_id`
+- `graph_ready_rows`
+- per-row `graph_rows_last_30d`
+
 Daily rank graph endpoint:
 
 `GET /serp/graph?keyword=Plumbers%20in%20Minden,%20NV&days=30`
@@ -277,6 +342,31 @@ Response includes:
   - `url`
   - `root_domain`
   - `ranks` (y-axis positions, aligned to `day_axis`)
+
+Local scripts:
+
+- `scripts/dev_pipeline_run.sh` runs `upsert -> step1 -> step2 -> step3 -> board`.
+- `scripts/task_state_machine_harness.py` validates task transitions (`READY -> IN_PROGRESS -> DONE`, `BLOCKED -> READY`).
+
+Moz row-budget rules implemented (estimator endpoint):
+
+- Daily delta baseline: top-5 URL metrics across tracked keywords + entrants/movers.
+- Weekly refresh model: site-level `competitor_focus_urls` (default 20 URLs) for anchor/link-domain refresh and link-intersect.
+- Profiles:
+  - `single_site_max` (default): richer daily collection under a per-site monthly row budget (default `15000`).
+  - `scalable_delta`: same guardrails, tuned for tighter weekly focus.
+- Guardrails degrade automatically when projected rows exceed monthly remaining budget (`depth 20->10->5`, RD rows `50->25`, anchors `20->10`, then intersect skip).
+- Monthly baseline model: `light=400 rows` or `fuller=1100 rows`.
+- Cost model defaults to `$5 / 1,000 rows` and is configurable via query param.
+
+Provider profile support (per site):
+
+- `serp_provider`: `decodo_serp_api` or `headless_google`
+- `page_provider`: `decodo_web_api` or `direct_fetch`
+- `geo_provider`: `decodo_geo` or `proxy_lease_pool`
+- Configure with `POST /v1/sites/{id}/providers`, inspect with `GET /v1/sites/{id}/providers`.
+- Step2 and `/serp/google/top20` can use Decodo with automatic fallback to headless/direct modes.
+- Every provider call is logged through `jobs` and `artifacts` with `extractor_mode` and `fallback_reason`.
 
 Cross-keyword root-domain averages:
 

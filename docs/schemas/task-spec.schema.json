@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seo-ai-agent.local/schemas/task-spec.schema.json",
+  "title": "TaskSpec",
+  "type": "object",
+  "required": [
+    "title",
+    "description",
+    "platform",
+    "issuer_wallet",
+    "required_profile_fields",
+    "required_media_hashes",
+    "verification_rules",
+    "payout",
+    "deadline_at"
+  ],
+  "properties": {
+    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 3000 },
+    "platform": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "issuer_wallet": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "required_profile_fields": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 120 },
+      "uniqueItems": true
+    },
+    "required_media_hashes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[a-fA-F0-9]{32,128}$"
+      }
+    },
+    "verification_rules": {
+      "type": "object",
+      "properties": {
+        "min_screenshots": { "type": "integer", "minimum": 0, "maximum": 200 },
+        "require_trace": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "payout": {
+      "type": "object",
+      "required": ["amount", "token"],
+      "properties": {
+        "amount": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "token": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "chain": { "type": ["string", "null"], "maxLength": 80 }
+      },
+      "additionalProperties": false
+    },
+    "deadline_at": { "type": "integer", "minimum": 1 },
+    "metadata": { "type": "object", "additionalProperties": true }
+  },
+  "additionalProperties": true
+}

@@ -39,10 +39,10 @@ def test_speed_snapshot_cooldown_per_site_strategy(conn):
     conn.execute(
         """
         INSERT INTO speed_snapshots (
-          site_id, date, strategy, lcp_ms, cls, tbt_ms, fcp_ms, field_lcp_pctl, field_cls_pctl, field_inp_pctl,
+          snapshot_id, site_id, created_at, strategy, lcp_ms, cls, tbt_ms, fcp_ms, field_lcp_pctl, field_cls_pctl, field_inp_pctl,
           performance_score, psi_fetch_time, trigger_reason, deploy_hash
         ) VALUES (
-          's1', 1735689600, 'mobile', 2200, 0.08, 120, 1100, 2500, 0.08, 200, 0.82, '2026-01-01T00:00:00Z', 'deploy', 'abc123'
+          'snap_1', 's1', 1735689600000, 'mobile', 2200, 0.08, 120, 1100, 2500, 0.08, 200, 0.82, '2026-01-01T00:00:00Z', 'deploy', 'abc123'
         )
         """
     )
@@ -51,10 +51,10 @@ def test_speed_snapshot_cooldown_per_site_strategy(conn):
         conn.execute(
             """
             INSERT INTO speed_snapshots (
-              site_id, date, strategy, lcp_ms, cls, tbt_ms, fcp_ms, field_lcp_pctl, field_cls_pctl, field_inp_pctl,
+              snapshot_id, site_id, created_at, strategy, lcp_ms, cls, tbt_ms, fcp_ms, field_lcp_pctl, field_cls_pctl, field_inp_pctl,
               performance_score, psi_fetch_time, trigger_reason, deploy_hash
             ) VALUES (
-              's1', 1735693200, 'mobile', 2300, 0.09, 140, 1200, 2550, 0.09, 220, 0.80, '2026-01-01T01:00:00Z', 'manual', 'abc123'
+              'snap_2', 's1', 1735693200000, 'mobile', 2300, 0.09, 140, 1200, 2550, 0.09, 220, 0.80, '2026-01-01T01:00:00Z', 'manual', 'abc123'
             )
             """
         )
@@ -70,20 +70,20 @@ def test_speed_delta_view_sets_warn_and_note(conn):
     conn.execute(
         """
         INSERT INTO speed_snapshots (
-          site_id, date, strategy, lcp_ms, cls, tbt_ms, fcp_ms, field_lcp_pctl, field_cls_pctl, field_inp_pctl,
+          snapshot_id, site_id, created_at, strategy, lcp_ms, cls, tbt_ms, fcp_ms, field_lcp_pctl, field_cls_pctl, field_inp_pctl,
           performance_score, psi_fetch_time, trigger_reason, deploy_hash
         ) VALUES (
-          's2', 1735689600, 'desktop', 1800, 0.05, 90, 1000, 2000, 0.05, 150, 0.91, '2026-01-01T00:00:00Z', 'deploy', 'abc111'
+          'snap_3', 's2', 1735689600000, 'desktop', 1800, 0.05, 90, 1000, 2000, 0.05, 150, 0.91, '2026-01-01T00:00:00Z', 'deploy', 'abc111'
         )
         """
     )
     conn.execute(
         """
         INSERT INTO speed_snapshots (
-          site_id, date, strategy, lcp_ms, cls, tbt_ms, fcp_ms, field_lcp_pctl, field_cls_pctl, field_inp_pctl,
+          snapshot_id, site_id, created_at, strategy, lcp_ms, cls, tbt_ms, fcp_ms, field_lcp_pctl, field_cls_pctl, field_inp_pctl,
           performance_score, psi_fetch_time, trigger_reason, deploy_hash
         ) VALUES (
-          's2', 1735736400, 'desktop', 2200, 0.09, 260, 1100, 2250, 0.09, 280, 0.80, '2026-01-01T13:00:00Z', 'deploy', 'abc123'
+          'snap_4', 's2', 1735736400000, 'desktop', 2200, 0.09, 260, 1100, 2250, 0.09, 280, 0.80, '2026-01-01T13:00:00Z', 'deploy', 'abc123'
         )
         """
     )

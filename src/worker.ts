@@ -2,6 +2,10 @@ export interface Env {
   DB: D1Database;
   PAGESPEED_API_KEY: string;
   WP_PLUGIN_SHARED_SECRET?: string;
+  TASK_AGENT_SIGNING_SECRET?: string;
+  MOZ_API_TOKEN?: string;
+  DECODO_API_KEY?: string;
+  DECODO_TASKS_URL?: string;
   APIFY_TOKEN?: string;
   APIFY_GOOGLE_ACTOR?: string;
   PROXY_CONTROL_SECRET?: string;
@@ -15,6 +19,9 @@ const SITE_SERP_RESULTS_CAP = 20;
 const SITE_MAX_URL_FETCHES_PER_DAY = 400;
 const SITE_MAX_BACKLINK_ENRICH_PER_DAY = 400;
 const SITE_MAX_GRAPH_DOMAINS_PER_DAY = 10;
+const TASK_MAX_CLAIM_MINUTES = 24 * 60;
+const MOZ_DEFAULT_COST_PER_1K_ROWS_USD = 5;
+const DECODO_DEFAULT_TASKS_URL = "https://scraper-api.decodo.com/v1/tasks";
 
 function nowMs(): number {
   return Date.now();
@@ -155,6 +162,30 @@ function safeJsonStringify(input: unknown, maxLen = 64000): string {
     return raw;
   }
   return raw.slice(0, maxLen);
+}
+
+function canonicalizeValue(input: unknown): unknown {
+  if (input == null) return null;
+  if (Array.isArray(input)) {
+    return input.map((value) => canonicalizeValue(value));
+  }
+  if (typeof input === "object") {
+    const source = parseJsonObject(input);
+    if (!source) return null;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(source).sort()) {
+      out[key] = canonicalizeValue(source[key]);
+    }
+    return out;
+  }
+  if (typeof input === "string" || typeof input === "number" || typeof input === "boolean") {
+    return input;
+  }
+  return String(input);
+}
+
+function canonicalJson(input: unknown): string {
+  return JSON.stringify(canonicalizeValue(input));
 }
 
 type JobStatus = "running" | "succeeded" | "failed" | "dead_letter";
@@ -356,6 +387,89 @@ function normalizeRegion(input: unknown): Record<string, unknown> {
   return next;
 }
 
+function normalizeSerpProvider(input: unknown): SerpProvider {
+  return cleanString(input, 40).toLowerCase() === "decodo_serp_api" ? "decodo_serp_api" : "headless_google";
+}
+
+function normalizePageProvider(input: unknown): PageProvider {
+  return cleanString(input, 40).toLowerCase() === "decodo_web_api" ? "decodo_web_api" : "direct_fetch";
+}
+
+function normalizeGeoProvider(input: unknown): GeoProvider {
+  return cleanString(input, 40).toLowerCase() === "decodo_geo" ? "decodo_geo" : "proxy_lease_pool";
+}
+
+async function loadSiteProviderProfile(env: Env, siteId: string): Promise<SiteProviderProfile> {
+  const row = await env.DB.prepare(
+    `SELECT site_id, serp_provider, page_provider, geo_provider, updated_at
+     FROM site_provider_profiles
+     WHERE site_id = ?
+     LIMIT 1`
+  )
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+  if (!row) {
+    const updatedAt = Math.floor(nowMs() / 1000);
+    await env.DB.prepare(
+      `INSERT INTO site_provider_profiles (
+        site_id, serp_provider, page_provider, geo_provider, updated_at
+      ) VALUES (?, 'headless_google', 'direct_fetch', 'proxy_lease_pool', ?)`
+    )
+      .bind(siteId, updatedAt)
+      .run();
+    return {
+      site_id: siteId,
+      serp_provider: "headless_google",
+      page_provider: "direct_fetch",
+      geo_provider: "proxy_lease_pool",
+      updated_at: updatedAt,
+    };
+  }
+  return {
+    site_id: cleanString(row.site_id, 120),
+    serp_provider: normalizeSerpProvider(row.serp_provider),
+    page_provider: normalizePageProvider(row.page_provider),
+    geo_provider: normalizeGeoProvider(row.geo_provider),
+    updated_at: clampInt(row.updated_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  };
+}
+
+async function upsertSiteProviderProfile(
+  env: Env,
+  input: { siteId: string; serpProvider: SerpProvider; pageProvider: PageProvider; geoProvider: GeoProvider }
+): Promise<SiteProviderProfile> {
+  const updatedAt = Math.floor(nowMs() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO site_provider_profiles (
+      site_id, serp_provider, page_provider, geo_provider, updated_at
+    ) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(site_id) DO UPDATE SET
+      serp_provider = excluded.serp_provider,
+      page_provider = excluded.page_provider,
+      geo_provider = excluded.geo_provider,
+      updated_at = excluded.updated_at`
+  )
+    .bind(input.siteId, input.serpProvider, input.pageProvider, input.geoProvider, updatedAt)
+    .run();
+  return await loadSiteProviderProfile(env, input.siteId);
+}
+
+function mapGeoForProvider(
+  geoLabel: string,
+  region: Record<string, unknown>,
+  geoProvider: GeoProvider
+): { region: Record<string, unknown>; decodoGeoLabel: string | null } {
+  const out = { ...region };
+  const isMetro = geoLabel.startsWith("metro:");
+  const metro = isMetro ? cleanString(geoLabel.slice("metro:".length), 160) : "";
+  if (geoProvider === "decodo_geo" && metro) {
+    out.city = metro;
+    out.region = metro;
+    return { region: out, decodoGeoLabel: metro };
+  }
+  return { region: out, decodoGeoLabel: null };
+}
+
 function buildGoogleQueryUrl(phrase: string, region: Record<string, unknown>): string {
   const q = new URL("https://www.google.com/search");
   q.searchParams.set("q", phrase);
@@ -425,6 +539,14 @@ function normalizeProxyGeo(value: unknown, maxLen = 80): string {
   return clean || "";
 }
 
+function formatProxyGeo(lease: ProxyLeaseRow): string | null {
+  const parts = [lease.metro_area, lease.region, lease.country]
+    .map((v) => cleanString(v, 120))
+    .filter(Boolean);
+  if (parts.length < 1) return null;
+  return parts.join(", ");
+}
+
 async function registerResidentialProxy(
   env: Env,
   payload: Record<string, unknown>
@@ -474,6 +596,19 @@ async function registerResidentialProxy(
       ts
     )
     .run();
+
+  const providerProfile = parseJsonObject(payload.provider_profile) ?? {};
+  const serpProviderInput = cleanString(providerProfile.serp_provider || payload.serp_provider, 40);
+  const pageProviderInput = cleanString(providerProfile.page_provider || payload.page_provider, 40);
+  const geoProviderInput = cleanString(providerProfile.geo_provider || payload.geo_provider, 40);
+  if (serpProviderInput || pageProviderInput || geoProviderInput) {
+    await upsertSiteProviderProfile(env, {
+      siteId,
+      serpProvider: normalizeSerpProvider(serpProviderInput),
+      pageProvider: normalizePageProvider(pageProviderInput),
+      geoProvider: normalizeGeoProvider(geoProviderInput),
+    });
+  }
 
   return {
     ok: true,
@@ -798,6 +933,151 @@ function parseSerpResultsFromApifyPayload(payload: unknown, maxResults: number):
   }));
 }
 
+function parseSerpResultsFromDecodoPayload(payload: unknown, maxResults: number): SerpResultRow[] {
+  const out: SerpResultRow[] = [];
+  const seen = new Set<string>();
+  const push = (raw: unknown, fallbackRank: number) => {
+    const row = parseOrganicCandidate(raw, fallbackRank);
+    if (!row) return;
+    if (seen.has(row.url)) return;
+    seen.add(row.url);
+    out.push(row);
+  };
+
+  const root = parseJsonObject(payload);
+  const candidateArrays: unknown[] = [];
+  if (Array.isArray(payload)) candidateArrays.push(payload);
+  if (root) {
+    if (Array.isArray(root.results)) candidateArrays.push(root.results);
+    if (Array.isArray(root.organic)) candidateArrays.push(root.organic);
+    if (Array.isArray(root.organic_results)) candidateArrays.push(root.organic_results);
+    if (Array.isArray(root.data)) candidateArrays.push(root.data);
+    const parsed = parseJsonObject(root.parsed);
+    if (parsed) {
+      if (Array.isArray(parsed.organic)) candidateArrays.push(parsed.organic);
+      if (Array.isArray(parsed.organic_results)) candidateArrays.push(parsed.organic_results);
+      if (Array.isArray(parsed.results)) candidateArrays.push(parsed.results);
+    }
+  }
+
+  for (const arrRaw of candidateArrays) {
+    const arr = Array.isArray(arrRaw) ? arrRaw : [];
+    for (const item of arr) {
+      if (out.length >= maxResults) break;
+      push(item, out.length + 1);
+    }
+    if (out.length >= maxResults) break;
+  }
+
+  out.sort((a, b) => a.rank - b.rank);
+  return out.slice(0, maxResults).map((row, idx) => ({ ...row, rank: idx + 1 }));
+}
+
+async function callDecodoTask(env: Env, payload: Record<string, unknown>): Promise<{ raw: string; parsed: unknown }> {
+  const token = cleanString(env.DECODO_API_KEY ?? "", 500);
+  if (!token) {
+    throw new Error("DECODO_API_KEY not configured");
+  }
+  const endpoint = cleanString(env.DECODO_TASKS_URL ?? "", 2000) || DECODO_DEFAULT_TASKS_URL;
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const rawErr = await res.text();
+    throw new Error(`Decodo request failed (${res.status}): ${rawErr.slice(0, 400)}`);
+  }
+  const raw = await res.text();
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("Decodo response parse failed: invalid JSON.");
+  }
+  return { raw, parsed };
+}
+
+async function fetchGoogleTop20ViaDecodo(
+  env: Env,
+  phrase: string,
+  region: Record<string, unknown>,
+  device: "mobile" | "desktop",
+  maxResults = SERP_MAX_RESULTS,
+  geoLabel: string | null = null
+): Promise<{
+  rows: SerpResultRow[];
+  provider: string;
+  actor: string;
+  runId: string | null;
+  rawPayloadSha256: string;
+}> {
+  const locale = cleanString(region.country, 2).toUpperCase() || "US";
+  const language = cleanString(region.language, 2).toLowerCase() || "en";
+  const taskPayload: Record<string, unknown> = {
+    target: "google_search",
+    parse: true,
+    query: phrase,
+    locale: `${language}-${locale}`,
+    device_type: device,
+    num: Math.max(1, Math.min(SERP_MAX_RESULTS, maxResults)),
+  };
+  if (geoLabel) {
+    taskPayload.geo = geoLabel;
+    taskPayload.location = geoLabel;
+  } else {
+    const city = cleanString(region.city, 120) || cleanString(region.region, 120);
+    if (city) taskPayload.location = city;
+  }
+  const decodo = await callDecodoTask(env, taskPayload);
+  const rows = parseSerpResultsFromDecodoPayload(decodo.parsed, maxResults);
+  const root = parseJsonObject(decodo.parsed) ?? {};
+  return {
+    rows,
+    provider: "decodo-serp-api",
+    actor: "decodo/google_search",
+    runId: cleanString(root.task_id ?? root.id, 200) || null,
+    rawPayloadSha256: await sha256Hex(decodo.raw),
+  };
+}
+
+async function fetchPageViaDecodo(
+  env: Env,
+  input: { url: string; geoLabel: string | null; timeoutMs?: number }
+): Promise<{ html: string | null; markdown: string | null; rawPayloadSha256: string; taskId: string | null }> {
+  const taskPayload: Record<string, unknown> = {
+    target: "web",
+    parse: true,
+    url: input.url,
+    output_format: "html",
+  };
+  if (input.geoLabel) {
+    taskPayload.geo = input.geoLabel;
+    taskPayload.location = input.geoLabel;
+  }
+  const decodo = await callDecodoTask(env, taskPayload);
+  const root = parseJsonObject(decodo.parsed) ?? {};
+  const dataObj = parseJsonObject(root.data) ?? root;
+  const html =
+    cleanString(dataObj.html, 3_000_000) ||
+    cleanString(dataObj.content, 3_000_000) ||
+    cleanString(root.html, 3_000_000) ||
+    null;
+  const markdown =
+    cleanString(dataObj.markdown, 3_000_000) ||
+    cleanString(root.markdown, 3_000_000) ||
+    null;
+  return {
+    html,
+    markdown,
+    rawPayloadSha256: await sha256Hex(decodo.raw),
+    taskId: cleanString(root.task_id ?? root.id, 200) || null,
+  };
+}
+
 async function fetchGoogleTop20ViaApify(
   env: Env,
   phrase: string,
@@ -1009,6 +1289,10 @@ type SerpCollectionInput = {
   device: "mobile" | "desktop";
   maxResults: number;
   proxyUrl: string | null;
+  provider: SerpProvider;
+  geoProvider: GeoProvider;
+  geoLabel?: string | null;
+  auditJobId?: string | null;
 };
 
 type SerpCollectionResult =
@@ -1021,6 +1305,8 @@ type SerpCollectionResult =
       actor: string;
       runId: string | null;
       rawPayloadSha256: string;
+      extractorMode: "decodo_serp_api" | "apify";
+      fallbackReason: string | null;
     }
   | {
       ok: false;
@@ -1036,6 +1322,11 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
   const deviceKey = input.device;
   const serpKey = await buildSerpKey(keywordNorm, regionKey, deviceKey, toDateYYYYMMDD(nowMs()));
 
+  const actor =
+    input.provider === "decodo_serp_api"
+      ? "decodo/google_search"
+      : cleanString(env.APIFY_GOOGLE_ACTOR ?? "apify/google-search-scraper", 200);
+  const providerLabel = input.provider === "decodo_serp_api" ? "decodo-serp-api" : "apify-headless-chrome";
   await insertSerpRun(env, {
     serpId,
     userId: input.userId,
@@ -1043,8 +1334,8 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
     regionJson,
     device: input.device,
     engine: "google",
-    provider: "apify-headless-chrome",
-    actor: cleanString(env.APIFY_GOOGLE_ACTOR ?? "apify/google-search-scraper", 200),
+    provider: providerLabel,
+    actor,
     runId: null,
     status: "pending",
     error: null,
@@ -1052,24 +1343,78 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
     regionKey,
     deviceKey,
     serpKey,
-    parserVersion: "apify-google-v1",
+    parserVersion: input.provider === "decodo_serp_api" ? "decodo-google-v1" : "apify-google-v1",
     rawPayloadSha256: null,
-    extractorMode: "apify",
+    extractorMode: input.provider === "decodo_serp_api" ? "decodo_serp_api" : "apify",
   });
 
   try {
-    const collected = await fetchGoogleTop20ViaApify(
-      env,
-      input.phrase,
-      input.region,
-      input.device,
-      input.maxResults,
-      input.proxyUrl
-    );
+    let collected:
+      | {
+          rows: SerpResultRow[];
+          provider: string;
+          actor: string;
+          runId: string | null;
+          rawPayloadSha256: string;
+          extractorMode: "decodo_serp_api" | "apify";
+          fallbackReason: string | null;
+        }
+      | null = null;
+
+    if (input.provider === "decodo_serp_api") {
+      try {
+        const decodo = await fetchGoogleTop20ViaDecodo(
+          env,
+          input.phrase,
+          input.region,
+          input.device,
+          input.maxResults,
+          input.geoProvider === "decodo_geo" ? cleanString(input.geoLabel, 120) || null : null
+        );
+        collected = {
+          ...decodo,
+          extractorMode: "decodo_serp_api",
+          fallbackReason: null,
+        };
+      } catch (decodoError) {
+        const fallbackReason = `decodo_failed:${cleanString((decodoError as Error)?.message ?? decodoError, 180)}`;
+        const apify = await fetchGoogleTop20ViaApify(
+          env,
+          input.phrase,
+          input.region,
+          input.device,
+          input.maxResults,
+          input.proxyUrl
+        );
+        collected = {
+          ...apify,
+          extractorMode: "apify",
+          fallbackReason,
+        };
+      }
+    } else {
+      const apify = await fetchGoogleTop20ViaApify(
+        env,
+        input.phrase,
+        input.region,
+        input.device,
+        input.maxResults,
+        input.proxyUrl
+      );
+      collected = {
+        ...apify,
+        extractorMode: "apify",
+        fallbackReason: null,
+      };
+    }
+
+    if (!collected) {
+      throw new Error("serp_provider_unavailable");
+    }
     if (collected.rows.length < 1) {
       await updateSerpRunStatus(env, serpId, "error", "no_results", collected.runId, {
-        parserVersion: "apify-google-v1",
-        extractorMode: "apify",
+        parserVersion: collected.extractorMode === "decodo_serp_api" ? "decodo-google-v1" : "apify-google-v1",
+        extractorMode: collected.extractorMode,
       });
       return {
         ok: false,
@@ -1080,10 +1425,25 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
 
     await insertSerpResults(env, serpId, collected.rows);
     await updateSerpRunStatus(env, serpId, "ok", null, collected.runId, {
-      parserVersion: "apify-google-v1",
+      parserVersion: collected.extractorMode === "decodo_serp_api" ? "decodo-google-v1" : "apify-google-v1",
       rawPayloadSha256: collected.rawPayloadSha256,
-      extractorMode: "apify",
+      extractorMode: collected.extractorMode,
     });
+    if (input.auditJobId) {
+      await createArtifactRecord(env, {
+        jobId: input.auditJobId,
+        kind: "serp.provider.audit",
+        payload: {
+          serp_id: serpId,
+          provider: collected.provider,
+          actor: collected.actor,
+          extractor_mode: collected.extractorMode,
+          fallback_reason: collected.fallbackReason,
+          geo_label: cleanString(input.geoLabel, 120) || null,
+          raw_payload_sha256: collected.rawPayloadSha256,
+        },
+      });
+    }
     return {
       ok: true,
       serpId,
@@ -1093,6 +1453,8 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
       actor: collected.actor,
       runId: collected.runId,
       rawPayloadSha256: collected.rawPayloadSha256,
+      extractorMode: collected.extractorMode,
+      fallbackReason: collected.fallbackReason,
     };
   } catch (error) {
     const message = String((error as Error)?.message ?? error).slice(0, 500);
@@ -1199,6 +1561,18 @@ type Step1SiteRecord = {
   updated_at: number;
 };
 
+type SerpProvider = "decodo_serp_api" | "headless_google";
+type PageProvider = "decodo_web_api" | "direct_fetch";
+type GeoProvider = "decodo_geo" | "proxy_lease_pool";
+
+type SiteProviderProfile = {
+  site_id: string;
+  serp_provider: SerpProvider;
+  page_provider: PageProvider;
+  geo_provider: GeoProvider;
+  updated_at: number;
+};
+
 type Step1SemrushMetric = {
   keyword: string;
   volume_us: number;
@@ -1266,6 +1640,768 @@ function parseStringArray(input: unknown, maxItems = 200, maxLen = 300): string[
     if (out.length >= maxItems) break;
   }
   return out;
+}
+
+function parseStringListInput(input: unknown, maxItems = 200, maxLen = 300): string[] {
+  if (Array.isArray(input)) {
+    return parseStringArray(input, maxItems, maxLen);
+  }
+  const asString = cleanString(input, maxItems * maxLen);
+  if (!asString) return [];
+  return parseStringArray(
+    asString.split(",").map((value) => cleanString(value, maxLen)).filter(Boolean),
+    maxItems,
+    maxLen
+  );
+}
+
+function normalizeDayString(input: unknown): string {
+  const raw = cleanString(input, 20);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  return toDateYYYYMMDD(nowMs());
+}
+
+function parseMozGeoKey(input: unknown): string {
+  const raw = cleanString(input, 120).toLowerCase();
+  return raw || "us";
+}
+
+async function getOrCreateUrlId(env: Env, rawUrl: string): Promise<string | null> {
+  const url = cleanString(rawUrl, 2000);
+  if (!url) return null;
+  const domain = normalizeDomain(url);
+  if (!domain) return null;
+  const urlHash = await sha256Hex(url.toLowerCase());
+  const existing = await env.DB.prepare(
+    `SELECT id FROM urls WHERE url_hash = ? LIMIT 1`
+  )
+    .bind(urlHash)
+    .first<Record<string, unknown>>();
+  if (existing) {
+    return cleanString(existing.id, 120) || null;
+  }
+  const urlId = uuid("url");
+  await env.DB.prepare(
+    `INSERT INTO urls (id, url, url_hash, domain, created_at) VALUES (?, ?, ?, ?, ?)`
+  )
+    .bind(urlId, url, urlHash, domain, Math.floor(nowMs() / 1000))
+    .run();
+  return urlId;
+}
+
+function estimateMozRowBudget(input: {
+  keywords?: number;
+  daily_new_entrants?: number;
+  daily_top_movers?: number;
+  baseline_mode?: "light" | "fuller";
+  cost_per_1k_rows_usd?: number;
+}): {
+  assumptions: Record<string, number | string>;
+  daily_rows: number;
+  weekly_rows: number;
+  monthly_baseline_rows: number;
+  daily_cost_usd: number;
+  weekly_cost_usd: number;
+  monthly_baseline_cost_usd: number;
+} {
+  const keywords = clampInt(input.keywords, 1, 500, SITE_KEYWORD_CAP);
+  const newEntrants = clampInt(input.daily_new_entrants, 0, 5000, 0);
+  const topMovers = clampInt(input.daily_top_movers, 0, 5000, 0);
+  const baselineMode = input.baseline_mode === "fuller" ? "fuller" : "light";
+  const costPer1k = Math.max(0, Number(input.cost_per_1k_rows_usd ?? MOZ_DEFAULT_COST_PER_1K_ROWS_USD) || 0);
+
+  const dailyTop5Rows = keywords * 5;
+  const dailyRows = dailyTop5Rows + newEntrants + topMovers;
+
+  const weeklyTopUrls = keywords * 3;
+  const weeklyAnchorRows = weeklyTopUrls * 20;
+  const weeklyRootDomainRows = weeklyTopUrls * 50;
+  const weeklyRows = weeklyAnchorRows + weeklyRootDomainRows;
+
+  const baselineRows = baselineMode === "fuller" ? 1100 : 400;
+
+  const cost = (rows: number) => Number(((rows / 1000) * costPer1k).toFixed(4));
+  return {
+    assumptions: {
+      keywords,
+      daily_top5_rows: dailyTop5Rows,
+      daily_new_entrants: newEntrants,
+      daily_top_movers: topMovers,
+      weekly_tracked_top_urls: weeklyTopUrls,
+      cost_per_1k_rows_usd: costPer1k,
+      baseline_mode: baselineMode,
+    },
+    daily_rows: dailyRows,
+    weekly_rows: weeklyRows,
+    monthly_baseline_rows: baselineRows,
+    daily_cost_usd: cost(dailyRows),
+    weekly_cost_usd: cost(weeklyRows),
+    monthly_baseline_cost_usd: cost(baselineRows),
+  };
+}
+
+type MozProfileName = "single_site_max" | "scalable_delta";
+
+type MozSiteProfile = {
+  site_id: string;
+  moz_profile: MozProfileName;
+  monthly_rows_budget: number;
+  weekly_focus_url_count: number;
+  daily_keyword_depth: number;
+  updated_at: number;
+};
+
+type MozExecutionPlan = {
+  profile: MozProfileName;
+  date: string;
+  remaining_rows: number;
+  projected_rows: number;
+  degraded_mode: boolean;
+  fallback_reason: string | null;
+  daily: {
+    keyword_depth: number;
+    url_metrics_rows: number;
+    competitor_target_urls: number;
+    linking_root_domains_rows_per_target: number;
+    anchor_rows_per_target: number;
+    linking_root_domains_rows: number;
+    anchor_rows: number;
+  };
+  weekly: {
+    enabled: boolean;
+    competitor_focus_urls: number;
+    run_link_intersect: boolean;
+  };
+  monthly: {
+    baseline_enabled: boolean;
+    reason: string;
+  };
+};
+
+async function loadMozSiteProfile(env: Env, siteId: string): Promise<MozSiteProfile> {
+  const row = await env.DB.prepare(
+    `SELECT
+      site_id, moz_profile, monthly_rows_budget, weekly_focus_url_count, daily_keyword_depth, updated_at
+     FROM moz_site_profiles
+     WHERE site_id = ?
+     LIMIT 1`
+  )
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+
+  if (!row) {
+    const ts = Math.floor(nowMs() / 1000);
+    await env.DB.prepare(
+      `INSERT INTO moz_site_profiles (
+        site_id, moz_profile, monthly_rows_budget, weekly_focus_url_count, daily_keyword_depth, updated_at
+      ) VALUES (?, 'single_site_max', 15000, 20, 20, ?)`
+    )
+      .bind(siteId, ts)
+      .run();
+    return {
+      site_id: siteId,
+      moz_profile: "single_site_max",
+      monthly_rows_budget: 15000,
+      weekly_focus_url_count: 20,
+      daily_keyword_depth: 20,
+      updated_at: ts,
+    };
+  }
+
+  return {
+    site_id: cleanString(row.site_id, 120),
+    moz_profile:
+      cleanString(row.moz_profile, 30) === "scalable_delta" ? "scalable_delta" : "single_site_max",
+    monthly_rows_budget: clampInt(row.monthly_rows_budget, 0, 100_000_000, 15_000),
+    weekly_focus_url_count: clampInt(row.weekly_focus_url_count, 1, 500, 20),
+    daily_keyword_depth: clampInt(row.daily_keyword_depth, 1, 20, 20),
+    updated_at: clampInt(row.updated_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  };
+}
+
+async function upsertMozSiteProfile(
+  env: Env,
+  input: {
+    siteId: string;
+    mozProfile: MozProfileName;
+    monthlyRowsBudget: number;
+    weeklyFocusUrlCount: number;
+    dailyKeywordDepth: number;
+  }
+): Promise<MozSiteProfile> {
+  const ts = Math.floor(nowMs() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO moz_site_profiles (
+      site_id, moz_profile, monthly_rows_budget, weekly_focus_url_count, daily_keyword_depth, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(site_id) DO UPDATE SET
+      moz_profile = excluded.moz_profile,
+      monthly_rows_budget = excluded.monthly_rows_budget,
+      weekly_focus_url_count = excluded.weekly_focus_url_count,
+      daily_keyword_depth = excluded.daily_keyword_depth,
+      updated_at = excluded.updated_at`
+  )
+    .bind(
+      input.siteId,
+      input.mozProfile,
+      Math.max(0, input.monthlyRowsBudget),
+      Math.max(1, input.weeklyFocusUrlCount),
+      Math.max(1, Math.min(20, input.dailyKeywordDepth)),
+      ts
+    )
+    .run();
+  return await loadMozSiteProfile(env, input.siteId);
+}
+
+async function recordMozJobUsage(
+  env: Env,
+  input: {
+    siteId: string | null;
+    day: string;
+    jobId: string;
+    jobType: string;
+    rowsUsed: number;
+    degradedMode: boolean;
+    fallbackReason: string | null;
+    profile: MozProfileName | null;
+  }
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO moz_job_row_usage (
+      usage_id, site_id, collected_day, job_id, job_type, rows_used,
+      degraded_mode, fallback_reason, profile, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      uuid("mozusage"),
+      cleanString(input.siteId, 120) || null,
+      input.day,
+      cleanString(input.jobId, 120),
+      cleanString(input.jobType, 80),
+      Math.max(0, input.rowsUsed),
+      input.degradedMode ? 1 : 0,
+      cleanString(input.fallbackReason, 200) || null,
+      input.profile,
+      Math.floor(nowMs() / 1000)
+    )
+    .run();
+}
+
+async function loadMozMonthlyUsage(env: Env, siteId: string, monthPrefix: string): Promise<number> {
+  const internal = await env.DB.prepare(
+    `SELECT SUM(rows_used) AS total_rows
+     FROM moz_job_row_usage
+     WHERE site_id = ?
+       AND collected_day LIKE ?`
+  )
+    .bind(siteId, `${monthPrefix}%`)
+    .first<Record<string, unknown>>();
+  const provider = await env.DB.prepare(
+    `SELECT MAX(rows_used) AS max_rows_used
+     FROM moz_usage_snapshots
+     WHERE collected_day LIKE ?`
+  )
+    .bind(`${monthPrefix}%`)
+    .first<Record<string, unknown>>();
+  return Math.max(0, clampInt(internal?.total_rows, 0, 10_000_000_000, 0)) + Math.max(
+    0,
+    clampInt(provider?.max_rows_used, 0, 10_000_000_000, 0)
+  );
+}
+
+async function loadCompetitorFocusUrlCount(
+  env: Env,
+  input: { siteId: string; day: string; desired: number }
+): Promise<number> {
+  const rows = await env.DB.prepare(
+    `SELECT r.url, COUNT(*) AS c
+     FROM step2_serp_results r
+     JOIN step2_serp_snapshots s ON s.serp_id = r.serp_id
+     WHERE s.site_id = ?
+       AND s.date_yyyymmdd = ?
+       AND r.rank <= 5
+     GROUP BY r.url
+     ORDER BY c DESC, MIN(r.rank) ASC
+     LIMIT ?`
+  )
+    .bind(input.siteId, input.day, Math.max(1, input.desired))
+    .all<Record<string, unknown>>();
+  return (rows.results ?? []).length;
+}
+
+async function shouldRunMonthlyMozBaseline(
+  env: Env,
+  input: { day: string }
+): Promise<{ enabled: boolean; reason: string }> {
+  if (!input.day.endsWith("-01")) {
+    return { enabled: false, reason: "not_month_boundary" };
+  }
+  const row = await env.DB.prepare(
+    `SELECT index_updated_at, metadata_json
+     FROM moz_index_metadata_snapshots
+     ORDER BY created_at DESC
+     LIMIT 1`
+  ).first<Record<string, unknown>>();
+  if (!row) return { enabled: true, reason: "no_index_metadata_snapshot" };
+  const metadata = safeJsonParseObject(cleanString(row.metadata_json, 64000)) ?? {};
+  if (parseBoolUnknown(metadata.major_refresh, false)) {
+    return { enabled: true, reason: "major_refresh_flag" };
+  }
+  return { enabled: true, reason: "monthly_cycle" };
+}
+
+async function buildMozExecutionPlan(
+  env: Env,
+  input: { siteId: string; day: string; profile: MozSiteProfile; isWeekly: boolean }
+): Promise<MozExecutionPlan> {
+  const monthPrefix = input.day.slice(0, 7);
+  const monthlyUsed = await loadMozMonthlyUsage(env, input.siteId, monthPrefix);
+  const budget = Math.max(0, input.profile.monthly_rows_budget);
+  const remaining = Math.max(0, budget - monthlyUsed);
+
+  let keywordDepth = input.profile.daily_keyword_depth;
+  let rdPerTarget = 50;
+  let anchorPerTarget = 20;
+  let intersectEnabled = input.isWeekly;
+  let fallbackReason: string | null = null;
+
+  const computeProjected = () => {
+    const urlMetricsRows = SITE_KEYWORD_CAP * keywordDepth;
+    const competitorTargetUrls = Math.max(1, Math.min(200, SITE_KEYWORD_CAP * 10));
+    const linkingRows = competitorTargetUrls * rdPerTarget;
+    const anchorRows = competitorTargetUrls * anchorPerTarget;
+    const dailyRows = urlMetricsRows + linkingRows + anchorRows;
+    const weeklyRows = intersectEnabled ? Math.max(1, input.profile.weekly_focus_url_count) : 0;
+    return { urlMetricsRows, competitorTargetUrls, linkingRows, anchorRows, dailyRows, weeklyRows };
+  };
+
+  let projected = computeProjected();
+  const totalNeeded = () => projected.dailyRows + projected.weeklyRows;
+
+  if (totalNeeded() > remaining) {
+    fallbackReason = "moz_budget_exhausted";
+    keywordDepth = keywordDepth >= 20 ? 10 : keywordDepth;
+    projected = computeProjected();
+  }
+  if (totalNeeded() > remaining) {
+    keywordDepth = Math.min(keywordDepth, 5);
+    projected = computeProjected();
+  }
+  if (totalNeeded() > remaining) {
+    rdPerTarget = 25;
+    projected = computeProjected();
+  }
+  if (totalNeeded() > remaining) {
+    anchorPerTarget = 10;
+    projected = computeProjected();
+  }
+  if (totalNeeded() > remaining) {
+    intersectEnabled = false;
+    projected = computeProjected();
+  }
+
+  const focusCount = await loadCompetitorFocusUrlCount(env, {
+    siteId: input.siteId,
+    day: input.day,
+    desired: input.profile.weekly_focus_url_count,
+  });
+  const monthly = await shouldRunMonthlyMozBaseline(env, { day: input.day });
+  return {
+    profile: input.profile.moz_profile,
+    date: input.day,
+    remaining_rows: remaining,
+    projected_rows: projected.dailyRows + projected.weeklyRows,
+    degraded_mode: !!fallbackReason,
+    fallback_reason: fallbackReason,
+    daily: {
+      keyword_depth: keywordDepth,
+      url_metrics_rows: SITE_KEYWORD_CAP * keywordDepth,
+      competitor_target_urls: projected.competitorTargetUrls,
+      linking_root_domains_rows_per_target: rdPerTarget,
+      anchor_rows_per_target: anchorPerTarget,
+      linking_root_domains_rows: projected.linkingRows,
+      anchor_rows: projected.anchorRows,
+    },
+    weekly: {
+      enabled: input.isWeekly,
+      competitor_focus_urls: focusCount || input.profile.weekly_focus_url_count,
+      run_link_intersect: intersectEnabled && (focusCount || input.profile.weekly_focus_url_count) > 0,
+    },
+    monthly: {
+      baseline_enabled: monthly.enabled,
+      reason: monthly.reason,
+    },
+  };
+}
+
+async function runMozProfileForSite(
+  env: Env,
+  input: {
+    site: Step1SiteRecord;
+    day: string;
+    isWeekly: boolean;
+    trigger: "step2" | "cron" | "manual";
+  }
+): Promise<Record<string, unknown>> {
+  const profile = await loadMozSiteProfile(env, input.site.site_id);
+  const plan = await buildMozExecutionPlan(env, {
+    siteId: input.site.site_id,
+    day: input.day,
+    profile,
+    isWeekly: input.isWeekly,
+  });
+
+  const mozPlanJob = await createJobRecord(env, {
+    siteId: input.site.site_id,
+    type: "moz_profile_run",
+    request: {
+      profile: plan.profile,
+      date: plan.date,
+      trigger: input.trigger,
+      plan,
+    },
+  });
+  await createArtifactRecord(env, {
+    jobId: mozPlanJob,
+    kind: "moz.profile.plan",
+    payload: {
+      site_id: input.site.site_id,
+      trigger: input.trigger,
+      plan,
+      fallback_reason: plan.fallback_reason,
+    },
+  });
+
+  const plannedRows = plan.projected_rows;
+  await recordMozJobUsage(env, {
+    siteId: input.site.site_id,
+    day: input.day,
+    jobId: mozPlanJob,
+    jobType: "moz_profile_run",
+    rowsUsed: plannedRows,
+    degradedMode: plan.degraded_mode,
+    fallbackReason: plan.fallback_reason,
+    profile: profile.moz_profile,
+  });
+  await finalizeJobSuccess(env, mozPlanJob, Math.max(1, plannedRows));
+  return {
+    site_id: input.site.site_id,
+    profile: profile.moz_profile,
+    plan,
+    job_id: mozPlanJob,
+  };
+}
+
+type MarketplaceTaskSpec = {
+  title: string;
+  description: string;
+  platform: string;
+  issuer_wallet: string;
+  required_profile_fields: string[];
+  required_media_hashes: Record<string, string>;
+  verification_rules: Record<string, unknown>;
+  payout: {
+    amount: string;
+    token: string;
+    chain: string | null;
+  };
+  deadline_at: number;
+  metadata: Record<string, unknown>;
+};
+
+type MarketplaceEvidenceBundle = {
+  urls: string[];
+  fields: Record<string, string>;
+  screenshots: string[];
+  trace_ref: string | null;
+};
+
+type MarketplaceVerificationResult = {
+  task_id: string;
+  evidence_id: string;
+  passed: boolean;
+  checked_at: number;
+  diffs: Array<{
+    rule: string;
+    path: string;
+    expected: string;
+    actual: string;
+    pass: boolean;
+    message: string;
+  }>;
+};
+
+function getTaskSigningSecret(env: Env): string | null {
+  const direct = cleanString(env.TASK_AGENT_SIGNING_SECRET, 500);
+  if (direct) return direct;
+  const fallback = cleanString(env.WP_PLUGIN_SHARED_SECRET, 500);
+  if (fallback) return fallback;
+  return null;
+}
+
+async function signAgentPayload(env: Env, payload: string): Promise<string | null> {
+  const secret = getTaskSigningSecret(env);
+  if (!secret) return null;
+  return await hmacSha256Hex(secret, payload);
+}
+
+function pickIdempotencyKey(req: Request, body: Record<string, unknown>): string {
+  const fromHeader = cleanString(req.headers.get("idempotency-key"), 200);
+  if (fromHeader) return fromHeader;
+  return cleanString(body.idempotency_key, 200);
+}
+
+async function fetchIdempotencyRecord(
+  env: Env,
+  key: string,
+  endpoint: string
+): Promise<Record<string, unknown> | null> {
+  return await env.DB.prepare(
+    `SELECT idempotency_key, endpoint, request_hash, response_status, response_json, created_at
+     FROM task_idempotency_keys
+     WHERE endpoint = ? AND idempotency_key = ?
+     LIMIT 1`
+  )
+    .bind(endpoint, key)
+    .first<Record<string, unknown>>();
+}
+
+async function saveIdempotencyRecord(
+  env: Env,
+  input: {
+    key: string;
+    endpoint: string;
+    requestHash: string;
+    responseStatus: number;
+    responseBody: unknown;
+  }
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO task_idempotency_keys (
+      idempotency_key, endpoint, request_hash, response_status, response_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(endpoint, idempotency_key) DO UPDATE SET
+      request_hash = excluded.request_hash,
+      response_status = excluded.response_status,
+      response_json = excluded.response_json`
+  )
+    .bind(
+      input.key,
+      input.endpoint,
+      input.requestHash,
+      input.responseStatus,
+      safeJsonStringify(input.responseBody, 32000),
+      nowMs()
+    )
+    .run();
+}
+
+async function resolveIdempotency(
+  env: Env,
+  req: Request,
+  endpoint: string,
+  body: Record<string, unknown>,
+  options: { required: boolean }
+): Promise<
+  | { ok: false; response: Response }
+  | { ok: true; key: string; requestHash: string; replayResponse: Response | null }
+> {
+  const idempotencyKey = pickIdempotencyKey(req, body);
+  if (!idempotencyKey) {
+    if (options.required) {
+      return {
+        ok: false,
+        response: Response.json({ ok: false, error: "idempotency_key_required" }, { status: 400 }),
+      };
+    }
+    return { ok: true, key: "", requestHash: "", replayResponse: null };
+  }
+  const requestHash = await sha256Hex(`${endpoint}|${canonicalJson(body)}`);
+  const existing = await fetchIdempotencyRecord(env, idempotencyKey, endpoint);
+  if (existing) {
+    const existingHash = cleanString(existing.request_hash, 1000);
+    if (existingHash && !safeEqualHex(existingHash, requestHash)) {
+      return {
+        ok: false,
+        response: Response.json({ ok: false, error: "idempotency_key_conflict" }, { status: 409 }),
+      };
+    }
+    const status = clampInt(existing.response_status, 100, 599, 200);
+    const raw = cleanString(existing.response_json, 64000);
+    const parsed = safeJsonParseObject(raw) ?? {};
+    return {
+      ok: true,
+      key: idempotencyKey,
+      requestHash,
+      replayResponse: Response.json(parsed, {
+        status,
+        headers: { "x-idempotent-replay": "1" },
+      }),
+    };
+  }
+  return { ok: true, key: idempotencyKey, requestHash, replayResponse: null };
+}
+
+async function writeTaskAuditLog(
+  env: Env,
+  input: {
+    taskId: string;
+    eventType: string;
+    actorWallet: string | null;
+    payload: unknown;
+  }
+): Promise<void> {
+  const payloadJson = canonicalJson(input.payload);
+  const payloadHash = await sha256Hex(payloadJson);
+  await env.DB.prepare(
+    `INSERT INTO task_audit_log (
+      event_id, task_id, event_type, actor_wallet, payload_json, payload_hash, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      uuid("taudit"),
+      input.taskId,
+      cleanString(input.eventType, 80),
+      cleanString(input.actorWallet, 200) || null,
+      payloadJson,
+      payloadHash,
+      nowMs()
+    )
+    .run();
+}
+
+function normalizeTaskSpec(input: Record<string, unknown>): MarketplaceTaskSpec {
+  const payoutRaw = parseJsonObject(input.payout) ?? {};
+  const metadataRaw = parseJsonObject(input.metadata) ?? {};
+  const requiredMediaHashes = parseJsonObject(input.required_media_hashes) ?? {};
+  const normalizedMediaHashes: Record<string, string> = {};
+  for (const [key, value] of Object.entries(requiredMediaHashes)) {
+    const mediaKey = cleanString(key, 80).toLowerCase();
+    const mediaHash = cleanString(value, 200).toLowerCase();
+    if (!mediaKey || !mediaHash) continue;
+    normalizedMediaHashes[mediaKey] = mediaHash;
+  }
+  return {
+    title: cleanString(input.title, 200),
+    description: cleanString(input.description, 3000),
+    platform: cleanString(input.platform, 80).toLowerCase(),
+    issuer_wallet: cleanString(input.issuer_wallet ?? input.wallet, 200).toLowerCase(),
+    required_profile_fields: parseStringArray(input.required_profile_fields, 200, 120),
+    required_media_hashes: normalizedMediaHashes,
+    verification_rules: parseJsonObject(input.verification_rules) ?? {},
+    payout: {
+      amount: cleanString(payoutRaw.amount, 80),
+      token: cleanString(payoutRaw.token, 80).toUpperCase(),
+      chain: cleanString(payoutRaw.chain, 80) || null,
+    },
+    deadline_at: clampInt(input.deadline_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    metadata: metadataRaw,
+  };
+}
+
+function validateTaskSpec(spec: MarketplaceTaskSpec): string | null {
+  if (!spec.title) return "title_required";
+  if (!spec.platform) return "platform_required";
+  if (!spec.issuer_wallet) return "issuer_wallet_required";
+  if (!spec.payout.amount || !spec.payout.token) return "payout_required";
+  if (!spec.deadline_at) return "deadline_at_required";
+  if (spec.deadline_at <= nowMs()) return "deadline_must_be_in_future";
+  return null;
+}
+
+function normalizeEvidenceBundle(input: Record<string, unknown>): MarketplaceEvidenceBundle {
+  const fieldsRaw = parseJsonObject(input.fields ?? input.structured_fields) ?? {};
+  const fields: Record<string, string> = {};
+  for (const [key, value] of Object.entries(fieldsRaw)) {
+    const cleanKey = cleanString(key, 160);
+    const cleanValue = cleanString(value, 4000);
+    if (!cleanKey || !cleanValue) continue;
+    fields[cleanKey] = cleanValue;
+  }
+  return {
+    urls: parseStringArray(input.urls, 200, 2000),
+    fields,
+    screenshots: parseStringArray(input.screenshots ?? input.screenshot_refs, 200, 1000),
+    trace_ref: cleanString(input.trace_ref, 1000) || null,
+  };
+}
+
+async function evaluateEvidenceAgainstSpec(
+  taskId: string,
+  spec: MarketplaceTaskSpec,
+  evidenceId: string,
+  evidence: MarketplaceEvidenceBundle
+): Promise<MarketplaceVerificationResult> {
+  const diffs: MarketplaceVerificationResult["diffs"] = [];
+  const add = (
+    rule: string,
+    path: string,
+    expected: string,
+    actual: string,
+    pass: boolean,
+    message: string
+  ) => {
+    diffs.push({ rule, path, expected, actual, pass, message });
+  };
+
+  for (const field of spec.required_profile_fields) {
+    const actual = cleanString(evidence.fields[field], 4000);
+    const pass = actual.length > 0;
+    add("required_profile_field", `fields.${field}`, "non_empty", actual || "<missing>", pass, pass ? "ok" : "missing");
+  }
+
+  for (const [mediaKey, mediaHash] of Object.entries(spec.required_media_hashes)) {
+    const evidenceKey = `media_hash.${mediaKey}`;
+    const actual = cleanString(evidence.fields[evidenceKey], 300).toLowerCase();
+    const pass = !!actual && safeEqualHex(actual, mediaHash.toLowerCase());
+    add(
+      "required_media_hash",
+      `fields.${evidenceKey}`,
+      mediaHash.toLowerCase(),
+      actual || "<missing>",
+      pass,
+      pass ? "ok" : "hash_mismatch"
+    );
+  }
+
+  const rules = parseJsonObject(spec.verification_rules) ?? {};
+  const minScreenshots = clampInt(rules.min_screenshots, 0, 200, 0);
+  if (minScreenshots > 0) {
+    const pass = evidence.screenshots.length >= minScreenshots;
+    add(
+      "min_screenshots",
+      "screenshots.length",
+      String(minScreenshots),
+      String(evidence.screenshots.length),
+      pass,
+      pass ? "ok" : "insufficient_screenshots"
+    );
+  }
+
+  const requireTrace = parseBoolUnknown(rules.require_trace, false);
+  if (requireTrace) {
+    const pass = !!evidence.trace_ref;
+    add("require_trace", "trace_ref", "present", evidence.trace_ref || "<missing>", pass, pass ? "ok" : "missing_trace_ref");
+  }
+
+  const deadlinePass = nowMs() <= spec.deadline_at;
+  add(
+    "deadline_window",
+    "deadline_at",
+    `<=${spec.deadline_at}`,
+    String(nowMs()),
+    deadlinePass,
+    deadlinePass ? "ok" : "evidence_after_deadline"
+  );
+
+  const passed = diffs.every((row) => row.pass);
+  return {
+    task_id: taskId,
+    evidence_id: evidenceId,
+    passed,
+    checked_at: nowMs(),
+    diffs,
+  };
 }
 
 function parseTopPages(input: unknown): Array<{ url: string; title: string; h1: string; meta: string }> {
@@ -1340,6 +2476,11 @@ function normalizeSiteUpsertPayload(payload: Record<string, unknown>): Record<st
     plan: {
       metro_proxy: parseBoolUnknown(plan.metro_proxy, false),
       metro: cleanString(plan.metro, 120) || null,
+    },
+    provider_profile: {
+      serp_provider: normalizeSerpProvider(payload.serp_provider ?? plan.serp_provider),
+      page_provider: normalizePageProvider(payload.page_provider ?? plan.page_provider),
+      geo_provider: normalizeGeoProvider(payload.geo_provider ?? plan.geo_provider),
     },
     signals: {
       detected_phone: cleanString(signals.detected_phone, 80) || null,
@@ -1709,6 +2850,15 @@ function parseSiteIdFromPath(pathname: string, suffix: string): string | null {
   if (!pathname.startsWith("/v1/sites/")) return null;
   if (!pathname.endsWith(suffix)) return null;
   const middle = pathname.slice("/v1/sites/".length, pathname.length - suffix.length);
+  const siteId = cleanString(decodeURIComponent(middle), 120);
+  if (!siteId || siteId.includes("/")) return null;
+  return siteId;
+}
+
+function parseSiteIdFromPrefixedPath(pathname: string, prefix: string, suffix: string): string | null {
+  if (!pathname.startsWith(prefix)) return null;
+  if (!pathname.endsWith(suffix)) return null;
+  const middle = pathname.slice(prefix.length, pathname.length - suffix.length);
   const siteId = cleanString(decodeURIComponent(middle), 120);
   if (!siteId || siteId.includes("/")) return null;
   return siteId;
@@ -2904,6 +4054,142 @@ async function fetchHtmlWithTimeout(
   }
 }
 
+type Step2PageFetchResult = {
+  status: number;
+  html: string | null;
+  etag: string | null;
+  last_modified: string | null;
+  extractor_mode: "direct_fetch" | "decodo_web_api";
+  fallback_reason: string | null;
+  raw_payload_sha256: string | null;
+  provider_task_id: string | null;
+};
+
+async function fetchPageHtmlByProvider(
+  env: Env,
+  input: {
+    pageProvider: PageProvider;
+    geoProvider: GeoProvider;
+    geoLabel: string;
+    url: string;
+    timeoutMs: number;
+    cache: { etag: string | null; last_modified: string | null; html: string | null } | null;
+  }
+): Promise<Step2PageFetchResult> {
+  if (input.pageProvider === "decodo_web_api") {
+    try {
+      const decodo = await fetchPageViaDecodo(env, {
+        url: input.url,
+        geoLabel: input.geoProvider === "decodo_geo" ? cleanString(input.geoLabel, 120) || null : null,
+      });
+      const html = cleanString(decodo.html, 3_000_000) || cleanString(decodo.markdown, 3_000_000) || null;
+      if (html) {
+        return {
+          status: 200,
+          html,
+          etag: null,
+          last_modified: null,
+          extractor_mode: "decodo_web_api",
+          fallback_reason: null,
+          raw_payload_sha256: decodo.rawPayloadSha256,
+          provider_task_id: decodo.taskId,
+        };
+      }
+      const direct = await fetchHtmlWithTimeout(
+        input.url,
+        input.timeoutMs,
+        input.cache?.etag ?? null,
+        input.cache?.last_modified ?? null
+      );
+      return {
+        status: direct.status,
+        html: direct.status === 304 ? input.cache?.html ?? null : direct.html,
+        etag: direct.etag,
+        last_modified: direct.last_modified,
+        extractor_mode: "direct_fetch",
+        fallback_reason: "decodo_empty_response",
+        raw_payload_sha256: decodo.rawPayloadSha256,
+        provider_task_id: decodo.taskId,
+      };
+    } catch (error) {
+      const direct = await fetchHtmlWithTimeout(
+        input.url,
+        input.timeoutMs,
+        input.cache?.etag ?? null,
+        input.cache?.last_modified ?? null
+      );
+      return {
+        status: direct.status,
+        html: direct.status === 304 ? input.cache?.html ?? null : direct.html,
+        etag: direct.etag,
+        last_modified: direct.last_modified,
+        extractor_mode: "direct_fetch",
+        fallback_reason: `decodo_failed:${cleanString((error as Error)?.message ?? error, 180)}`,
+        raw_payload_sha256: null,
+        provider_task_id: null,
+      };
+    }
+  }
+
+  const direct = await fetchHtmlWithTimeout(
+    input.url,
+    input.timeoutMs,
+    input.cache?.etag ?? null,
+    input.cache?.last_modified ?? null
+  );
+  return {
+    status: direct.status,
+    html: direct.status === 304 ? input.cache?.html ?? null : direct.html,
+    etag: direct.etag,
+    last_modified: direct.last_modified,
+    extractor_mode: "direct_fetch",
+    fallback_reason: null,
+    raw_payload_sha256: null,
+    provider_task_id: null,
+  };
+}
+
+async function persistCanonicalPageSnapshot(
+  env: Env,
+  input: {
+    url: string;
+    html: string;
+    parserVersion: string;
+    rawSha256: string | null;
+  }
+): Promise<{ urlId: string | null; pageSnapshotId: string | null; contentHash: string }> {
+  const urlId = await getOrCreateUrlId(env, input.url);
+  const contentHash = await sha256Hex(input.html);
+  if (!urlId) {
+    return { urlId: null, pageSnapshotId: null, contentHash };
+  }
+  const pageExtract = buildStep2PageExtract(input.url, input.html, "");
+  const pageSnapshotId = uuid("pagesnap");
+  await env.DB.prepare(
+    `INSERT INTO page_snapshots (
+      id, url_id, fetched_at, http_status, content_hash, extracted_json, raw_r2_key, raw_sha256, parser_version
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(url_id, content_hash) DO UPDATE SET
+      fetched_at = excluded.fetched_at,
+      extracted_json = excluded.extracted_json,
+      raw_sha256 = excluded.raw_sha256,
+      parser_version = excluded.parser_version`
+  )
+    .bind(
+      pageSnapshotId,
+      urlId,
+      Math.floor(nowMs() / 1000),
+      200,
+      contentHash,
+      safeJsonStringify(pageExtract, 120000),
+      null,
+      input.rawSha256,
+      input.parserVersion
+    )
+    .run();
+  return { urlId, pageSnapshotId, contentHash };
+}
+
 type Step2PageExtract = {
   url: string;
   domain: string;
@@ -3817,6 +5103,7 @@ async function runStep2DailyHarvest(
   }
   const siteInput = safeJsonParseObject(site.input_json) ?? {};
   const plan = getSitePlanFromInput(siteInput);
+  const providerProfile = await loadSiteProviderProfile(env, site.site_id);
   const geos = [opts.geo];
   if (plan.metro_proxy && plan.metro) {
     geos.push(`metro:${plan.metro}`);
@@ -3885,10 +5172,18 @@ async function runStep2DailyHarvest(
       const serp = await collectAndPersistSerpTop20(env, {
         userId: site.site_id,
         phrase: target.keyword,
-        region: normalizeRegion({ country: "US", language: "en", metro: geo.startsWith("metro:") ? geo.slice(6) : "" }),
+        region: mapGeoForProvider(
+          geo,
+          normalizeRegion({ country: "US", language: "en", metro: geo.startsWith("metro:") ? geo.slice(6) : "" }),
+          providerProfile.geo_provider
+        ).region,
         device: "desktop",
         maxResults: Math.max(1, Math.min(SITE_SERP_RESULTS_CAP, opts.maxResults)),
         proxyUrl: null,
+        provider: providerProfile.serp_provider,
+        geoProvider: providerProfile.geo_provider,
+        geoLabel: geo,
+        auditJobId: childJobId,
       });
       if (serp.ok === false) {
         keywordErrors += 1;
@@ -3977,15 +5272,23 @@ async function runStep2DailyHarvest(
         const previousExtract = await loadLatestStep2PageExtract(env, urlHash, date);
 
         const cachedHtml = await loadHtmlCache(env, urlHash, nowMs());
-        const fetched = await fetchHtmlWithTimeout(
-          row.url,
-          8000,
-          cachedHtml?.etag ?? null,
-          cachedHtml?.last_modified ?? null
-        );
-        const html = fetched.status === 304 ? cachedHtml?.html_snapshot ?? null : fetched.html;
+        const fetched = await fetchPageHtmlByProvider(env, {
+          pageProvider: providerProfile.page_provider,
+          geoProvider: providerProfile.geo_provider,
+          geoLabel: geo,
+          url: row.url,
+          timeoutMs: 8000,
+          cache: cachedHtml
+            ? {
+                etag: cachedHtml.etag,
+                last_modified: cachedHtml.last_modified,
+                html: cachedHtml.html_snapshot,
+              }
+            : null,
+        });
+        const html = fetched.html;
         if (!html) continue;
-        if (fetched.status !== 304) {
+        if (fetched.status !== 304 && fetched.extractor_mode === "direct_fetch") {
           await upsertHtmlCache(env, {
             urlHash,
             url: row.url,
@@ -3996,6 +5299,20 @@ async function runStep2DailyHarvest(
             ttlMs: 7 * 24 * 60 * 60 * 1000,
           });
         }
+        await createArtifactRecord(env, {
+          jobId: childJobId,
+          kind: "step2.page.fetch.audit",
+          payload: {
+            keyword: target.keyword,
+            geo,
+            url: row.url,
+            extractor_mode: fetched.extractor_mode,
+            fallback_reason: fetched.fallback_reason,
+            decodo_raw_payload_sha256: fetched.raw_payload_sha256,
+            provider_task_id: fetched.provider_task_id,
+            status: fetched.status,
+          },
+        });
 
         const pageExtract = buildStep2PageExtract(row.url, html, target.keyword);
         await upsertStep2PageExtract(env, pageExtract, nowMs());
@@ -4321,6 +5638,8 @@ type Step3TaskType =
   | "SEASONAL_PAGE_DRAFT"
   | "CONTENT_REFRESH"
   | "LINK_RECLAMATION"
+  | "AUTHORITY_GAP_PLAN"
+  | "LINK_RISK_AUDIT"
   | "OUTREACH_TARGET_LIST"
   | "DIGITAL_PR_IDEA"
   | "LOCAL_PARTNERSHIP_OPPORTUNITIES"
@@ -4434,6 +5753,19 @@ type Step3OwnPageSignal = {
 type Step3DiffSignal = {
   keyword: string;
   new_top3_entrant: boolean;
+};
+
+type Step3MozKeywordSignal = {
+  keyword: string;
+  top3_median_pa: number;
+  top3_median_da: number;
+  top3_median_spam: number;
+  own_pa: number | null;
+  own_da: number | null;
+  own_spam: number | null;
+  top3_median_ref_domains: number;
+  own_ref_domains: number | null;
+  available: boolean;
 };
 
 function isDirectoryDomain(domain: string): boolean {
@@ -4751,6 +6083,148 @@ async function loadStep3PreviousSocialCadence(env: Env, siteId: string): Promise
   return Math.max(0, Number(row?.avg_cadence ?? 0) || 0);
 }
 
+function parseMozDomainTotal(totalsJsonRaw: string, fallbackRows: number): number {
+  const totals = safeJsonParseObject(cleanString(totalsJsonRaw, 16000)) ?? {};
+  const candidates = [
+    totals.total_domains,
+    totals.total_root_domains,
+    totals.total_rows,
+    totals.total,
+    totals.rows,
+  ];
+  for (const value of candidates) {
+    const n = Number(value ?? NaN);
+    if (Number.isFinite(n) && n >= 0) {
+      return Math.max(0, Math.round(n));
+    }
+  }
+  return Math.max(0, fallbackRows);
+}
+
+async function loadStep3MozKeywordSignal(
+  env: Env,
+  input: { siteId: string; date: string; keyword: string; targetUrl: string | null }
+): Promise<Step3MozKeywordSignal | null> {
+  const topRows = await env.DB.prepare(
+    `SELECT
+      m.page_authority AS pa,
+      m.domain_authority AS da,
+      m.spam_score AS spam,
+      (
+        SELECT lr.total_domain_rows
+        FROM moz_linking_root_domains_snapshots lr
+        WHERE lr.target_url_id = u.id
+          AND lr.collected_day = s.date_yyyymmdd
+        ORDER BY lr.created_at DESC
+        LIMIT 1
+      ) AS moz_rd_rows,
+      (
+        SELECT lr.totals_json
+        FROM moz_linking_root_domains_snapshots lr
+        WHERE lr.target_url_id = u.id
+          AND lr.collected_day = s.date_yyyymmdd
+        ORDER BY lr.created_at DESC
+        LIMIT 1
+      ) AS moz_rd_totals_json
+     FROM step2_serp_results r
+     JOIN step2_serp_snapshots s ON s.serp_id = r.serp_id
+     LEFT JOIN urls u ON u.url_hash = r.url_hash
+     LEFT JOIN moz_url_metrics_snapshots m
+       ON m.url_id = u.id
+      AND m.collected_day = s.date_yyyymmdd
+     WHERE s.site_id = ?
+       AND s.date_yyyymmdd = ?
+       AND s.keyword = ?
+       AND r.rank <= 3`
+  )
+    .bind(input.siteId, input.date, input.keyword)
+    .all<Record<string, unknown>>();
+
+  const paValues: number[] = [];
+  const daValues: number[] = [];
+  const spamValues: number[] = [];
+  const rdValues: number[] = [];
+  for (const raw of topRows.results ?? []) {
+    const pa = Number(raw.pa ?? NaN);
+    const da = Number(raw.da ?? NaN);
+    const spam = Number(raw.spam ?? NaN);
+    if (Number.isFinite(pa) && pa >= 0) paValues.push(pa);
+    if (Number.isFinite(da) && da >= 0) daValues.push(da);
+    if (Number.isFinite(spam) && spam >= 0) spamValues.push(spam);
+    const rdRows = clampInt(raw.moz_rd_rows, 0, 1_000_000_000, 0);
+    const rdTotal = parseMozDomainTotal(cleanString(raw.moz_rd_totals_json, 16000), rdRows);
+    if (rdTotal > 0) rdValues.push(rdTotal);
+  }
+
+  let ownPa: number | null = null;
+  let ownDa: number | null = null;
+  let ownSpam: number | null = null;
+  let ownRefDomains: number | null = null;
+  if (input.targetUrl) {
+    const targetHash = await sha256Hex(cleanString(input.targetUrl, 2000).toLowerCase());
+    const own = await env.DB.prepare(
+      `SELECT
+        m.page_authority AS pa,
+        m.domain_authority AS da,
+        m.spam_score AS spam,
+        (
+          SELECT lr.total_domain_rows
+          FROM moz_linking_root_domains_snapshots lr
+          WHERE lr.target_url_id = u.id
+            AND lr.collected_day = ?
+          ORDER BY lr.created_at DESC
+          LIMIT 1
+        ) AS moz_rd_rows,
+        (
+          SELECT lr.totals_json
+          FROM moz_linking_root_domains_snapshots lr
+          WHERE lr.target_url_id = u.id
+            AND lr.collected_day = ?
+          ORDER BY lr.created_at DESC
+          LIMIT 1
+        ) AS moz_rd_totals_json
+       FROM urls u
+       LEFT JOIN moz_url_metrics_snapshots m
+         ON m.url_id = u.id
+        AND m.collected_day = ?
+       WHERE u.url_hash = ?
+       ORDER BY m.created_at DESC
+       LIMIT 1`
+    )
+      .bind(input.date, input.date, input.date, targetHash)
+      .first<Record<string, unknown>>();
+    if (own) {
+      const pa = Number(own.pa ?? NaN);
+      const da = Number(own.da ?? NaN);
+      const spam = Number(own.spam ?? NaN);
+      if (Number.isFinite(pa) && pa >= 0) ownPa = pa;
+      if (Number.isFinite(da) && da >= 0) ownDa = da;
+      if (Number.isFinite(spam) && spam >= 0) ownSpam = spam;
+      ownRefDomains = parseMozDomainTotal(
+        cleanString(own.moz_rd_totals_json, 16000),
+        clampInt(own.moz_rd_rows, 0, 1_000_000_000, 0)
+      );
+    }
+  }
+
+  const available = paValues.length > 0 || daValues.length > 0 || spamValues.length > 0 || rdValues.length > 0;
+  if (!available && ownPa == null && ownDa == null && ownSpam == null && ownRefDomains == null) {
+    return null;
+  }
+  return {
+    keyword: input.keyword,
+    top3_median_pa: median(paValues),
+    top3_median_da: median(daValues),
+    top3_median_spam: median(spamValues),
+    own_pa: ownPa,
+    own_da: ownDa,
+    own_spam: ownSpam,
+    top3_median_ref_domains: median(rdValues),
+    own_ref_domains: ownRefDomains,
+    available,
+  };
+}
+
 function buildStep3Tasks(input: {
   site: Step1SiteRecord;
   siteRunId: string;
@@ -4758,6 +6232,7 @@ function buildStep3Tasks(input: {
   competitors: Step3CompetitorCandidate[];
   keywordSignals: Map<string, Step3KeywordSignal>;
   ownSignals: Map<string, Step3OwnPageSignal>;
+  mozSignals: Map<string, Step3MozKeywordSignal>;
   top3Modules: Map<string, { faq_rate: number; pricing_rate: number }>;
   diffSignals: Map<string, Step3DiffSignal>;
   socialCadenceIncreased: boolean;
@@ -4783,6 +6258,7 @@ function buildStep3Tasks(input: {
         ? `${cleanString(input.site.site_url, 2000).replace(/\/+$/, "")}/${slug.replace(/^\/+/, "")}`
         : null;
     const signal = input.keywordSignals.get(toKeywordNorm(keyword));
+    const mozSignal = input.mozSignals.get(toKeywordNorm(keyword));
     const ownSignal = targetUrl ? input.ownSignals.get(toKeywordNorm(keyword)) ?? null : null;
     const top3Modules = input.top3Modules.get(toKeywordNorm(keyword)) ?? { faq_rate: 0, pricing_rate: 0 };
     const diffSignal = input.diffSignals.get(toKeywordNorm(keyword));
@@ -5011,8 +6487,8 @@ function buildStep3Tasks(input: {
       );
     }
 
-    const top3RD = signal?.top3_median_ref_domains ?? 0;
-    const ownRD = ownSignal?.ref_domains ?? 0;
+    const top3RD = mozSignal?.top3_median_ref_domains || signal?.top3_median_ref_domains || 0;
+    const ownRD = mozSignal?.own_ref_domains ?? ownSignal?.ref_domains ?? 0;
     if (top3RD > 0 && ownRD < top3RD * 0.6) {
       add(
         makeStep3Task({
@@ -5037,8 +6513,10 @@ function buildStep3Tasks(input: {
             citations: [
               {
                 kind: "METRIC_GAP",
-                text: "Target referring domains are materially below top-3 median.",
-                data: { top3_median_ref_domains: top3RD, target_ref_domains: ownRD },
+                text: mozSignal
+                  ? "Moz linking root domains indicate a material ref-domain gap vs top-3 competitors."
+                  : "Target referring domains are materially below top-3 median.",
+                data: { top3_median_ref_domains: top3RD, target_ref_domains: ownRD, source: mozSignal ? "moz_linking_root_domains_snapshots" : "step2_estimate" },
               },
             ],
           },
@@ -5058,6 +6536,112 @@ function buildStep3Tasks(input: {
           outputs: { artifacts: [{ kind: "OUTREACH_LIST", data: { target_count: 30, cluster } }] },
         })
       );
+    }
+
+    if (mozSignal && mozSignal.own_da != null && mozSignal.own_pa != null) {
+      const daGap = mozSignal.top3_median_da - mozSignal.own_da;
+      const paGap = mozSignal.top3_median_pa - mozSignal.own_pa;
+      if (daGap >= 12 || paGap >= 12) {
+        add(
+          makeStep3Task({
+            siteId: input.site.site_id,
+            siteRunId: input.siteRunId,
+            category: "AUTHORITY",
+            type: "AUTHORITY_GAP_PLAN",
+            title: `Build authority gap plan for "${cluster}"`,
+            summary: "Moz authority metrics show the target page/domain trails top-3 competitors.",
+            priority: "P1",
+            effort: "M",
+            confidence: 0.79,
+            estimatedImpact: { seo: "high", leads: "med", timeToEffectDays: 21 },
+            mode: "TEAM",
+            requiresAccess: ["NONE"],
+            requiresInputs: ["SERVICE_LIST"],
+            requiresApprovals: ["OUTREACH_SEND"],
+            scope: { keyword, cluster, target_slug: slug, target_url: targetUrl, geo: "both" },
+            evidence: {
+              based_on: ["LINKS"],
+              citations: [
+                {
+                  kind: "METRIC_GAP",
+                  text: "Top-3 Moz PA/DA median exceeds owned page authority by threshold.",
+                  data: {
+                    top3_median_pa: mozSignal.top3_median_pa,
+                    own_pa: mozSignal.own_pa,
+                    top3_median_da: mozSignal.top3_median_da,
+                    own_da: mozSignal.own_da,
+                    pa_gap: Number(paGap.toFixed(2)),
+                    da_gap: Number(daGap.toFixed(2)),
+                  },
+                },
+              ],
+            },
+            instructions: {
+              steps: [
+                "Build a 60-day authority sprint plan tied to this cluster.",
+                "Prioritize domains linking to multiple top competitors.",
+                "Sequence on-page trust assets before outreach pushes.",
+              ],
+              acceptance_criteria: [
+                "Authority gap plan includes monthly RD goals and anchor mix.",
+                "Plan references at least 20 realistic target domains.",
+              ],
+              guardrails: ["No paid link farms.", "No exact-match anchor over-optimization."],
+            },
+            outputs: { artifacts: [{ kind: "OUTREACH_LIST", data: { strategy: "authority_gap", cluster } }] },
+          })
+        );
+      }
+    }
+
+    if (mozSignal && mozSignal.own_spam != null) {
+      const topSpam = mozSignal.top3_median_spam;
+      const ownSpam = mozSignal.own_spam;
+      if (ownSpam >= 40 && ownSpam >= topSpam + 15 && topSpam <= 30) {
+        add(
+          makeStep3Task({
+            siteId: input.site.site_id,
+            siteRunId: input.siteRunId,
+            category: "AUTHORITY",
+            type: "LINK_RISK_AUDIT",
+            title: `Run link risk audit for "${cluster}"`,
+            summary: "Moz spam profile is elevated versus top-3 competitors and needs remediation review.",
+            priority: "P1",
+            effort: "M",
+            confidence: 0.74,
+            estimatedImpact: { seo: "med", leads: "low", timeToEffectDays: 14 },
+            mode: "AUTO",
+            requiresAccess: ["NONE"],
+            scope: { keyword, cluster, target_slug: slug, target_url: targetUrl, geo: "both" },
+            evidence: {
+              based_on: ["LINKS"],
+              citations: [
+                {
+                  kind: "METRIC_GAP",
+                  text: "Owned spam score materially exceeds competitor baseline.",
+                  data: {
+                    own_spam_score: ownSpam,
+                    top3_median_spam_score: topSpam,
+                  },
+                },
+              ],
+            },
+            instructions: {
+              steps: [
+                "Review risky anchor and referring-domain patterns.",
+                "Identify cleanup/disavow candidates for manual review.",
+                "Shift outreach plan toward higher-trust local domains.",
+              ],
+              acceptance_criteria: [
+                "Risk report produced with prioritized remediation actions.",
+                "Future outreach anchor guardrails updated.",
+              ],
+              guardrails: ["No automated disavow submission without review."],
+            },
+            outputs: { artifacts: [{ kind: "OUTREACH_LIST", data: { strategy: "link_risk_audit", cluster } }] },
+          })
+        );
+      }
     }
   }
 
@@ -6312,6 +7896,7 @@ async function runStep3LocalExecutionPlan(
     .run();
 
   const ownSignals = new Map<string, Step3OwnPageSignal>();
+  const mozSignals = new Map<string, Step3MozKeywordSignal>();
   const top3Modules = new Map<string, { faq_rate: number; pricing_rate: number }>();
   for (const row of primaryRows) {
     const keyword = cleanString(row.keyword, 300);
@@ -6323,6 +7908,15 @@ async function runStep3LocalExecutionPlan(
     if (targetUrl) {
       const own = await loadStep3OwnPageSignal(env, { targetUrl, targetSlug: slug, date: step2Date });
       if (own) ownSignals.set(toKeywordNorm(keyword), own);
+    }
+    const mozSignal = await loadStep3MozKeywordSignal(env, {
+      siteId: site.site_id,
+      date: step2Date,
+      keyword,
+      targetUrl,
+    });
+    if (mozSignal) {
+      mozSignals.set(toKeywordNorm(keyword), mozSignal);
     }
     const rates = await loadStep3Top3ModuleRates(env, { siteId: site.site_id, date: step2Date, keyword });
     top3Modules.set(toKeywordNorm(keyword), rates);
@@ -6341,6 +7935,7 @@ async function runStep3LocalExecutionPlan(
     competitors: competitorSet,
     keywordSignals,
     ownSignals,
+    mozSignals,
     top3Modules,
     diffSignals,
     socialCadenceIncreased,
@@ -6758,11 +8353,13 @@ type SerpWatchlistRunSummary = {
   started_at: number;
   finished_at: number;
   day_utc: string;
+  proxy_lease_id: string | null;
   total_candidates: number;
   attempted: number;
   succeeded: number;
   failed: number;
   skipped: number;
+  graph_ready_rows: number;
   rows: Array<{
     watch_id: string;
     keyword: string;
@@ -6770,12 +8367,15 @@ type SerpWatchlistRunSummary = {
     reason: string | null;
     serp_id: string | null;
     job_id: string | null;
+    proxy_lease_id: string | null;
+    proxy_geo: string | null;
+    graph_rows_last_30d: number;
   }>;
 };
 
 async function runSerpWatchlist(
   env: Env,
-  input: { userId: string; watchId: string; limit: number; force: boolean }
+  input: { userId: string; watchId: string; limit: number; force: boolean; proxyLeaseId: string | null }
 ): Promise<SerpWatchlistRunSummary> {
   const startedAt = nowMs();
   const dayUtc = toDateYYYYMMDD(startedAt);
@@ -6794,15 +8394,37 @@ async function runSerpWatchlist(
     started_at: startedAt,
     finished_at: startedAt,
     day_utc: dayUtc,
+    proxy_lease_id: input.proxyLeaseId,
     total_candidates: candidates.length,
     attempted: 0,
     succeeded: 0,
     failed: 0,
     skipped: 0,
+    graph_ready_rows: 0,
     rows: [],
   };
 
   for (const candidate of candidates) {
+    let activeLease: ProxyLeaseRow | null = null;
+    if (input.proxyLeaseId) {
+      activeLease = await getActiveProxyLease(env, input.proxyLeaseId, candidate.user_id);
+      if (!activeLease) {
+        summary.failed += 1;
+        summary.rows.push({
+          watch_id: candidate.watch_id,
+          keyword: candidate.phrase,
+          status: "error",
+          reason: "proxy_lease_not_found_or_expired",
+          serp_id: null,
+          job_id: null,
+          proxy_lease_id: input.proxyLeaseId,
+          proxy_geo: null,
+          graph_rows_last_30d: 0,
+        });
+        continue;
+      }
+    }
+
     if (!input.force && candidate.last_run_at != null && toDateYYYYMMDD(candidate.last_run_at) === dayUtc) {
       summary.skipped += 1;
       summary.rows.push({
@@ -6812,6 +8434,9 @@ async function runSerpWatchlist(
         reason: "already_ran_today",
         serp_id: candidate.last_serp_id,
         job_id: null,
+        proxy_lease_id: activeLease?.lease_id ?? null,
+        proxy_geo: activeLease ? formatProxyGeo(activeLease) : null,
+        graph_rows_last_30d: 0,
       });
       continue;
     }
@@ -6828,6 +8453,7 @@ async function runSerpWatchlist(
         region,
         device: candidate.device,
         max_results: candidate.max_results,
+        proxy_lease_id: activeLease?.lease_id ?? null,
       },
     });
     const collected = await collectAndPersistSerpTop20(env, {
@@ -6836,11 +8462,24 @@ async function runSerpWatchlist(
       region,
       device: candidate.device,
       maxResults: candidate.max_results,
-      proxyUrl: null,
+      proxyUrl: activeLease?.proxy_url ?? null,
+      provider: "headless_google",
+      geoProvider: "proxy_lease_pool",
+      geoLabel: cleanString(region.city ?? region.region, 120) || "us",
+      auditJobId: jobId,
     });
     const finishedAt = nowMs();
 
     if (collected.ok === true) {
+      const graphRows = await loadDailyLatestSerpRows(
+        env,
+        candidate.phrase,
+        startedAt - 30 * 24 * 60 * 60 * 1000,
+        candidate.device
+      );
+      if (graphRows.length > 0) {
+        summary.graph_ready_rows += 1;
+      }
       summary.succeeded += 1;
       await finalizeJobSuccess(env, jobId, 1);
       await createArtifactRecord(env, {
@@ -6852,6 +8491,8 @@ async function runSerpWatchlist(
           raw_payload_sha256: collected.rawPayloadSha256,
           provider: collected.provider,
           actor: collected.actor,
+          extractor_mode: collected.extractorMode,
+          fallback_reason: collected.fallbackReason,
         },
       });
       await createArtifactRecord(env, {
@@ -6876,6 +8517,9 @@ async function runSerpWatchlist(
         reason: null,
         serp_id: collected.serpId,
         job_id: jobId,
+        proxy_lease_id: activeLease?.lease_id ?? null,
+        proxy_geo: activeLease ? formatProxyGeo(activeLease) : null,
+        graph_rows_last_30d: graphRows.length,
       });
       continue;
     }
@@ -6906,6 +8550,9 @@ async function runSerpWatchlist(
       reason: collected.error,
       serp_id: collected.serpId,
       job_id: jobId,
+      proxy_lease_id: activeLease?.lease_id ?? null,
+      proxy_geo: activeLease ? formatProxyGeo(activeLease) : null,
+      graph_rows_last_30d: 0,
     });
   }
 
@@ -7094,6 +8741,113 @@ function buildSuggestedSeoCopy(
 type VerifiedPluginRequest =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; response: Response };
+
+type MarketplaceTaskRow = {
+  task_id: string;
+  status: string;
+  platform: string;
+  issuer_wallet: string;
+  payout_amount: string;
+  payout_token: string;
+  payout_chain: string | null;
+  deadline_at: number;
+  task_spec_json: string;
+  task_spec_hash: string;
+  created_at: number;
+  updated_at: number;
+};
+
+type MarketplaceClaimRow = {
+  claim_id: string;
+  task_id: string;
+  worker_wallet: string;
+  status: string;
+  claimed_at: number;
+  expires_at: number;
+  released_at: number | null;
+  release_reason: string | null;
+};
+
+async function loadMarketplaceTask(env: Env, taskId: string): Promise<MarketplaceTaskRow | null> {
+  const row = await env.DB.prepare(
+    `SELECT
+      task_id, status, platform, issuer_wallet,
+      payout_amount, payout_token, payout_chain,
+      deadline_at, task_spec_json, task_spec_hash, created_at, updated_at
+     FROM task_market_tasks
+     WHERE task_id = ?
+     LIMIT 1`
+  )
+    .bind(taskId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return {
+    task_id: cleanString(row.task_id, 120),
+    status: cleanString(row.status, 40),
+    platform: cleanString(row.platform, 80),
+    issuer_wallet: cleanString(row.issuer_wallet, 200),
+    payout_amount: cleanString(row.payout_amount, 80),
+    payout_token: cleanString(row.payout_token, 80),
+    payout_chain: cleanString(row.payout_chain, 80) || null,
+    deadline_at: clampInt(row.deadline_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    task_spec_json: cleanString(row.task_spec_json, 64000),
+    task_spec_hash: cleanString(row.task_spec_hash, 200),
+    created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    updated_at: clampInt(row.updated_at, 0, Number.MAX_SAFE_INTEGER, 0),
+  };
+}
+
+async function loadActiveMarketplaceClaim(env: Env, taskId: string): Promise<MarketplaceClaimRow | null> {
+  const row = await env.DB.prepare(
+    `SELECT
+      claim_id, task_id, worker_wallet, status, claimed_at, expires_at, released_at, release_reason
+     FROM task_market_claims
+     WHERE task_id = ? AND status = 'active'
+     LIMIT 1`
+  )
+    .bind(taskId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return {
+    claim_id: cleanString(row.claim_id, 120),
+    task_id: cleanString(row.task_id, 120),
+    worker_wallet: cleanString(row.worker_wallet, 200),
+    status: cleanString(row.status, 40),
+    claimed_at: clampInt(row.claimed_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    expires_at: clampInt(row.expires_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    released_at:
+      row.released_at == null ? null : clampInt(row.released_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    release_reason: cleanString(row.release_reason, 200) || null,
+  };
+}
+
+async function listOpenMarketplaceTasks(env: Env, limit: number): Promise<Array<Record<string, unknown>>> {
+  const rows = await env.DB.prepare(
+    `SELECT
+      t.task_id,
+      t.platform,
+      t.payout_amount,
+      t.payout_token,
+      t.payout_chain,
+      t.deadline_at,
+      t.task_spec_hash,
+      t.status,
+      t.created_at
+     FROM task_market_tasks t
+     WHERE t.status = 'open'
+       AND t.deadline_at > ?
+       AND NOT EXISTS (
+         SELECT 1
+         FROM task_market_claims c
+         WHERE c.task_id = t.task_id AND c.status = 'active'
+       )
+     ORDER BY t.created_at DESC
+     LIMIT ?`
+  )
+    .bind(nowMs(), limit)
+    .all<Record<string, unknown>>();
+  return rows.results ?? [];
+}
 
 async function verifySignedPluginRequest(req: Request, env: Env): Promise<VerifiedPluginRequest> {
   const secret = String(env.WP_PLUGIN_SHARED_SECRET || "").trim();
@@ -7457,6 +9211,934 @@ async function insertSnapshot(env: Env, siteId: string, strategy: string, trigge
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    const pluginV1Prefix = "/plugin/wp/v1";
+
+    if (req.method === "POST" && url.pathname === "/v1/tasks") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const idem = await resolveIdempotency(env, req, "POST:/v1/tasks", body, { required: true });
+      if (!idem.ok) return idem.response;
+      if (idem.replayResponse) return idem.replayResponse;
+
+      const spec = normalizeTaskSpec(body);
+      const validationError = validateTaskSpec(spec);
+      if (validationError) {
+        return Response.json({ ok: false, error: validationError }, { status: 400 });
+      }
+      const taskId = cleanString(body.task_id, 120) || uuid("tmktask");
+      const specJson = canonicalJson(spec);
+      const taskSpecHash = await sha256Hex(specJson);
+      const agentSignature = await signAgentPayload(env, `${taskId}.${taskSpecHash}`);
+      if (!agentSignature) {
+        return Response.json({ ok: false, error: "task_signing_secret_not_configured" }, { status: 503 });
+      }
+      try {
+        await env.DB.prepare(
+          `INSERT INTO task_market_tasks (
+            task_id, status, platform, issuer_wallet, payout_amount, payout_token, payout_chain,
+            deadline_at, task_spec_json, task_spec_hash, created_at, updated_at
+          ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+          .bind(
+            taskId,
+            spec.platform,
+            spec.issuer_wallet,
+            spec.payout.amount,
+            spec.payout.token,
+            spec.payout.chain,
+            spec.deadline_at,
+            specJson,
+            taskSpecHash,
+            nowMs(),
+            nowMs()
+          )
+          .run();
+      } catch {
+        return Response.json({ ok: false, error: "task_id_already_exists" }, { status: 409 });
+      }
+      await writeTaskAuditLog(env, {
+        taskId,
+        eventType: "task_created",
+        actorWallet: spec.issuer_wallet,
+        payload: { task_spec_hash: taskSpecHash, platform: spec.platform, payout: spec.payout },
+      });
+      const responseBody = {
+        ok: true,
+        task_id: taskId,
+        status: "open",
+        taskSpecHash,
+        agentSignature,
+        task_spec: spec,
+      };
+      if (idem.key) {
+        await saveIdempotencyRecord(env, {
+          key: idem.key,
+          endpoint: "POST:/v1/tasks",
+          requestHash: idem.requestHash,
+          responseStatus: 200,
+          responseBody,
+        });
+      }
+      return Response.json(responseBody);
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/tasks/open") {
+      const limit = clampInt(url.searchParams.get("limit"), 1, 200, 50);
+      const rows = await listOpenMarketplaceTasks(env, limit);
+      return Response.json({
+        ok: true,
+        count: rows.length,
+        tasks: rows.map((row) => ({
+          task_id: cleanString(row.task_id, 120),
+          status: cleanString(row.status, 40),
+          platform: cleanString(row.platform, 80),
+          payout_amount: cleanString(row.payout_amount, 80),
+          payout_token: cleanString(row.payout_token, 80),
+          payout_chain: cleanString(row.payout_chain, 80) || null,
+          deadline_at: clampInt(row.deadline_at, 0, Number.MAX_SAFE_INTEGER, 0),
+          task_spec_hash: cleanString(row.task_spec_hash, 200),
+          created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+        })),
+      });
+    }
+
+    const taskIdMatch = url.pathname.match(/^\/v1\/tasks\/([^/]+)$/);
+    if (req.method === "GET" && taskIdMatch) {
+      const taskId = cleanString(decodeURIComponent(taskIdMatch[1]), 120);
+      const task = await loadMarketplaceTask(env, taskId);
+      if (!task) {
+        return Response.json({ ok: false, error: "task_not_found" }, { status: 404 });
+      }
+      const activeClaim = await loadActiveMarketplaceClaim(env, taskId);
+      const latestVerification = await env.DB.prepare(
+        `SELECT verification_id, passed, verification_result_hash, created_at
+         FROM task_market_verifications
+         WHERE task_id = ?
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+        .bind(taskId)
+        .first<Record<string, unknown>>();
+      return Response.json({
+        ok: true,
+        task_id: task.task_id,
+        status: task.status,
+        platform: task.platform,
+        issuer_wallet: task.issuer_wallet,
+        payout: {
+          amount: task.payout_amount,
+          token: task.payout_token,
+          chain: task.payout_chain,
+        },
+        deadline_at: task.deadline_at,
+        task_spec_hash: task.task_spec_hash,
+        task_spec: safeJsonParseObject(task.task_spec_json) ?? {},
+        active_claim: activeClaim,
+        latest_verification: latestVerification
+          ? {
+              verification_id: cleanString(latestVerification.verification_id, 120),
+              passed: clampInt(latestVerification.passed, 0, 1, 0) === 1,
+              verification_result_hash: cleanString(latestVerification.verification_result_hash, 200),
+              created_at: clampInt(latestVerification.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
+            }
+          : null,
+      });
+    }
+
+    const taskActionMatch = url.pathname.match(/^\/v1\/tasks\/([^/]+)\/(claim|release|evidence|verify|payout-authorize)$/);
+    if (taskActionMatch && req.method === "POST") {
+      const taskId = cleanString(decodeURIComponent(taskActionMatch[1]), 120);
+      const action = cleanString(taskActionMatch[2], 40);
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+
+      const endpoint = `POST:/v1/tasks/:id/${action}`;
+      const idem = await resolveIdempotency(env, req, endpoint, body, { required: true });
+      if (!idem.ok) return idem.response;
+      if (idem.replayResponse) return idem.replayResponse;
+
+      const task = await loadMarketplaceTask(env, taskId);
+      if (!task) return Response.json({ ok: false, error: "task_not_found" }, { status: 404 });
+
+      if (action === "claim") {
+        const wallet = cleanString(body.worker_wallet ?? body.wallet, 200).toLowerCase();
+        if (!wallet) return Response.json({ ok: false, error: "worker_wallet_required" }, { status: 400 });
+        if (task.deadline_at <= nowMs()) {
+          return Response.json({ ok: false, error: "task_deadline_passed" }, { status: 409 });
+        }
+        const active = await loadActiveMarketplaceClaim(env, taskId);
+        if (active) {
+          if (active.worker_wallet === wallet) {
+            const responseBody = { ok: true, task_id: taskId, claim: active, already_claimed: true };
+            if (idem.key) {
+              await saveIdempotencyRecord(env, {
+                key: idem.key,
+                endpoint,
+                requestHash: idem.requestHash,
+                responseStatus: 200,
+                responseBody,
+              });
+            }
+            return Response.json(responseBody);
+          }
+          return Response.json({ ok: false, error: "task_already_claimed" }, { status: 409 });
+        }
+        const claimId = uuid("claim");
+        const claimedAt = nowMs();
+        const ttlMinutes = clampInt(body.ttl_minutes, 1, TASK_MAX_CLAIM_MINUTES, 60);
+        const expiresAt = claimedAt + ttlMinutes * 60_000;
+        try {
+          await env.DB.prepare(
+            `INSERT INTO task_market_claims (
+              claim_id, task_id, worker_wallet, status, claimed_at, expires_at
+            ) VALUES (?, ?, ?, 'active', ?, ?)`
+          )
+            .bind(claimId, taskId, wallet, claimedAt, expiresAt)
+            .run();
+        } catch {
+          return Response.json({ ok: false, error: "task_already_claimed" }, { status: 409 });
+        }
+        await env.DB.prepare(
+          `UPDATE task_market_tasks
+           SET status = 'claimed', updated_at = ?
+           WHERE task_id = ?`
+        )
+          .bind(nowMs(), taskId)
+          .run();
+        await writeTaskAuditLog(env, {
+          taskId,
+          eventType: "task_claimed",
+          actorWallet: wallet,
+          payload: { claim_id: claimId, expires_at: expiresAt },
+        });
+        const responseBody = {
+          ok: true,
+          task_id: taskId,
+          claim: {
+            claim_id: claimId,
+            task_id: taskId,
+            worker_wallet: wallet,
+            status: "active",
+            claimed_at: claimedAt,
+            expires_at: expiresAt,
+            released_at: null,
+            release_reason: null,
+          },
+        };
+        if (idem.key) {
+          await saveIdempotencyRecord(env, {
+            key: idem.key,
+            endpoint,
+            requestHash: idem.requestHash,
+            responseStatus: 200,
+            responseBody,
+          });
+        }
+        return Response.json(responseBody);
+      }
+
+      if (action === "release") {
+        const active = await loadActiveMarketplaceClaim(env, taskId);
+        if (!active) return Response.json({ ok: false, error: "active_claim_not_found" }, { status: 404 });
+        const wallet = cleanString(body.worker_wallet ?? body.wallet, 200).toLowerCase();
+        const force = parseBoolUnknown(body.force, false);
+        const now = nowMs();
+        const timedOut = now > active.expires_at;
+        if (!force && !timedOut && wallet !== active.worker_wallet) {
+          return Response.json({ ok: false, error: "claim_owner_mismatch" }, { status: 403 });
+        }
+        const reason = cleanString(body.reason, 120) || (timedOut ? "timeout" : "manual_release");
+        const releaseStatus = reason === "timeout" || timedOut ? "expired" : "released";
+        await env.DB.prepare(
+          `UPDATE task_market_claims
+           SET status = ?, released_at = ?, release_reason = ?
+           WHERE claim_id = ?`
+        )
+          .bind(releaseStatus, now, reason, active.claim_id)
+          .run();
+        const nextTaskStatus = task.deadline_at > now ? "open" : "expired";
+        await env.DB.prepare(
+          `UPDATE task_market_tasks
+           SET status = ?, updated_at = ?
+           WHERE task_id = ?`
+        )
+          .bind(nextTaskStatus, now, taskId)
+          .run();
+        await writeTaskAuditLog(env, {
+          taskId,
+          eventType: "task_released",
+          actorWallet: wallet || active.worker_wallet,
+          payload: { claim_id: active.claim_id, reason, status: releaseStatus },
+        });
+        const responseBody = {
+          ok: true,
+          task_id: taskId,
+          released: true,
+          claim_id: active.claim_id,
+          status: releaseStatus,
+          release_reason: reason,
+        };
+        if (idem.key) {
+          await saveIdempotencyRecord(env, {
+            key: idem.key,
+            endpoint,
+            requestHash: idem.requestHash,
+            responseStatus: 200,
+            responseBody,
+          });
+        }
+        return Response.json(responseBody);
+      }
+
+      if (action === "evidence") {
+        const wallet = cleanString(body.worker_wallet ?? body.wallet, 200).toLowerCase();
+        if (!wallet) return Response.json({ ok: false, error: "worker_wallet_required" }, { status: 400 });
+        const active = await loadActiveMarketplaceClaim(env, taskId);
+        if (!active) return Response.json({ ok: false, error: "active_claim_not_found" }, { status: 404 });
+        if (active.worker_wallet !== wallet) {
+          return Response.json({ ok: false, error: "claim_owner_mismatch" }, { status: 403 });
+        }
+        const rawEvidence = parseJsonObject(body.evidence) ?? body;
+        const evidence = normalizeEvidenceBundle(rawEvidence);
+        if (
+          evidence.urls.length < 1 &&
+          Object.keys(evidence.fields).length < 1 &&
+          evidence.screenshots.length < 1 &&
+          !evidence.trace_ref
+        ) {
+          return Response.json({ ok: false, error: "evidence_payload_empty" }, { status: 400 });
+        }
+        const evidenceCanonical = canonicalJson(evidence);
+        const evidenceHash = await sha256Hex(evidenceCanonical);
+        const evidenceId = uuid("evidence");
+        await env.DB.prepare(
+          `INSERT INTO task_market_evidence (
+            evidence_id, task_id, claim_id, worker_wallet, evidence_json, evidence_hash, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+          .bind(evidenceId, taskId, active.claim_id, wallet, evidenceCanonical, evidenceHash, nowMs())
+          .run();
+        await writeTaskAuditLog(env, {
+          taskId,
+          eventType: "evidence_submitted",
+          actorWallet: wallet,
+          payload: { evidence_id: evidenceId, evidence_hash: evidenceHash },
+        });
+        const responseBody = {
+          ok: true,
+          task_id: taskId,
+          evidence_id: evidenceId,
+          evidence_hash: evidenceHash,
+        };
+        if (idem.key) {
+          await saveIdempotencyRecord(env, {
+            key: idem.key,
+            endpoint,
+            requestHash: idem.requestHash,
+            responseStatus: 200,
+            responseBody,
+          });
+        }
+        return Response.json(responseBody);
+      }
+
+      if (action === "verify") {
+        const evidenceId = cleanString(body.evidence_id, 120);
+        const evidenceRow = evidenceId
+          ? await env.DB.prepare(
+              `SELECT evidence_id, evidence_json, worker_wallet
+               FROM task_market_evidence
+               WHERE task_id = ? AND evidence_id = ?
+               LIMIT 1`
+            )
+              .bind(taskId, evidenceId)
+              .first<Record<string, unknown>>()
+          : await env.DB.prepare(
+              `SELECT evidence_id, evidence_json, worker_wallet
+               FROM task_market_evidence
+               WHERE task_id = ?
+               ORDER BY created_at DESC
+               LIMIT 1`
+            )
+              .bind(taskId)
+              .first<Record<string, unknown>>();
+        if (!evidenceRow) {
+          return Response.json({ ok: false, error: "evidence_not_found" }, { status: 404 });
+        }
+        const spec = safeJsonParseObject(task.task_spec_json) ?? {};
+        const normalizedSpec = normalizeTaskSpec(spec);
+        const evidence = normalizeEvidenceBundle(safeJsonParseObject(cleanString(evidenceRow.evidence_json, 64000)) ?? {});
+        const result = await evaluateEvidenceAgainstSpec(
+          taskId,
+          normalizedSpec,
+          cleanString(evidenceRow.evidence_id, 120),
+          evidence
+        );
+        const verificationResultHash = await sha256Hex(canonicalJson(result));
+        const serverSignature = await signAgentPayload(env, `${taskId}.${verificationResultHash}`);
+        if (!serverSignature) {
+          return Response.json({ ok: false, error: "task_signing_secret_not_configured" }, { status: 503 });
+        }
+        const verificationId = uuid("verify");
+        await env.DB.prepare(
+          `INSERT INTO task_market_verifications (
+            verification_id, task_id, evidence_id, passed, result_json, verification_result_hash, server_signature, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+          .bind(
+            verificationId,
+            taskId,
+            cleanString(evidenceRow.evidence_id, 120),
+            result.passed ? 1 : 0,
+            canonicalJson(result),
+            verificationResultHash,
+            serverSignature,
+            nowMs()
+          )
+          .run();
+        await writeTaskAuditLog(env, {
+          taskId,
+          eventType: "verification_completed",
+          actorWallet: cleanString(evidenceRow.worker_wallet, 200) || null,
+          payload: { verification_id: verificationId, passed: result.passed, verification_result_hash: verificationResultHash },
+        });
+        const responseBody = {
+          ok: true,
+          task_id: taskId,
+          verification_id: verificationId,
+          result,
+          verificationResultHash,
+          serverSignature,
+        };
+        if (idem.key) {
+          await saveIdempotencyRecord(env, {
+            key: idem.key,
+            endpoint,
+            requestHash: idem.requestHash,
+            responseStatus: 200,
+            responseBody,
+          });
+        }
+        return Response.json(responseBody);
+      }
+
+      if (action === "payout-authorize") {
+        const wallet = cleanString(body.worker_wallet ?? body.wallet, 200).toLowerCase();
+        if (!wallet) return Response.json({ ok: false, error: "worker_wallet_required" }, { status: 400 });
+        const active = await loadActiveMarketplaceClaim(env, taskId);
+        if (!active) return Response.json({ ok: false, error: "active_claim_not_found" }, { status: 404 });
+        if (active.worker_wallet !== wallet) {
+          return Response.json({ ok: false, error: "claim_owner_mismatch" }, { status: 403 });
+        }
+        const latestVerification = await env.DB.prepare(
+          `SELECT verification_id, passed, verification_result_hash
+           FROM task_market_verifications
+           WHERE task_id = ?
+           ORDER BY created_at DESC
+           LIMIT 1`
+        )
+          .bind(taskId)
+          .first<Record<string, unknown>>();
+        if (!latestVerification || clampInt(latestVerification.passed, 0, 1, 0) !== 1) {
+          return Response.json({ ok: false, error: "verification_not_passed" }, { status: 409 });
+        }
+        const serverSecret = getTaskSigningSecret(env);
+        if (!serverSecret) {
+          return Response.json({ ok: false, error: "task_signing_secret_not_configured" }, { status: 503 });
+        }
+        const authorizationId = uuid("payoutauth");
+        const payload = {
+          authorization_id: authorizationId,
+          task_id: taskId,
+          claim_id: active.claim_id,
+          worker_wallet: wallet,
+          payout: {
+            amount: task.payout_amount,
+            token: task.payout_token,
+            chain: task.payout_chain,
+          },
+          verification_result_hash: cleanString(latestVerification.verification_result_hash, 200),
+          authorized_at: nowMs(),
+          expires_at: nowMs() + 15 * 60 * 1000,
+          nonce: uuid("nonce"),
+        };
+        const payloadHash = await sha256Hex(canonicalJson(payload));
+        const serverSignature = await hmacSha256Hex(serverSecret, payloadHash);
+        await env.DB.prepare(
+          `INSERT INTO task_market_payout_authorizations (
+            authorization_id, task_id, claim_id, worker_wallet,
+            payout_payload_json, payout_payload_hash, server_signature, status, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'authorized', ?)`
+        )
+          .bind(
+            authorizationId,
+            taskId,
+            active.claim_id,
+            wallet,
+            canonicalJson(payload),
+            payloadHash,
+            serverSignature,
+            nowMs()
+          )
+          .run();
+        await writeTaskAuditLog(env, {
+          taskId,
+          eventType: "payout_authorized",
+          actorWallet: wallet,
+          payload: { authorization_id: authorizationId, payout_payload_hash: payloadHash },
+        });
+        const responseBody = {
+          ok: true,
+          task_id: taskId,
+          authorization_id: authorizationId,
+          payout_authorization: payload,
+          payoutAuthorizationHash: payloadHash,
+          serverSignature,
+        };
+        if (idem.key) {
+          await saveIdempotencyRecord(env, {
+            key: idem.key,
+            endpoint,
+            requestHash: idem.requestHash,
+            responseStatus: 200,
+            responseBody,
+          });
+        }
+        return Response.json(responseBody);
+      }
+
+      return Response.json({ ok: false, error: "unsupported_task_action" }, { status: 400 });
+    }
+
+    if (req.method === "POST" && (url.pathname === `${pluginV1Prefix}/sites/upsert` || url.pathname === `${pluginV1Prefix}/sites/analyze`)) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const normalizedBody =
+        url.pathname === `${pluginV1Prefix}/sites/upsert`
+          ? normalizeSiteUpsertPayload(verified.body)
+          : verified.body;
+      const siteUrl = cleanString(normalizedBody.site_url, 2000);
+      if (!siteUrl) {
+        return Response.json({ ok: false, error: "site_url required." }, { status: 400 });
+      }
+      const saved = await upsertStep1Site(env, normalizedBody);
+      const profile = safeJsonParseObject(saved.site_profile_json) ?? {};
+      const savedInput = safeJsonParseObject(saved.input_json) ?? {};
+      const plan = getSitePlanFromInput(savedInput);
+      return Response.json({
+        ok: true,
+        site_brief_id: saved.site_id,
+        site_id: saved.site_id,
+        site_url: saved.site_url,
+        site_name: saved.site_name,
+        wp_site_id: cleanString(savedInput.wp_site_id, 120) || null,
+        site_profile: profile,
+        site_brief: parseJsonObject(profile.site_brief) ?? null,
+        billing: {
+          model: "per_site",
+          entitlement: {
+            tracked_keywords_cap: SITE_KEYWORD_CAP,
+            tracked_keywords_in_use: SITE_KEYWORD_CAP,
+          },
+          limits: {
+            serp_results_per_keyword_cap: SITE_SERP_RESULTS_CAP,
+            url_fetches_per_day_cap: SITE_MAX_URL_FETCHES_PER_DAY,
+            backlink_enrich_per_day_cap: SITE_MAX_BACKLINK_ENRICH_PER_DAY,
+            competitor_graph_domains_per_day_cap: SITE_MAX_GRAPH_DOMAINS_PER_DAY,
+          },
+        },
+        plugin_ui: {
+          tracking_status: `Tracking ${SITE_KEYWORD_CAP} keywords`,
+          update_cadence: "Daily competitive report updates every 24 hours",
+          local_metro_tracking: plan.metro_proxy
+            ? `Local metro tracking enabled: ${plan.metro ?? "configured"}`
+            : "Local metro tracking disabled",
+        },
+        analyzed_at: saved.last_analysis_at,
+      });
+    }
+
+    const pluginSiteResearchSiteId = parseSiteIdFromPrefixedPath(
+      url.pathname,
+      `${pluginV1Prefix}/sites/`,
+      "/keyword-research"
+    );
+    if (req.method === "POST" && pluginSiteResearchSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const siteId = pluginSiteResearchSiteId;
+      const site = await loadStep1Site(env, siteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const jobId = await createJobRecord(env, {
+        siteId,
+        type: "keyword_research_step1",
+        request: {
+          site_id: siteId,
+          semrush_keywords_count: Array.isArray(verified.body.semrush_keywords)
+            ? verified.body.semrush_keywords.length
+            : 0,
+        },
+      });
+      try {
+        const executed = await runStep1KeywordResearch(env, site, verified.body);
+        await createArtifactRecord(env, {
+          jobId,
+          kind: "keyword_research.results",
+          payload: executed.result,
+        });
+        await finalizeJobSuccess(env, jobId, 1);
+        return Response.json({
+          ok: true,
+          job_id: jobId,
+          site_id: siteId,
+          research_run_id: executed.researchRunId,
+          status: "succeeded",
+          results_ready: true,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        await finalizeJobFailure(env, jobId, "keyword_research_failed", { error: message });
+        await createArtifactRecord(env, {
+          jobId,
+          kind: "keyword_research.error",
+          payload: { error: message },
+        });
+        return Response.json({ ok: false, job_id: jobId, error: message }, { status: 500 });
+      }
+    }
+
+    const pluginSiteStep2RunSiteId = parseSiteIdFromPrefixedPath(url.pathname, `${pluginV1Prefix}/sites/`, "/step2/run");
+    if (req.method === "POST" && pluginSiteStep2RunSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const site = await loadStep1Site(env, pluginSiteStep2RunSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const body = verified.body ?? {};
+      const maxKeywords = clampInt(body.max_keywords, 1, SITE_KEYWORD_CAP, SITE_KEYWORD_CAP);
+      const maxResults = clampInt(body.max_results, 1, SITE_SERP_RESULTS_CAP, SITE_SERP_RESULTS_CAP);
+      const geo = cleanString(body.geo, 120) || "US";
+      const runTypeRaw = cleanString(body.run_type, 20).toLowerCase();
+      const runType: "baseline" | "delta" | "auto" =
+        runTypeRaw === "baseline" || runTypeRaw === "delta" ? runTypeRaw : "auto";
+      const parentJobId = await createJobRecord(env, {
+        siteId: site.site_id,
+        type: "site_daily_run",
+        request: {
+          site_id: site.site_id,
+          max_keywords: maxKeywords,
+          max_results: maxResults,
+          geo,
+          run_type: runType,
+        },
+      });
+      try {
+        const summary = await runStep2DailyHarvest(env, site, {
+          maxKeywords,
+          maxResults,
+          geo,
+          parentJobId,
+          runType,
+        });
+        let mozSummary: Record<string, unknown> | null = null;
+        try {
+          mozSummary = await runMozProfileForSite(env, {
+            site,
+            day: toDateYYYYMMDD(nowMs()),
+            isWeekly: new Date().getUTCDay() === 1,
+            trigger: "step2",
+          });
+          await createArtifactRecord(env, {
+            jobId: parentJobId,
+            kind: "moz.profile.summary",
+            payload: mozSummary,
+          });
+        } catch (mozError) {
+          await createArtifactRecord(env, {
+            jobId: parentJobId,
+            kind: "moz.profile.error",
+            payload: {
+              error: String((mozError as Error)?.message ?? mozError),
+            },
+          });
+        }
+        await createArtifactRecord(env, {
+          jobId: parentJobId,
+          kind: "step2.harvest.summary",
+          payload: summary,
+        });
+        await finalizeJobSuccess(env, parentJobId, Math.max(1, summary.keyword_count));
+        return Response.json({
+          ok: true,
+          job_id: parentJobId,
+          run_type: "site_daily_run",
+          summary,
+          moz_summary: mozSummary,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        await finalizeJobFailure(env, parentJobId, "step2_harvest_failed", { error: message });
+        await createArtifactRecord(env, {
+          jobId: parentJobId,
+          kind: "step2.harvest.error",
+          payload: { error: message },
+        });
+        return Response.json({ ok: false, job_id: parentJobId, error: message }, { status: 500 });
+      }
+    }
+
+    const pluginSiteStep3PlanSiteId = parseSiteIdFromPrefixedPath(url.pathname, `${pluginV1Prefix}/sites/`, "/step3/plan");
+    if (req.method === "POST" && pluginSiteStep3PlanSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const site = await loadStep1Site(env, pluginSiteStep3PlanSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const requestedStep2Date = cleanString(verified.body.step2_date, 20) || null;
+      const parentJobId = await createJobRecord(env, {
+        siteId: site.site_id,
+        type: "step3_local_execution_plan",
+        request: {
+          site_id: site.site_id,
+          step2_date: requestedStep2Date,
+        },
+      });
+      try {
+        const summary = await runStep3LocalExecutionPlan(env, site, {
+          requestedStep2Date,
+          parentJobId,
+        });
+        await createArtifactRecord(env, {
+          jobId: parentJobId,
+          kind: "step3.plan.summary",
+          payload: summary,
+        });
+        await finalizeJobSuccess(env, parentJobId, Math.max(1, clampInt(summary.tasks_total, 1, 500, 1)));
+        return Response.json({
+          ok: true,
+          job_id: parentJobId,
+          site_id: site.site_id,
+          summary,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        await finalizeJobFailure(env, parentJobId, "step3_plan_failed", { error: message });
+        await createArtifactRecord(env, {
+          jobId: parentJobId,
+          kind: "step3.plan.error",
+          payload: { error: message },
+        });
+        return Response.json({ ok: false, job_id: parentJobId, error: message }, { status: 500 });
+      }
+    }
+
+    const pluginTaskBoardSiteId = parseSiteIdFromPrefixedPath(url.pathname, `${pluginV1Prefix}/sites/`, "/tasks/board");
+    if (req.method === "POST" && pluginTaskBoardSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const site = await loadStep1Site(env, pluginTaskBoardSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const requestedRunId = cleanString(verified.body.site_run_id, 120) || null;
+      const runMeta = await loadStep3RunMeta(env, { siteId: site.site_id, runId: requestedRunId });
+      if (!runMeta) {
+        return Response.json({
+          ok: true,
+          ...buildStep3TaskBoardPayload({
+            site,
+            runId: requestedRunId,
+            runDate: null,
+            source: requestedRunId ? "run" : "latest",
+            tasks: [],
+          }),
+        });
+      }
+      const rows = await loadStep3TasksForRun(env, runMeta.run_id);
+      const tasks = rows.map((row) => parseTaskV1FromStored(row, site.site_id, runMeta.run_id));
+      return Response.json({
+        ok: true,
+        ...buildStep3TaskBoardPayload({
+          site,
+          runId: runMeta.run_id,
+          runDate: runMeta.date_yyyymmdd,
+          source: requestedRunId ? "run" : "latest",
+          tasks,
+        }),
+      });
+    }
+
+    const pluginStep3TasksSiteId = parseSiteIdFromPrefixedPath(url.pathname, `${pluginV1Prefix}/sites/`, "/step3/tasks");
+    if (req.method === "POST" && pluginStep3TasksSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const site = await loadStep1Site(env, pluginStep3TasksSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const runIdFilter = cleanString(verified.body.site_run_id, 120) || null;
+      const runMeta = await loadStep3RunMeta(env, { siteId: site.site_id, runId: runIdFilter });
+      if (!runMeta) {
+        return Response.json({
+          ok: true,
+          site_id: site.site_id,
+          site_run_id: runIdFilter,
+          run_date: null,
+          filters_applied: {
+            execution_mode: [],
+            task_group: [],
+            status: [],
+          },
+          count: 0,
+          tasks: [],
+          task_details: { by_id: {} },
+        });
+      }
+      const executionModeFilters = parseStringListInput(verified.body.execution_mode, 30, 30)
+        .map(mapQueryExecutionMode)
+        .filter((v): v is string => !!v);
+      const taskGroupFilters = parseStringListInput(verified.body.task_group, 40, 40)
+        .map((v) => cleanString(v, 40).toUpperCase())
+        .filter(Boolean);
+      const statusFilters = parseStringListInput(verified.body.status, 20, 40)
+        .map(mapQueryStatusToDb)
+        .filter((v): v is string => !!v);
+      const rows = await loadStep3TasksFiltered(env, {
+        siteId: site.site_id,
+        runId: runMeta.run_id,
+        executionModes: executionModeFilters,
+        taskGroups: taskGroupFilters,
+        statuses: statusFilters,
+      });
+      const tasks = rows.map((row) => parseTaskV1FromStored(row, site.site_id, runMeta.run_id));
+      const cards = tasks.map(mapTaskToCard);
+      return Response.json({
+        ok: true,
+        site_id: site.site_id,
+        site_run_id: runMeta.run_id,
+        run_date: runMeta.date_yyyymmdd,
+        filters_applied: {
+          execution_mode: executionModeFilters,
+          task_group: taskGroupFilters,
+          status: statusFilters,
+        },
+        count: cards.length,
+        tasks: cards,
+        task_details: {
+          by_id: Object.fromEntries(tasks.map((task) => [task.task_id, task])),
+        },
+      });
+    }
+
+    const pluginTaskDetailMatch = url.pathname.match(/^\/plugin\/wp\/v1\/sites\/([^/]+)\/tasks\/([^/]+)$/);
+    if (pluginTaskDetailMatch && req.method === "POST") {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const siteId = cleanString(decodeURIComponent(pluginTaskDetailMatch[1]), 120);
+      const taskId = cleanString(decodeURIComponent(pluginTaskDetailMatch[2]), 120);
+      if (!siteId || !taskId) {
+        return Response.json({ ok: false, error: "invalid_site_or_task_id" }, { status: 400 });
+      }
+      const site = await loadStep1Site(env, siteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const targetStatus = normalizeTaskStatusInput(verified.body.status);
+      if (!targetStatus) {
+        return Response.json(
+          {
+            ok: false,
+            error: "status_required",
+            allowed_statuses: ["READY", "IN_PROGRESS", "DONE", "BLOCKED"],
+          },
+          { status: 400 }
+        );
+      }
+      const blockers = parseBlockersFromBody(verified.body);
+      const updated = await updateStep3TaskStatus(env, {
+        siteId: site.site_id,
+        taskId,
+        targetStatus,
+        blockers,
+      });
+      if (updated.ok === false) {
+        return Response.json(
+          { ok: false, error: updated.error, current_status: updated.current ?? null },
+          { status: updated.status }
+        );
+      }
+      return Response.json({ ok: true, task: updated.task });
+    }
+
+    const pluginSiteTasksBulkSiteId = parseSiteIdFromPrefixedPath(url.pathname, `${pluginV1Prefix}/sites/`, "/tasks/bulk");
+    if (req.method === "POST" && pluginSiteTasksBulkSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const site = await loadStep1Site(env, pluginSiteTasksBulkSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const actionRaw = cleanString(verified.body.action, 60).toUpperCase();
+      if (actionRaw !== "AUTO_APPLY_READY" && actionRaw !== "MARK_DONE_SELECTED") {
+        return Response.json(
+          {
+            ok: false,
+            error: "invalid_action",
+            allowed_actions: ["AUTO_APPLY_READY", "MARK_DONE_SELECTED"],
+          },
+          { status: 400 }
+        );
+      }
+      const runIdRequested = cleanString(verified.body.site_run_id, 120) || null;
+      const runMeta = await loadStep3RunMeta(env, { siteId: site.site_id, runId: runIdRequested });
+      if (!runMeta) {
+        return Response.json({ ok: false, error: "run_not_found" }, { status: 404 });
+      }
+      const taskIds = parseStringListInput(verified.body.task_ids, 300, 120);
+      if (actionRaw === "MARK_DONE_SELECTED" && taskIds.length < 1) {
+        return Response.json(
+          { ok: false, error: "task_ids_required_for_mark_done_selected" },
+          { status: 400 }
+        );
+      }
+      const result = await runStep3BulkAction(env, {
+        siteId: site.site_id,
+        runId: runMeta.run_id,
+        action: actionRaw,
+        taskIds,
+      });
+      return Response.json({ ok: true, ...result });
+    }
 
     if (req.method === "POST" && (url.pathname === "/v1/sites/upsert" || url.pathname === "/v1/sites/analyze")) {
       let body: Record<string, unknown> | null = null;
@@ -8137,6 +10819,18 @@ export default {
       const maxResults = clampInt(body.max_results, 1, SERP_MAX_RESULTS, SERP_MAX_RESULTS);
       const serpUrl = buildGoogleQueryUrl(phrase, region);
       const proxyLeaseId = cleanString(body.proxy_lease_id, 120) || null;
+      const siteIdHint = cleanString(body.site_id, 120) || null;
+      const siteProfile =
+        siteIdHint && (await loadStep1Site(env, siteIdHint))
+          ? await loadSiteProviderProfile(env, siteIdHint)
+          : null;
+      const serpProvider = siteProfile?.serp_provider ?? normalizeSerpProvider(body.serp_provider);
+      const geoProvider = siteProfile?.geo_provider ?? normalizeGeoProvider(body.geo_provider);
+      const geoMapped = mapGeoForProvider(
+        cleanString(body.geo_label, 120) || cleanString(region.city ?? region.region, 120) || "us",
+        region,
+        geoProvider
+      );
 
       let activeLease: ProxyLeaseRow | null = null;
       if (proxyLeaseId) {
@@ -8158,6 +10852,9 @@ export default {
           region,
           device,
           max_results: maxResults,
+          site_id: siteIdHint,
+          serp_provider: serpProvider,
+          geo_provider: geoProvider,
           proxy_lease_id: proxyLeaseId,
         },
       });
@@ -8165,10 +10862,14 @@ export default {
       const collected = await collectAndPersistSerpTop20(env, {
         userId,
         phrase,
-        region,
+        region: geoMapped.region,
         device,
         maxResults,
         proxyUrl: activeLease?.proxy_url ?? null,
+        provider: serpProvider,
+        geoProvider,
+        geoLabel: geoMapped.decodoGeoLabel ?? (cleanString(body.geo_label, 120) || null),
+        auditJobId: jobId,
       });
       if (collected.ok === false) {
         await finalizeJobFailure(env, jobId, "serp_collect_failed", {
@@ -8222,6 +10923,8 @@ export default {
         serp_url: serpUrl,
         provider: collected.provider,
         actor: collected.actor,
+        extractor_mode: collected.extractorMode,
+        fallback_reason: collected.fallbackReason,
         proxy_lease_id: activeLease?.lease_id ?? null,
         proxy_geo: activeLease
           ? {
@@ -8493,6 +11196,641 @@ export default {
       });
     }
 
+    const siteMozBudgetSiteId = parseSiteIdFromPath(url.pathname, "/moz/budget");
+    if (req.method === "GET" && siteMozBudgetSiteId) {
+      const site = await loadStep1Site(env, siteMozBudgetSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const estimate = estimateMozRowBudget({
+        keywords: clampInt(url.searchParams.get("keywords"), 1, 500, SITE_KEYWORD_CAP),
+        daily_new_entrants: clampInt(url.searchParams.get("daily_new_entrants"), 0, 5000, 0),
+        daily_top_movers: clampInt(url.searchParams.get("daily_top_movers"), 0, 5000, 0),
+        baseline_mode:
+          cleanString(url.searchParams.get("baseline_mode"), 20).toLowerCase() === "fuller"
+            ? "fuller"
+            : "light",
+        cost_per_1k_rows_usd: Number(url.searchParams.get("cost_per_1k_rows_usd") || MOZ_DEFAULT_COST_PER_1K_ROWS_USD),
+      });
+      const profile = await loadMozSiteProfile(env, site.site_id);
+      const isWeekly = new Date().getUTCDay() === 1;
+      const plan = await buildMozExecutionPlan(env, {
+        siteId: site.site_id,
+        day: toDateYYYYMMDD(nowMs()),
+        profile,
+        isWeekly,
+      });
+      return Response.json({ ok: true, site_id: site.site_id, profile, estimate, plan });
+    }
+
+    const siteProvidersSiteId = parseSiteIdFromPath(url.pathname, "/providers");
+    if (req.method === "GET" && siteProvidersSiteId) {
+      const site = await loadStep1Site(env, siteProvidersSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const providers = await loadSiteProviderProfile(env, site.site_id);
+      return Response.json({ ok: true, site_id: site.site_id, providers });
+    }
+    if (req.method === "POST" && siteProvidersSiteId) {
+      const site = await loadStep1Site(env, siteProvidersSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const providers = await upsertSiteProviderProfile(env, {
+        siteId: site.site_id,
+        serpProvider: normalizeSerpProvider(body.serp_provider),
+        pageProvider: normalizePageProvider(body.page_provider),
+        geoProvider: normalizeGeoProvider(body.geo_provider),
+      });
+      return Response.json({ ok: true, site_id: site.site_id, providers });
+    }
+
+    const siteMozProfileSiteId = parseSiteIdFromPath(url.pathname, "/moz/profile");
+    if (req.method === "GET" && siteMozProfileSiteId) {
+      const site = await loadStep1Site(env, siteMozProfileSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const profile = await loadMozSiteProfile(env, site.site_id);
+      return Response.json({ ok: true, site_id: site.site_id, profile });
+    }
+
+    if (req.method === "POST" && siteMozProfileSiteId) {
+      const site = await loadStep1Site(env, siteMozProfileSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const mozProfileRaw = cleanString(body.moz_profile, 40).toLowerCase();
+      const mozProfile: MozProfileName = mozProfileRaw === "scalable_delta" ? "scalable_delta" : "single_site_max";
+      const profile = await upsertMozSiteProfile(env, {
+        siteId: site.site_id,
+        mozProfile,
+        monthlyRowsBudget: clampInt(body.moz_monthly_rows_budget ?? body.monthly_rows_budget, 0, 100_000_000, 15_000),
+        weeklyFocusUrlCount: clampInt(body.weekly_focus_url_count, 1, 500, 20),
+        dailyKeywordDepth: clampInt(body.daily_keyword_depth, 1, 20, 20),
+      });
+      return Response.json({ ok: true, site_id: site.site_id, profile });
+    }
+
+    const siteMozRunSiteId = parseSiteIdFromPath(url.pathname, "/moz/run");
+    if (req.method === "POST" && siteMozRunSiteId) {
+      const site = await loadStep1Site(env, siteMozRunSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      body = body ?? {};
+      const day = normalizeDayString(body.day);
+      const isWeekly = parseBoolUnknown(body.is_weekly, new Date().getUTCDay() === 1);
+      const summary = await runMozProfileForSite(env, {
+        site,
+        day,
+        isWeekly,
+        trigger: "manual",
+      });
+      return Response.json({ ok: true, summary });
+    }
+
+    if (req.method === "POST" && url.pathname === "/moz/url-metrics") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const rows = Array.isArray(body.rows) ? body.rows : [];
+      if (rows.length < 1) {
+        return Response.json({ ok: false, error: "rows_required" }, { status: 400 });
+      }
+      const userId = cleanString(body.user_id, 120) || null;
+      const siteId = cleanString(body.site_id, 120) || null;
+      const geoKey = parseMozGeoKey(body.geo_key);
+      const collectedDay = normalizeDayString(body.collected_day);
+      const jobId = await createJobRecord(env, {
+        userId,
+        siteId,
+        type: "moz_url_metrics",
+        request: { row_count: rows.length, geo_key: geoKey, collected_day: collectedDay },
+      });
+      let stored = 0;
+      for (const raw of rows) {
+        const row = parseJsonObject(raw);
+        if (!row) continue;
+        const urlId = await getOrCreateUrlId(env, cleanString(row.url, 2000));
+        if (!urlId) continue;
+        await env.DB.prepare(
+          `INSERT INTO moz_url_metrics_snapshots (
+            snapshot_id, url_id, collected_day, geo_key,
+            page_authority, domain_authority, spam_score, linking_domains, external_links,
+            metrics_json, job_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(url_id, collected_day, geo_key) DO UPDATE SET
+            page_authority = excluded.page_authority,
+            domain_authority = excluded.domain_authority,
+            spam_score = excluded.spam_score,
+            linking_domains = excluded.linking_domains,
+            external_links = excluded.external_links,
+            metrics_json = excluded.metrics_json,
+            job_id = excluded.job_id,
+            created_at = excluded.created_at`
+        )
+          .bind(
+            uuid("mozurl"),
+            urlId,
+            collectedDay,
+            geoKey,
+            Number(row.page_authority ?? row.pa ?? 0) || null,
+            Number(row.domain_authority ?? row.da ?? 0) || null,
+            Number(row.spam_score ?? row.spam ?? 0) || null,
+            clampInt(row.linking_domains, 0, 100000000, 0) || null,
+            clampInt(row.external_links, 0, 100000000, 0) || null,
+            safeJsonStringify(row, 32000),
+            jobId,
+            Math.floor(nowMs() / 1000)
+          )
+          .run();
+        stored += 1;
+      }
+      await createArtifactRecord(env, {
+        jobId,
+        kind: "moz.url_metrics.raw",
+        payload: { request: body, stored_rows: stored },
+      });
+      let usageSiteId: string | null = null;
+      let usageProfile: MozProfileName | null = null;
+      if (siteId) {
+        const usageSite = await loadStep1Site(env, siteId);
+        if (usageSite) {
+          usageSiteId = usageSite.site_id;
+          usageProfile = (await loadMozSiteProfile(env, usageSite.site_id)).moz_profile;
+        }
+      }
+      await recordMozJobUsage(env, {
+        siteId: usageSiteId,
+        day: collectedDay,
+        jobId,
+        jobType: "moz_url_metrics",
+        rowsUsed: stored,
+        degradedMode: parseBoolUnknown(body.degraded_mode, false),
+        fallbackReason: cleanString(body.fallback_reason, 200) || null,
+        profile: usageProfile,
+      });
+      await finalizeJobSuccess(env, jobId, Math.max(1, stored));
+      return Response.json({ ok: true, job_id: jobId, stored_rows: stored, collected_day: collectedDay, geo_key: geoKey });
+    }
+
+    if (req.method === "POST" && url.pathname === "/moz/anchor-text") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const targetUrl = cleanString(body.target_url, 2000);
+      if (!targetUrl) return Response.json({ ok: false, error: "target_url_required" }, { status: 400 });
+      const urlId = await getOrCreateUrlId(env, targetUrl);
+      if (!urlId) return Response.json({ ok: false, error: "invalid_target_url" }, { status: 400 });
+      const anchors = parseStringArray(body.top_anchors, 200, 400);
+      const jobId = await createJobRecord(env, {
+        userId: cleanString(body.user_id, 120) || null,
+        siteId: cleanString(body.site_id, 120) || null,
+        type: "moz_anchor_text",
+        request: { target_url: targetUrl, anchor_count: anchors.length },
+      });
+      const collectedDay = normalizeDayString(body.collected_day);
+      await env.DB.prepare(
+        `INSERT INTO moz_anchor_text_snapshots (
+          snapshot_id, target_url_id, collected_day, top_anchors_json, total_anchor_rows, totals_json, job_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target_url_id, collected_day) DO UPDATE SET
+          top_anchors_json = excluded.top_anchors_json,
+          total_anchor_rows = excluded.total_anchor_rows,
+          totals_json = excluded.totals_json,
+          job_id = excluded.job_id,
+          created_at = excluded.created_at`
+      )
+        .bind(
+          uuid("mozanch"),
+          urlId,
+          collectedDay,
+          safeJsonStringify(anchors, 32000),
+          anchors.length,
+          safeJsonStringify(parseJsonObject(body.totals) ?? {}, 8000),
+          jobId,
+          Math.floor(nowMs() / 1000)
+        )
+        .run();
+      await createArtifactRecord(env, {
+        jobId,
+        kind: "moz.anchor_text.raw",
+        payload: body,
+      });
+      let usageSiteId: string | null = null;
+      let usageProfile: MozProfileName | null = null;
+      const bodySiteId = cleanString(body.site_id, 120);
+      if (bodySiteId) {
+        const usageSite = await loadStep1Site(env, bodySiteId);
+        if (usageSite) {
+          usageSiteId = usageSite.site_id;
+          usageProfile = (await loadMozSiteProfile(env, usageSite.site_id)).moz_profile;
+        }
+      }
+      await recordMozJobUsage(env, {
+        siteId: usageSiteId,
+        day: collectedDay,
+        jobId,
+        jobType: "moz_anchor_text",
+        rowsUsed: anchors.length,
+        degradedMode: parseBoolUnknown(body.degraded_mode, false),
+        fallbackReason: cleanString(body.fallback_reason, 200) || null,
+        profile: usageProfile,
+      });
+      await finalizeJobSuccess(env, jobId, Math.max(1, anchors.length));
+      return Response.json({ ok: true, job_id: jobId, target_url_id: urlId, collected_day: collectedDay, anchor_count: anchors.length });
+    }
+
+    if (req.method === "POST" && url.pathname === "/moz/linking-root-domains") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const targetUrl = cleanString(body.target_url, 2000);
+      if (!targetUrl) return Response.json({ ok: false, error: "target_url_required" }, { status: 400 });
+      const urlId = await getOrCreateUrlId(env, targetUrl);
+      if (!urlId) return Response.json({ ok: false, error: "invalid_target_url" }, { status: 400 });
+      const domainsRaw = Array.isArray(body.top_domains) ? body.top_domains : [];
+      const topDomains = domainsRaw
+        .map((raw) => parseJsonObject(raw))
+        .filter((v): v is Record<string, unknown> => !!v)
+        .slice(0, 500);
+      const jobId = await createJobRecord(env, {
+        userId: cleanString(body.user_id, 120) || null,
+        siteId: cleanString(body.site_id, 120) || null,
+        type: "moz_linking_root_domains",
+        request: { target_url: targetUrl, domain_rows: topDomains.length },
+      });
+      const collectedDay = normalizeDayString(body.collected_day);
+      await env.DB.prepare(
+        `INSERT INTO moz_linking_root_domains_snapshots (
+          snapshot_id, target_url_id, collected_day, top_domains_json, total_domain_rows, totals_json, job_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target_url_id, collected_day) DO UPDATE SET
+          top_domains_json = excluded.top_domains_json,
+          total_domain_rows = excluded.total_domain_rows,
+          totals_json = excluded.totals_json,
+          job_id = excluded.job_id,
+          created_at = excluded.created_at`
+      )
+        .bind(
+          uuid("mozroot"),
+          urlId,
+          collectedDay,
+          safeJsonStringify(topDomains, 32000),
+          topDomains.length,
+          safeJsonStringify(parseJsonObject(body.totals) ?? {}, 8000),
+          jobId,
+          Math.floor(nowMs() / 1000)
+        )
+        .run();
+      await createArtifactRecord(env, {
+        jobId,
+        kind: "moz.linking_root_domains.raw",
+        payload: body,
+      });
+      let usageSiteId: string | null = null;
+      let usageProfile: MozProfileName | null = null;
+      const bodySiteId = cleanString(body.site_id, 120);
+      if (bodySiteId) {
+        const usageSite = await loadStep1Site(env, bodySiteId);
+        if (usageSite) {
+          usageSiteId = usageSite.site_id;
+          usageProfile = (await loadMozSiteProfile(env, usageSite.site_id)).moz_profile;
+        }
+      }
+      await recordMozJobUsage(env, {
+        siteId: usageSiteId,
+        day: collectedDay,
+        jobId,
+        jobType: "moz_linking_root_domains",
+        rowsUsed: topDomains.length,
+        degradedMode: parseBoolUnknown(body.degraded_mode, false),
+        fallbackReason: cleanString(body.fallback_reason, 200) || null,
+        profile: usageProfile,
+      });
+      await finalizeJobSuccess(env, jobId, Math.max(1, topDomains.length));
+      return Response.json({
+        ok: true,
+        job_id: jobId,
+        target_url_id: urlId,
+        collected_day: collectedDay,
+        domain_rows: topDomains.length,
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/moz/link-intersect") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const collectedDay = normalizeDayString(body.collected_day);
+      const cluster = cleanString(body.cluster, 160) || null;
+      const siteId = cleanString(body.site_id, 120) || null;
+      const payload = parseJsonObject(body.intersect) ?? {};
+      const jobId = await createJobRecord(env, {
+        userId: cleanString(body.user_id, 120) || null,
+        siteId,
+        type: "moz_link_intersect",
+        request: { cluster, collected_day: collectedDay },
+      });
+      await env.DB.prepare(
+        `INSERT INTO moz_link_intersect_snapshots (
+          snapshot_id, site_id, cluster, collected_day, intersect_json, totals_json, job_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          uuid("mozint"),
+          siteId,
+          cluster,
+          collectedDay,
+          safeJsonStringify(payload, 32000),
+          safeJsonStringify(parseJsonObject(body.totals) ?? {}, 8000),
+          jobId,
+          Math.floor(nowMs() / 1000)
+        )
+        .run();
+      await createArtifactRecord(env, { jobId, kind: "moz.link_intersect.raw", payload: body });
+      let usageSiteId: string | null = null;
+      let usageProfile: MozProfileName | null = null;
+      if (siteId) {
+        const usageSite = await loadStep1Site(env, siteId);
+        if (usageSite) {
+          usageSiteId = usageSite.site_id;
+          usageProfile = (await loadMozSiteProfile(env, usageSite.site_id)).moz_profile;
+        }
+      }
+      await recordMozJobUsage(env, {
+        siteId: usageSiteId,
+        day: collectedDay,
+        jobId,
+        jobType: "moz_link_intersect",
+        rowsUsed: clampInt(body.rows_used, 0, 1_000_000_000, 1),
+        degradedMode: parseBoolUnknown(body.degraded_mode, false),
+        fallbackReason: cleanString(body.fallback_reason, 200) || null,
+        profile: usageProfile,
+      });
+      await finalizeJobSuccess(env, jobId, 1);
+      return Response.json({ ok: true, job_id: jobId, collected_day: collectedDay, cluster, site_id: siteId });
+    }
+
+    if (req.method === "POST" && url.pathname === "/moz/usage-data") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const collectedDay = normalizeDayString(body.collected_day);
+      const usage = parseJsonObject(body.usage) ?? body;
+      const rowsUsed = clampInt(usage.rows_used, 0, 10_000_000_000, 0);
+      const rowsLimit = clampInt(usage.rows_limit, 0, 10_000_000_000, 0);
+      const jobId = await createJobRecord(env, {
+        userId: cleanString(body.user_id, 120) || null,
+        siteId: cleanString(body.site_id, 120) || null,
+        type: "moz_usage_data",
+        request: { collected_day: collectedDay, rows_used: rowsUsed, rows_limit: rowsLimit },
+      });
+      await env.DB.prepare(
+        `INSERT INTO moz_usage_snapshots (
+          snapshot_id, collected_day, usage_json, rows_used, rows_limit, job_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(collected_day) DO UPDATE SET
+          usage_json = excluded.usage_json,
+          rows_used = excluded.rows_used,
+          rows_limit = excluded.rows_limit,
+          job_id = excluded.job_id,
+          created_at = excluded.created_at`
+      )
+        .bind(
+          uuid("mozuse"),
+          collectedDay,
+          safeJsonStringify(usage, 32000),
+          rowsUsed || null,
+          rowsLimit || null,
+          jobId,
+          Math.floor(nowMs() / 1000)
+        )
+        .run();
+      await createArtifactRecord(env, { jobId, kind: "moz.usage_data.raw", payload: body });
+      let usageSiteId: string | null = null;
+      let usageProfile: MozProfileName | null = null;
+      const bodySiteId = cleanString(body.site_id, 120);
+      if (bodySiteId) {
+        const usageSite = await loadStep1Site(env, bodySiteId);
+        if (usageSite) {
+          usageSiteId = usageSite.site_id;
+          usageProfile = (await loadMozSiteProfile(env, usageSite.site_id)).moz_profile;
+        }
+      }
+      await recordMozJobUsage(env, {
+        siteId: usageSiteId,
+        day: collectedDay,
+        jobId,
+        jobType: "moz_usage_data",
+        rowsUsed: 1,
+        degradedMode: parseBoolUnknown(body.degraded_mode, false),
+        fallbackReason: cleanString(body.fallback_reason, 200) || null,
+        profile: usageProfile,
+      });
+      await finalizeJobSuccess(env, jobId, 1);
+      return Response.json({ ok: true, job_id: jobId, collected_day: collectedDay, rows_used: rowsUsed, rows_limit: rowsLimit });
+    }
+
+    if (req.method === "POST" && url.pathname === "/moz/index-metadata") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const collectedDay = normalizeDayString(body.collected_day);
+      const metadata = parseJsonObject(body.metadata) ?? body;
+      const indexUpdatedAt = cleanString(metadata.index_updated_at ?? metadata.last_updated, 80) || null;
+      const jobId = await createJobRecord(env, {
+        userId: cleanString(body.user_id, 120) || null,
+        siteId: cleanString(body.site_id, 120) || null,
+        type: "moz_index_metadata",
+        request: { collected_day: collectedDay, index_updated_at: indexUpdatedAt },
+      });
+      await env.DB.prepare(
+        `INSERT INTO moz_index_metadata_snapshots (
+          snapshot_id, collected_day, metadata_json, index_updated_at, job_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(collected_day) DO UPDATE SET
+          metadata_json = excluded.metadata_json,
+          index_updated_at = excluded.index_updated_at,
+          job_id = excluded.job_id,
+          created_at = excluded.created_at`
+      )
+        .bind(
+          uuid("mozidx"),
+          collectedDay,
+          safeJsonStringify(metadata, 32000),
+          indexUpdatedAt,
+          jobId,
+          Math.floor(nowMs() / 1000)
+        )
+        .run();
+      await createArtifactRecord(env, { jobId, kind: "moz.index_metadata.raw", payload: body });
+      let usageSiteId: string | null = null;
+      let usageProfile: MozProfileName | null = null;
+      const bodySiteId = cleanString(body.site_id, 120);
+      if (bodySiteId) {
+        const usageSite = await loadStep1Site(env, bodySiteId);
+        if (usageSite) {
+          usageSiteId = usageSite.site_id;
+          usageProfile = (await loadMozSiteProfile(env, usageSite.site_id)).moz_profile;
+        }
+      }
+      await recordMozJobUsage(env, {
+        siteId: usageSiteId,
+        day: collectedDay,
+        jobId,
+        jobType: "moz_index_metadata",
+        rowsUsed: 1,
+        degradedMode: parseBoolUnknown(body.degraded_mode, false),
+        fallbackReason: cleanString(body.fallback_reason, 200) || null,
+        profile: usageProfile,
+      });
+      await finalizeJobSuccess(env, jobId, 1);
+      return Response.json({ ok: true, job_id: jobId, collected_day: collectedDay, index_updated_at: indexUpdatedAt });
+    }
+
+    if (req.method === "POST" && url.pathname === "/page/fetch") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) {
+        return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      }
+      const urlToFetch = cleanString(body.url, 2000);
+      const siteId = cleanString(body.site_id, 120) || null;
+      if (!urlToFetch) {
+        return Response.json({ ok: false, error: "url_required" }, { status: 400 });
+      }
+      const site = siteId ? await loadStep1Site(env, siteId) : null;
+      const providers = site ? await loadSiteProviderProfile(env, site.site_id) : null;
+      const pageProvider = providers?.page_provider ?? normalizePageProvider(body.page_provider);
+      const geoProvider = providers?.geo_provider ?? normalizeGeoProvider(body.geo_provider);
+      const geoLabel = cleanString(body.geo_label, 120) || "us";
+      const jobId = await createJobRecord(env, {
+        siteId: site?.site_id ?? null,
+        userId: cleanString(body.user_id, 120) || null,
+        type: "page_fetch_extract",
+        request: {
+          url: urlToFetch,
+          site_id: site?.site_id ?? null,
+          page_provider: pageProvider,
+          geo_provider: geoProvider,
+          geo_label: geoLabel,
+        },
+      });
+      const cache: { etag: string | null; last_modified: string | null; html: string | null } | null = null;
+      const fetched = await fetchPageHtmlByProvider(env, {
+        pageProvider,
+        geoProvider,
+        geoLabel,
+        url: urlToFetch,
+        timeoutMs: clampInt(body.timeout_ms, 1000, 20000, 8000),
+        cache,
+      });
+      if (!fetched.html) {
+        await finalizeJobFailure(env, jobId, "page_fetch_failed", {
+          url: urlToFetch,
+          status: fetched.status,
+          extractor_mode: fetched.extractor_mode,
+          fallback_reason: fetched.fallback_reason,
+        });
+        return Response.json(
+          {
+            ok: false,
+            error: "page_fetch_failed",
+            job_id: jobId,
+            status: fetched.status,
+            extractor_mode: fetched.extractor_mode,
+            fallback_reason: fetched.fallback_reason,
+          },
+          { status: 502 }
+        );
+      }
+      const persisted = await persistCanonicalPageSnapshot(env, {
+        url: urlToFetch,
+        html: fetched.html,
+        parserVersion: fetched.extractor_mode === "decodo_web_api" ? "decodo-web-v1" : "direct-fetch-v1",
+        rawSha256: fetched.raw_payload_sha256,
+      });
+      await createArtifactRecord(env, {
+        jobId,
+        kind: "page.fetch.audit",
+        payload: {
+          url: urlToFetch,
+          site_id: site?.site_id ?? null,
+          extractor_mode: fetched.extractor_mode,
+          fallback_reason: fetched.fallback_reason,
+          raw_payload_sha256: fetched.raw_payload_sha256,
+          provider_task_id: fetched.provider_task_id,
+          url_id: persisted.urlId,
+          page_snapshot_id: persisted.pageSnapshotId,
+          content_hash: persisted.contentHash,
+        },
+      });
+      await finalizeJobSuccess(env, jobId, 1);
+      return Response.json({
+        ok: true,
+        job_id: jobId,
+        url: urlToFetch,
+        site_id: site?.site_id ?? null,
+        extractor_mode: fetched.extractor_mode,
+        fallback_reason: fetched.fallback_reason,
+        provider_task_id: fetched.provider_task_id,
+        url_id: persisted.urlId,
+        page_snapshot_id: persisted.pageSnapshotId,
+        content_hash: persisted.contentHash,
+      });
+    }
+
     if (req.method === "POST" && url.pathname === "/serp/watchlist/save") {
       let body: Record<string, unknown> | null = null;
       try {
@@ -8562,11 +11900,13 @@ export default {
       const watchId = cleanString(body.watch_id, 120);
       const limit = clampInt(body.limit, 1, 500, 100);
       const force = parseBoolUnknown(body.force, false);
+      const proxyLeaseId = cleanString(body.proxy_lease_id, 120) || null;
       const summary = await runSerpWatchlist(env, {
         userId,
         watchId,
         limit,
         force,
+        proxyLeaseId,
       });
       return Response.json({
         ok: true,
@@ -8875,6 +12215,7 @@ export default {
         watchId: "",
         limit: 500,
         force: false,
+        proxyLeaseId: null,
       });
       const step2Sites = await listStep2EligibleSites(env, 20);
       const step2Summaries: Array<Record<string, unknown>> = [];
@@ -8887,10 +12228,25 @@ export default {
             parentJobId: null,
             runType: "auto",
           });
+          let mozSummary: Record<string, unknown> | null = null;
+          try {
+            mozSummary = await runMozProfileForSite(env, {
+              site,
+              day: toDateYYYYMMDD(scheduledTs),
+              isWeekly: isWeeklyRefresh,
+              trigger: "cron",
+            });
+          } catch (mozError) {
+            mozSummary = {
+              ok: false,
+              error: String((mozError as Error)?.message ?? mozError),
+            };
+          }
           step2Summaries.push({
             site_id: site.site_id,
             ok: true,
             summary,
+            moz_summary: mozSummary,
           });
         } catch (error) {
           step2Summaries.push({
