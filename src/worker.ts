@@ -31,6 +31,8 @@ const SITE_MAX_GRAPH_DOMAINS_PER_DAY = 10;
 const TASK_MAX_CLAIM_MINUTES = 24 * 60;
 const MOZ_DEFAULT_COST_PER_1K_ROWS_USD = 5;
 const DECODO_DEFAULT_TASKS_URL = "https://scraper-api.decodo.com/v1/tasks";
+const MEMORY_EMBEDDING_MODEL = "text-embedding-3-small";
+const MEMORY_EMBEDDING_DIMS = 1536;
 
 type PlanDefinition = {
   key: "starter" | "growth" | "agency";
@@ -9727,7 +9729,23 @@ async function savePlanSelection(
   return { subscriptionId };
 }
 
-async function embedTextOpenAI(env: Env, text: string): Promise<{ embedding: number[]; tokenCount: number | null }> {
+async function makeMemoryVectorId(input: {
+  namespace: string;
+  siteId: string;
+  type: string;
+  geoKey: string;
+  collectedDay: string;
+  scopeKey: string;
+}): Promise<string> {
+  const raw = `${input.namespace}|${input.siteId}|${input.type}|${input.geoKey}|${input.collectedDay}|${input.scopeKey}`;
+  const hash = await sha256Hex(raw);
+  return `m_${hash.slice(0, 24)}`;
+}
+
+async function embedTextOpenAI(
+  env: Env,
+  text: string
+): Promise<{ embedding: number[]; tokenCount: number | null; model: string; dims: number }> {
   const apiKey = cleanString(env.OPENAI_API_KEY, 300);
   if (!apiKey) {
     throw new Error("openai_api_key_not_configured");
@@ -9739,7 +9757,7 @@ async function embedTextOpenAI(env: Env, text: string): Promise<{ embedding: num
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "text-embedding-3-large",
+      model: MEMORY_EMBEDDING_MODEL,
       input: text,
     }),
   });
@@ -9761,7 +9779,23 @@ async function embedTextOpenAI(env: Env, text: string): Promise<{ embedding: num
   return {
     embedding,
     tokenCount: usage ? clampInt(usage.total_tokens, 0, Number.MAX_SAFE_INTEGER, 0) : null,
+    model: MEMORY_EMBEDDING_MODEL,
+    dims: embedding.length,
   };
+}
+
+function projectEmbeddingToVectorDims(embedding: number[]): number[] {
+  if (embedding.length === MEMORY_EMBEDDING_DIMS) {
+    return embedding;
+  }
+  if (embedding.length === MEMORY_EMBEDDING_DIMS * 2) {
+    const out: number[] = [];
+    for (let i = 0; i < MEMORY_EMBEDDING_DIMS; i += 1) {
+      out.push((embedding[i] + embedding[i + MEMORY_EMBEDDING_DIMS]) / 2);
+    }
+    return out;
+  }
+  throw new Error(`embedding_dimension_unsupported:${embedding.length}`);
 }
 
 async function upsertSemanticMemory(
@@ -9795,12 +9829,20 @@ async function upsertSemanticMemory(
   });
 
   const embedded = await embedTextOpenAI(env, input.text_summary);
-  const vectorId = `mem_v1:${siteId}:${input.type}:${input.geo_key}:${input.collected_day}:${scopeKey}`;
+  const vectorValues = projectEmbeddingToVectorDims(embedded.embedding);
+  const vectorId = await makeMemoryVectorId({
+    namespace: "mem_v1",
+    siteId,
+    type: input.type,
+    geoKey: input.geo_key,
+    collectedDay: input.collected_day,
+    scopeKey,
+  });
 
   await env.USER_MEM.upsert([
     {
       id: vectorId,
-      values: embedded.embedding,
+      values: vectorValues,
       metadata: {
         site_id: siteId,
         type: input.type,
@@ -9815,8 +9857,8 @@ async function upsertSemanticMemory(
     `INSERT INTO memory_items (
       memory_id, site_id, type, scope_key, collected_day, geo_key,
       title, text_summary, tags_json, source_r2_key, source_sha256,
-      vector_namespace, vector_id, embedding_model, token_count, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mem_v1', ?, 'text-embedding-3-large', ?, strftime('%s','now'), strftime('%s','now'))
+      vector_namespace, vector_id, embedding_model, embedding_dims, token_count, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mem_v1', ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'))
     ON CONFLICT(site_id, type, COALESCE(scope_key,''), collected_day, geo_key) DO UPDATE SET
       title = excluded.title,
       text_summary = excluded.text_summary,
@@ -9824,6 +9866,8 @@ async function upsertSemanticMemory(
       source_r2_key = excluded.source_r2_key,
       source_sha256 = excluded.source_sha256,
       vector_id = excluded.vector_id,
+      embedding_model = excluded.embedding_model,
+      embedding_dims = excluded.embedding_dims,
       token_count = excluded.token_count,
       updated_at = strftime('%s','now')`
   )
@@ -9840,6 +9884,8 @@ async function upsertSemanticMemory(
       r2Key,
       payloadSha,
       vectorId,
+      embedded.model,
+      vectorValues.length,
       embedded.tokenCount
     )
     .run();
@@ -9869,11 +9915,12 @@ async function searchSemanticMemory(
     throw new Error("vectorize_binding_missing");
   }
   const embedded = await embedTextOpenAI(env, query);
+  const queryVector = projectEmbeddingToVectorDims(embedded.embedding);
   const vectorFilter: Record<string, unknown> = { site_id: siteId };
   if (options.type) vectorFilter.type = options.type;
   if (options.geoKey) vectorFilter.geo_key = options.geoKey;
 
-  const vectorResponse = (await env.USER_MEM.query(embedded.embedding, {
+  const vectorResponse = (await env.USER_MEM.query(queryVector, {
     topK: options.k,
     filter: vectorFilter,
   })) as { matches?: Array<{ id: string; score: number }> };
@@ -9889,7 +9936,7 @@ async function searchSemanticMemory(
   const stmt = env.DB.prepare(
     `SELECT
        memory_id, site_id, type, scope_key, collected_day, geo_key, title,
-       tags_json, source_r2_key, source_sha256, vector_namespace, vector_id, embedding_model, token_count, updated_at
+       tags_json, source_r2_key, source_sha256, vector_namespace, vector_id, embedding_model, embedding_dims, token_count, updated_at
      FROM memory_items
      WHERE site_id = ?
        AND collected_day >= ?

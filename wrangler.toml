@@ -23,7 +23,7 @@ binding = "AI"
 # Comment these out if you’re not using Vectorize yet.
 [[vectorize]]
 binding = "USER_MEM"
-index_name = "user-memory"
+index_name = "memory-v1-1536"
 
 [[vectorize]]
 binding = "GLOBAL_TRENDS"
