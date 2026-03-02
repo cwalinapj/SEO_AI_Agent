@@ -32,6 +32,60 @@ const TASK_MAX_CLAIM_MINUTES = 24 * 60;
 const MOZ_DEFAULT_COST_PER_1K_ROWS_USD = 5;
 const DECODO_DEFAULT_TASKS_URL = "https://scraper-api.decodo.com/v1/tasks";
 
+type PlanDefinition = {
+  key: "starter" | "growth" | "agency";
+  name: string;
+  monthly_usd: number;
+  summary: string;
+  features: string[];
+  cta: string;
+};
+
+const PORTAL_PLAN_DEFINITIONS: PlanDefinition[] = [
+  {
+    key: "starter",
+    name: "Starter",
+    monthly_usd: 149,
+    summary: "One site, daily SERP intelligence, and ready-to-apply tasks.",
+    features: [
+      "1 tracked site",
+      "20 tracked keywords (10 primary + 10 secondary)",
+      "Daily Step2 delta report",
+      "Step3 task board with AUTO/DIY recommendations",
+      "Signed WP plugin integration",
+    ],
+    cta: "Start Starter",
+  },
+  {
+    key: "growth",
+    name: "Growth",
+    monthly_usd: 399,
+    summary: "Multi-site operations with richer competitor memory and plan automation.",
+    features: [
+      "Up to 5 tracked sites",
+      "Semantic memory layer with evidence retrieval",
+      "Advanced task filtering and bulk operations",
+      "Priority provider budget controls",
+      "Client report portal access",
+    ],
+    cta: "Start Growth",
+  },
+  {
+    key: "agency",
+    name: "Agency",
+    monthly_usd: 999,
+    summary: "High-volume client reporting and team-assisted authority workflows.",
+    features: [
+      "Up to 20 tracked sites",
+      "Agency-grade report cadence and history",
+      "Authority gap + outreach planning",
+      "Custom onboarding and execution support",
+      "Delegated account operations where tier permits",
+    ],
+    cta: "Contact Sales",
+  },
+];
+
 function nowMs(): number {
   return Date.now();
 }
@@ -171,6 +225,225 @@ function safeJsonStringify(input: unknown, maxLen = 64000): string {
     return raw;
   }
   return raw.slice(0, maxLen);
+}
+
+function normalizePlanKey(input: unknown): PlanDefinition["key"] | null {
+  const key = cleanString(input, 40).toLowerCase();
+  if (key === "starter" || key === "growth" || key === "agency") return key;
+  return null;
+}
+
+function htmlEscape(input: unknown): string {
+  return String(input ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderPortalHtml(hostname: string): string {
+  const cards = PORTAL_PLAN_DEFINITIONS.map((plan) => {
+    const features = plan.features.map((f) => `<li>${htmlEscape(f)}</li>`).join("");
+    return `
+      <article class="plan-card" data-plan="${plan.key}">
+        <div class="plan-head">
+          <h3>${htmlEscape(plan.name)}</h3>
+          <p class="price">$${plan.monthly_usd}<span>/mo</span></p>
+        </div>
+        <p class="summary">${htmlEscape(plan.summary)}</p>
+        <ul>${features}</ul>
+        <button class="pick" data-plan="${plan.key}">${htmlEscape(plan.cta)}</button>
+      </article>
+    `;
+  }).join("");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AIWPDev Client Portal</title>
+  <style>
+    :root {
+      --bg: #0c1f1f;
+      --panel: #102b2b;
+      --ink: #f3f4ec;
+      --muted: #adc4b9;
+      --line: #295e58;
+      --cta: #ec6f2d;
+      --cta-ink: #1f120a;
+      --ok: #2f9e64;
+      --warn: #dc5537;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Sora", "Avenir Next", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 500px at 10% -20%, #1d4d4b 0, transparent 60%),
+        radial-gradient(900px 500px at 90% -10%, #7b3520 0, transparent 55%),
+        var(--bg);
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 26px 20px 60px; }
+    .brand { display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; }
+    .brand strong { letter-spacing: .04em; font-size: 20px; }
+    .brand .host { color: var(--muted); font-size: 13px; }
+    h1 { margin: 0 0 10px; font-size: clamp(30px, 4vw, 52px); line-height: 1.05; }
+    .lead { color: var(--muted); max-width: 770px; font-size: 17px; margin-bottom: 26px; }
+    .plans { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 16px; margin-bottom: 30px; }
+    .plan-card {
+      background: linear-gradient(160deg, #133533 0, #0f2929 70%);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 20px 30px rgba(0,0,0,.25);
+    }
+    .plan-head { display:flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    .plan-head h3 { margin: 0; font-size: 24px; }
+    .price { margin: 0; font-size: 27px; font-weight: 700; color: #ffe7d9; }
+    .price span { color: var(--muted); font-size: 13px; margin-left: 4px; }
+    .summary { color: #d8e6dd; font-size: 14px; min-height: 42px; }
+    ul { margin: 12px 0 14px 20px; padding: 0; color: #d2e2d8; font-size: 14px; line-height: 1.45; }
+    .pick {
+      border: 0; width: 100%; padding: 11px 12px; font-weight: 700;
+      background: var(--cta); color: var(--cta-ink); border-radius: 10px; cursor: pointer;
+    }
+    .panels { display: grid; grid-template-columns: 1.1fr .9fr; gap: 16px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 18px;
+    }
+    label { display:block; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 5px; }
+    input, select, textarea {
+      width: 100%; border: 1px solid #3f7770; border-radius: 10px; background: #0f2525; color: var(--ink);
+      padding: 10px 11px; margin-bottom: 10px; font-family: inherit;
+    }
+    textarea { min-height: 86px; resize: vertical; }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .btn {
+      border: 0; padding: 10px 13px; border-radius: 10px; background: #2f9e64; color: #042212; font-weight: 700; cursor: pointer;
+    }
+    .btn.secondary { background: #355e91; color: #edf3ff; }
+    .status { font-size: 13px; margin-top: 8px; color: var(--muted); }
+    .status.ok { color: #9df0bf; }
+    .status.err { color: #ffb7a8; }
+    .report-box {
+      margin-top: 12px; background: #0c1d1d; border: 1px solid #305e58; border-radius: 10px;
+      padding: 10px; min-height: 170px; max-height: 460px; overflow: auto; font-family: "JetBrains Mono","IBM Plex Mono",monospace; font-size: 12px;
+    }
+    @media (max-width: 980px) {
+      .plans { grid-template-columns: 1fr; }
+      .panels { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="brand">
+      <strong>AIWPDev Portal</strong>
+      <span class="host">${htmlEscape(hostname)}</span>
+    </header>
+    <h1>Client Reports And Plan Management</h1>
+    <p class="lead">Customers can choose a plan, then load live Step2 and Step3 reports by site ID. This portal is built to be hosted at <code>www.aiwpdev.com</code> on the same Worker.</p>
+    <section class="plans">${cards}</section>
+    <section class="panels">
+      <section class="panel">
+        <h2>Pick A Plan</h2>
+        <div class="row">
+          <div><label>Site ID</label><input id="plan-site-id" placeholder="site_..." /></div>
+          <div><label>Plan</label><select id="plan-key">${PORTAL_PLAN_DEFINITIONS.map((p)=>`<option value="${p.key}">${p.name} ($${p.monthly_usd}/mo)</option>`).join("")}</select></div>
+        </div>
+        <div class="row">
+          <div><label>Company</label><input id="plan-company" placeholder="Acme Plumbing" /></div>
+          <div><label>Contact Email</label><input id="plan-email" placeholder="owner@acme.com" /></div>
+        </div>
+        <label>Notes</label><textarea id="plan-notes" placeholder="Optional onboarding notes"></textarea>
+        <button id="plan-submit" class="btn">Save Plan Selection</button>
+        <p id="plan-status" class="status"></p>
+      </section>
+      <section class="panel">
+        <h2>View Client Reports</h2>
+        <div class="row">
+          <div><label>Site ID</label><input id="report-site-id" placeholder="site_..." /></div>
+          <div><label>Date (optional)</label><input id="report-date" placeholder="YYYY-MM-DD" /></div>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button id="load-step2" class="btn">Load Step2</button>
+          <button id="load-step3" class="btn secondary">Load Step3</button>
+        </div>
+        <p id="report-status" class="status"></p>
+        <pre id="report-box" class="report-box"></pre>
+      </section>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    for (const btn of document.querySelectorAll(".pick")) {
+      btn.addEventListener("click", () => {
+        const key = btn.getAttribute("data-plan");
+        $("plan-key").value = key || "starter";
+        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+      });
+    }
+    $("plan-submit").addEventListener("click", async () => {
+      const payload = {
+        site_id: $("plan-site-id").value.trim(),
+        plan_key: $("plan-key").value,
+        company_name: $("plan-company").value.trim(),
+        contact_email: $("plan-email").value.trim(),
+        notes: $("plan-notes").value.trim()
+      };
+      const status = $("plan-status");
+      status.textContent = "Saving...";
+      status.className = "status";
+      const res = await fetch("/v1/plans/select", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        status.textContent = "Failed: " + (data.error || res.status);
+        status.className = "status err";
+        return;
+      }
+      status.textContent = "Plan saved for " + (data.site_id || "site");
+      status.className = "status ok";
+    });
+    async function loadReport(kind) {
+      const siteId = $("report-site-id").value.trim();
+      const date = $("report-date").value.trim();
+      const status = $("report-status");
+      const box = $("report-box");
+      if (!siteId) {
+        status.textContent = "Site ID is required.";
+        status.className = "status err";
+        return;
+      }
+      const qs = date ? ("?date=" + encodeURIComponent(date)) : "";
+      status.textContent = "Loading " + kind + "...";
+      status.className = "status";
+      const res = await fetch("/v1/sites/" + encodeURIComponent(siteId) + "/" + kind + "/report" + qs);
+      const data = await res.json().catch(() => ({}));
+      box.textContent = JSON.stringify(data, null, 2);
+      if (!res.ok || !data.ok) {
+        status.textContent = "Failed: " + (data.error || res.status);
+        status.className = "status err";
+        return;
+      }
+      status.textContent = kind.toUpperCase() + " report loaded.";
+      status.className = "status ok";
+    }
+    $("load-step2").addEventListener("click", () => loadReport("step2"));
+    $("load-step3").addEventListener("click", () => loadReport("step3"));
+  </script>
+</body>
+</html>`;
 }
 
 function canonicalizeValue(input: unknown): unknown {
@@ -9423,6 +9696,37 @@ async function loadMemorySite(env: Env, siteId: string): Promise<{ site_id: stri
   return { site_id: cleanString(row.site_id, 120) };
 }
 
+async function savePlanSelection(
+  env: Env,
+  input: {
+    siteId: string | null;
+    planKey: PlanDefinition["key"];
+    contactEmail: string;
+    companyName: string | null;
+    notes: string | null;
+    source: string;
+  }
+): Promise<{ subscriptionId: string }> {
+  const subscriptionId = uuid("plan");
+  const site = input.siteId ? await loadMemorySite(env, input.siteId) : null;
+  await env.DB.prepare(
+    `INSERT INTO billing_site_subscriptions (
+      subscription_id, site_id, plan_key, company_name, contact_email, source, status, notes_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'lead', ?, strftime('%s','now'), strftime('%s','now'))`
+  )
+    .bind(
+      subscriptionId,
+      site?.site_id ?? null,
+      input.planKey,
+      input.companyName,
+      input.contactEmail,
+      input.source,
+      canonicalJson({ notes: input.notes ?? "" })
+    )
+    .run();
+  return { subscriptionId };
+}
+
 async function embedTextOpenAI(env: Env, text: string): Promise<{ embedding: number[]; tokenCount: number | null }> {
   const apiKey = cleanString(env.OPENAI_API_KEY, 300);
   if (!apiKey) {
@@ -9609,6 +9913,63 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const pluginV1Prefix = "/plugin/wp/v1";
+
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/portal" || url.pathname === "/pricing")) {
+      const html = renderPortalHtml(url.hostname);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/plans") {
+      return Response.json({
+        ok: true,
+        plans: PORTAL_PLAN_DEFINITIONS,
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/plans/select") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const planKey = normalizePlanKey(body.plan_key);
+      if (!planKey) return Response.json({ ok: false, error: "invalid_plan_key" }, { status: 400 });
+      const contactEmail = cleanString(body.contact_email, 200).toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) {
+        return Response.json({ ok: false, error: "valid_contact_email_required" }, { status: 400 });
+      }
+      const siteIdRaw = cleanString(body.site_id, 120);
+      const companyName = cleanString(body.company_name, 180) || null;
+      const notes = cleanString(body.notes, 2000) || null;
+      try {
+        const saved = await savePlanSelection(env, {
+          siteId: siteIdRaw || null,
+          planKey,
+          contactEmail,
+          companyName,
+          notes,
+          source: "portal",
+        });
+        return Response.json({
+          ok: true,
+          subscription_id: saved.subscriptionId,
+          site_id: siteIdRaw || null,
+          plan_key: planKey,
+          contact_email: contactEmail,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        return Response.json({ ok: false, error: message }, { status: 500 });
+      }
+    }
 
     if (req.method === "POST" && url.pathname === "/v1/tasks") {
       let body: Record<string, unknown> | null = null;
