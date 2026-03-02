@@ -23,3 +23,16 @@ htmlcov/
 
 # macOS
 .DS_Store
+
+# Wrangler / Cloudflare local state
+.wrangler/
+
+# Local scratch
+tmp/
+
+# Local-only repo indexing/memory DBs
+.repo_index.sqlite
+.repo_memory.sqlite
+
+# Local secrets (never commit)
+docs/wp-plugin-shared-secret.local.txt

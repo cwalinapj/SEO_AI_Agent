@@ -48,6 +48,7 @@ export interface Env {
   STRIPE_PRICE_AGENCY?: string;
   STRIPE_PROMO_MAP_JSON?: string;
   CHECKOUT_ALLOW_ORIGIN?: string;
+  STEP1_FAST_MODE?: string;
 }
 
 const COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
@@ -69,6 +70,10 @@ const APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_URL = "https://console.apify.com/actor
 const MEMORY_EMBEDDING_MODEL = "text-embedding-3-small";
 const MEMORY_EMBEDDING_DIMS = 1536;
 const CLOUDFLARE_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const DEMO_MAX_ASSET_BYTES = 40_000;
+// Keep prompt size bounded. Raw homepage HTML can be massive (WP builders, inline CSS, etc.).
+// This is a demo generator; we only need enough structure to infer nav, branding, and content themes.
+const DEMO_MAX_SOURCE_HTML_BYTES = 40_000;
 
 type PlanDefinition = {
   key: "starter" | "growth" | "agency";
@@ -132,6 +137,678 @@ function toDateYYYYMMDD(ms: number): string {
 }
 function uuid(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
+}
+
+function guessContentType(pathname: string): string {
+  const p = pathname.toLowerCase();
+  if (p.endsWith(".html")) return "text/html; charset=utf-8";
+  if (p.endsWith(".css")) return "text/css; charset=utf-8";
+  if (p.endsWith(".js")) return "application/javascript; charset=utf-8";
+  if (p.endsWith(".json")) return "application/json; charset=utf-8";
+  if (p.endsWith(".svg")) return "image/svg+xml";
+  if (p.endsWith(".png")) return "image/png";
+  if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return "image/jpeg";
+  if (p.endsWith(".webp")) return "image/webp";
+  if (p.endsWith(".ico")) return "image/x-icon";
+  return "application/octet-stream";
+}
+
+async function readResponseTextCapped(resp: Response, maxBytes: number): Promise<string> {
+  const buf = await resp.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  const sliced = bytes.slice(0, Math.min(bytes.length, maxBytes));
+  return new TextDecoder().decode(sliced);
+}
+
+function extractAssetUrlsFromHtml(html: string, baseUrl: string): { css: string[]; js: string[] } {
+  const css: string[] = [];
+  const js: string[] = [];
+  const add = (arr: string[], u: string) => {
+    if (!u) return;
+    if (arr.includes(u)) return;
+    arr.push(u);
+  };
+  const linkRe = /<link[^>]+rel=["']stylesheet["'][^>]*>/gi;
+  const hrefRe = /href=["']([^"']+)["']/i;
+  let m: RegExpExecArray | null;
+  while ((m = linkRe.exec(html))) {
+    const tag = m[0] ?? "";
+    const href = tag.match(hrefRe)?.[1] ?? "";
+    try {
+      const resolved = new URL(href, baseUrl).toString();
+      add(css, resolved);
+    } catch {
+      // ignore
+    }
+    if (css.length >= 3) break;
+  }
+  const scriptRe = /<script[^>]+src=["']([^"']+)["'][^>]*>\s*<\/script>/gi;
+  while ((m = scriptRe.exec(html))) {
+    const src = m[1] ?? "";
+    try {
+      const resolved = new URL(src, baseUrl).toString();
+      add(js, resolved);
+    } catch {
+      // ignore
+    }
+    if (js.length >= 2) break;
+  }
+  return { css, js };
+}
+
+function extractInternalPathsFromHtml(html: string, baseUrl: string): string[] {
+  const paths: string[] = [];
+  const add = (p: string) => {
+    const v = cleanString(p, 300);
+    if (!v) return;
+    if (paths.includes(v)) return;
+    paths.push(v);
+  };
+  let base: URL | null = null;
+  try {
+    base = new URL(baseUrl);
+  } catch {
+    base = null;
+  }
+  if (!base) return [];
+
+  const hrefRe = /href=["']([^"']+)["']/gi;
+  let m: RegExpExecArray | null;
+  while ((m = hrefRe.exec(html))) {
+    const href = cleanString(m[1] ?? "", 500);
+    if (!href) continue;
+    if (href.startsWith("#") || href.startsWith("mailto:") || href.startsWith("tel:")) continue;
+    try {
+      const u = new URL(href, base);
+      if (u.hostname.toLowerCase() !== base.hostname.toLowerCase()) continue;
+      const path = u.pathname.replace(/\/+$/, "") || "/";
+      if (path === "/") continue;
+      add(path);
+      if (paths.length >= 30) break;
+    } catch {
+      // ignore
+    }
+  }
+  return paths;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  try {
+    const merged: RequestInit = { ...init, signal: controller.signal };
+    return await fetch(url, merged);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function withHardTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label}_timeout_after_${timeoutMs}ms`)), Math.max(1, timeoutMs))
+    ),
+  ]);
+}
+
+async function fetchSiteSourceBundle(siteUrl: string): Promise<{
+  site_url: string;
+  html: string;
+  css_assets: Array<{ url: string; content: string }>;
+  js_assets: Array<{ url: string; content: string }>;
+}> {
+  const response = await withHardTimeout(
+    fetchWithTimeout(
+    siteUrl,
+    {
+      method: "GET",
+      headers: {
+        "user-agent": "AIWPDev-DemoBuild/1.0 (+https://www.onboarding.aiwpdev.com)",
+        accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+      },
+    },
+    25_000
+    ),
+    28_000,
+    "site_fetch"
+  );
+  const html = await readResponseTextCapped(response, DEMO_MAX_SOURCE_HTML_BYTES);
+  const assets = extractAssetUrlsFromHtml(html, siteUrl);
+  const css_assets: Array<{ url: string; content: string }> = [];
+  const js_assets: Array<{ url: string; content: string }> = [];
+  for (const url of assets.css.slice(0, 2)) {
+    try {
+      const r = await withHardTimeout(
+        fetchWithTimeout(url, { headers: { "user-agent": "AIWPDev-DemoBuild/1.0" } }, 20_000),
+        22_000,
+        "asset_fetch"
+      );
+      css_assets.push({ url, content: await readResponseTextCapped(r, DEMO_MAX_ASSET_BYTES) });
+    } catch {
+      // ignore
+    }
+  }
+  for (const url of assets.js.slice(0, 1)) {
+    try {
+      const r = await withHardTimeout(
+        fetchWithTimeout(url, { headers: { "user-agent": "AIWPDev-DemoBuild/1.0" } }, 20_000),
+        22_000,
+        "asset_fetch"
+      );
+      js_assets.push({ url, content: await readResponseTextCapped(r, DEMO_MAX_ASSET_BYTES) });
+    } catch {
+      // ignore
+    }
+  }
+  return { site_url: siteUrl, html, css_assets, js_assets };
+}
+
+function buildDemoCodegenPrompt(input: {
+  siteUrl: string;
+  businessName: string;
+  primaryLocation: string;
+  serviceTerms: string[];
+  keywords: Array<{ index: number; keyword: string; reason?: string | null }>;
+  source: { html: string; css_assets: Array<{ url: string; content: string }>; js_assets: Array<{ url: string; content: string }> };
+}): string {
+  const kwLines = input.keywords
+    .slice(0, 20)
+    .map((k) => `${k.index}. ${k.keyword}`)
+    .join("\n");
+  const html = input.source.html || "";
+  const title = parseSimpleTitle(html) || "unknown";
+  const h1 = parseSimpleH1(html) || "unknown";
+  const meta = parseSimpleMetaDescription(html) || "unknown";
+  const excerpt = htmlToPlainExcerpt(html, 1600) || "none";
+  const internalPaths = extractInternalPathsFromHtml(html, input.siteUrl);
+  const cssHint = cleanString(input.source.css_assets?.[0]?.content ?? "", 4000) || "";
+  return [
+    "You are an SEO web engineer.",
+    "Goal: produce a siloed, internally-linked static site optimized for the provided Top 20 keywords.",
+    "You MUST return a JSON object only.",
+    "",
+    `Site URL: ${input.siteUrl}`,
+    `Business: ${input.businessName}`,
+    `Primary location: ${input.primaryLocation}`,
+    `Known services: ${input.serviceTerms.join(", ") || "unknown"}`,
+    "",
+    "Existing site snapshot (do not copy verbatim; use as reference only):",
+    `- <title>: ${title}`,
+    `- H1: ${h1}`,
+    `- Meta description: ${meta}`,
+    `- Internal paths (sample): ${internalPaths.join(", ") || "none"}`,
+    `- Text excerpt (truncated): ${excerpt}`,
+    cssHint ? `- CSS hint (truncated): ${cssHint}` : "- CSS hint: none",
+    "",
+    "Top 20 keywords:",
+    kwLines || "none",
+    "",
+    "Requirements:",
+    "1) Create a clear silo: /services/ and /locations/ (only if location pages are justified by keywords).",
+    "2) Build internal linking best practices: contextual links, hub->spoke, breadcrumbs, and related services sections.",
+    "3) Add a sitewide nav that matches silo categories.",
+    "4) Add schema JSON-LD where appropriate (LocalBusiness + Service).",
+    "5) Keep it static HTML/CSS/JS (no frameworks).",
+    "6) Return files as JSON with shape: {\"files\":[{\"path\":\"index.html\",\"content\":\"...\"}, ...], \"notes\":\"...\"}.",
+    "7) Keep total output reasonable (<= 30 files). Prefer reusable templates and fewer pages when possible.",
+  ].join("\n");
+}
+
+async function openAiCodegenStaticSite(env: Env, prompt: string): Promise<Record<string, unknown>> {
+  const apiKey = cleanString(env.OPENAI_API_KEY, 500);
+  if (!apiKey) throw new Error("OPENAI_API_KEY_not_configured");
+  const payload = {
+    model: "gpt-5.2",
+    input: prompt,
+    temperature: 0.2,
+    max_output_tokens: 2600,
+    background: true,
+  };
+  const createResp = await withHardTimeout(
+    fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+    25_000,
+    "openai_codegen_create"
+  );
+  const createRaw = await createResp.text();
+  if (!createResp.ok) throw new Error(`openai_codegen_create_failed:${createResp.status}:${createRaw.slice(0, 400)}`);
+  const created = safeJsonParseObject(createRaw) ?? { raw_text: createRaw };
+  const responseId = cleanString((created as any).id, 200);
+  if (!responseId) {
+    // Fallback: some SDK variants may return completed response inline.
+    return created;
+  }
+
+  const started = nowMs();
+  while (nowMs() - started < 150_000) {
+    const pollResp = await withHardTimeout(
+      fetch(`https://api.openai.com/v1/responses/${encodeURIComponent(responseId)}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${apiKey}` },
+      }),
+      25_000,
+      "openai_codegen_poll"
+    );
+    const pollRaw = await pollResp.text();
+    if (!pollResp.ok) throw new Error(`openai_codegen_poll_failed:${pollResp.status}:${pollRaw.slice(0, 400)}`);
+    const polled = safeJsonParseObject(pollRaw) ?? { raw_text: pollRaw };
+    const status = cleanString((polled as any).status, 40).toLowerCase();
+    if (status === "completed") return polled;
+    if (status === "failed" || status === "cancelled" || status === "canceled") {
+      throw new Error(`openai_codegen_${status}:${pollRaw.slice(0, 400)}`);
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error("openai_codegen_poll_timeout");
+}
+
+async function saveDemoBuildRecord(env: Env, input: {
+  buildId: string;
+  siteId: string;
+  siteUrl: string;
+  researchRunId: string | null;
+  status: string;
+  keywordsJson: string;
+  sourcePrefix: string | null;
+  outputPrefix: string | null;
+  errorJson: string | null;
+}): Promise<void> {
+  const ts = Math.floor(nowMs() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO demo_site_builds (
+      build_id, site_id, site_url, research_run_id, status, keywords_json, source_r2_prefix, output_r2_prefix, error_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(build_id) DO UPDATE SET
+      status = excluded.status,
+      keywords_json = excluded.keywords_json,
+      source_r2_prefix = excluded.source_r2_prefix,
+      output_r2_prefix = excluded.output_r2_prefix,
+      error_json = excluded.error_json,
+      updated_at = excluded.updated_at`
+  ).bind(
+    input.buildId,
+    input.siteId,
+    input.siteUrl,
+    input.researchRunId,
+    input.status,
+    input.keywordsJson,
+    input.sourcePrefix,
+    input.outputPrefix,
+    input.errorJson,
+    ts,
+    ts
+  ).run();
+}
+
+async function loadDemoBuildRecord(env: Env, buildId: string): Promise<Record<string, unknown> | null> {
+  const row = await env.DB.prepare(
+    `SELECT build_id, site_id, site_url, research_run_id, status, keywords_json, source_r2_prefix, output_r2_prefix, error_json, created_at, updated_at
+     FROM demo_site_builds
+     WHERE build_id = ?
+     LIMIT 1`
+  ).bind(buildId).first<Record<string, unknown>>();
+  if (!row) return null;
+  return row;
+}
+
+async function loadLatestSuccessfulDemoBuildForSite(env: Env, siteId: string): Promise<Record<string, unknown> | null> {
+  const row = await env.DB.prepare(
+    `SELECT build_id, site_id, site_url, research_run_id, status, keywords_json, source_r2_prefix, output_r2_prefix, error_json, created_at, updated_at
+     FROM demo_site_builds
+     WHERE site_id = ?
+       AND status = 'success'
+     ORDER BY created_at DESC
+     LIMIT 1`
+  )
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+  return row ?? null;
+}
+
+async function loadSiteIdByHost(env: Env, siteHost: string): Promise<string | null> {
+  const host = cleanString(siteHost, 255).toLowerCase();
+  if (!host) return null;
+  const row = await env.DB.prepare(
+    `SELECT site_id
+     FROM wp_ai_seo_sites
+     WHERE lower(site_host) = lower(?)
+     LIMIT 1`
+  )
+    .bind(host)
+    .first<Record<string, unknown>>();
+  return cleanString(row?.site_id, 120) || null;
+}
+
+async function runDemoBuildInBackground(
+  env: Env,
+  input: {
+    buildId: string;
+    siteId: string;
+    siteUrl: string;
+    researchRunId: string;
+    businessName: string;
+    primaryLocation: string;
+    serviceTerms: string[];
+    keywords: Array<{ index: number; keyword: string; reason?: string | null }>;
+    sourcePrefix: string;
+    outputPrefix: string;
+  }
+): Promise<void> {
+  const buildId = input.buildId;
+  try {
+    await saveDemoBuildRecord(env, {
+      buildId,
+      siteId: input.siteId,
+      siteUrl: input.siteUrl,
+      researchRunId: input.researchRunId,
+      status: "running",
+      keywordsJson: safeJsonStringify({ keywords: input.keywords }, 200_000),
+      sourcePrefix: input.sourcePrefix,
+      outputPrefix: input.outputPrefix,
+      errorJson: safeJsonStringify({ stage: "fetch_source" }, 1000),
+    });
+
+    const bundle = await fetchSiteSourceBundle(input.siteUrl);
+
+    if (env.MEMORY_R2) {
+      await env.MEMORY_R2.put(`${input.sourcePrefix}index.html`, bundle.html, {
+        httpMetadata: { contentType: "text/html; charset=utf-8" },
+      });
+      for (let i = 0; i < bundle.css_assets.length; i += 1) {
+        await env.MEMORY_R2.put(`${input.sourcePrefix}css_${i + 1}.css`, bundle.css_assets[i].content, {
+          httpMetadata: { contentType: "text/css; charset=utf-8" },
+        });
+      }
+      for (let i = 0; i < bundle.js_assets.length; i += 1) {
+        await env.MEMORY_R2.put(`${input.sourcePrefix}js_${i + 1}.js`, bundle.js_assets[i].content, {
+          httpMetadata: { contentType: "application/javascript; charset=utf-8" },
+        });
+      }
+    }
+
+    await saveDemoBuildRecord(env, {
+      buildId,
+      siteId: input.siteId,
+      siteUrl: input.siteUrl,
+      researchRunId: input.researchRunId,
+      status: "running",
+      keywordsJson: safeJsonStringify({ keywords: input.keywords }, 200_000),
+      sourcePrefix: input.sourcePrefix,
+      outputPrefix: input.outputPrefix,
+      errorJson: safeJsonStringify({ stage: "codegen" }, 1000),
+    });
+
+    const codegenPrompt = buildDemoCodegenPrompt({
+      siteUrl: input.siteUrl,
+      businessName: input.businessName,
+      primaryLocation: input.primaryLocation,
+      serviceTerms: input.serviceTerms,
+      keywords: input.keywords,
+      source: { html: bundle.html, css_assets: bundle.css_assets, js_assets: bundle.js_assets },
+    });
+
+    const responseJson = await openAiCodegenStaticSite(env, codegenPrompt);
+    const outputText = extractOutputTextFromOpenAiResponse(responseJson);
+    const generated = tryParseJsonFromFreeText(outputText) ?? responseJson;
+    const files = Array.isArray((generated as any).files) ? (generated as any).files : [];
+
+    let fileCount = 0;
+    if (env.MEMORY_R2) {
+      for (const f of files) {
+        const fo = parseJsonObject(f);
+        if (!fo) continue;
+        const path = cleanString(fo.path, 240).replace(/^\/+/, "");
+        const content = cleanString(fo.content, 2_000_000);
+        if (!path || !content) continue;
+        await env.MEMORY_R2.put(`${input.outputPrefix}${path}`, content, {
+          httpMetadata: { contentType: guessContentType(path) },
+        });
+        fileCount += 1;
+        if (fileCount >= 40) break;
+      }
+      // Ensure there is always an index.html.
+      if (fileCount === 0) {
+        await env.MEMORY_R2.put(
+          `${input.outputPrefix}index.html`,
+          "<!doctype html><html><body><h1>Demo build failed</h1><p>No files were generated.</p></body></html>",
+          { httpMetadata: { contentType: "text/html; charset=utf-8" } }
+        );
+      }
+      // Save raw OpenAI response for audit/debug.
+      await env.MEMORY_R2.put(`${input.outputPrefix}openai_response.json`, safeJsonStringify(responseJson, 5_000_000), {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      });
+    }
+
+    await saveDemoBuildRecord(env, {
+      buildId,
+      siteId: input.siteId,
+      siteUrl: input.siteUrl,
+      researchRunId: input.researchRunId,
+      status: "success",
+      keywordsJson: safeJsonStringify({ keywords: input.keywords }, 200_000),
+      sourcePrefix: input.sourcePrefix,
+      outputPrefix: input.outputPrefix,
+      errorJson: null,
+    });
+  } catch (error) {
+    await saveDemoBuildRecord(env, {
+      buildId,
+      siteId: input.siteId,
+      siteUrl: input.siteUrl,
+      researchRunId: input.researchRunId,
+      status: "failed",
+      keywordsJson: safeJsonStringify({ keywords: input.keywords }, 200_000),
+      sourcePrefix: input.sourcePrefix,
+      outputPrefix: input.outputPrefix,
+      errorJson: safeJsonStringify({ error: cleanString((error as Error)?.message ?? error, 2000) }, 8000),
+    });
+  }
+}
+
+type DemoBuildProgress = {
+  stage: "fetch_source" | "codegen_create" | "codegen_poll" | "write_output" | string;
+  openai_response_id?: string;
+  last_error?: string;
+};
+
+function parseDemoBuildProgress(raw: unknown): DemoBuildProgress {
+  const obj = (typeof raw === "string" ? safeJsonParseObject(raw) : parseJsonObject(raw)) ?? {};
+  const stage = cleanString(obj.stage, 40) || "fetch_source";
+  const openai_response_id = cleanString(obj.openai_response_id, 200) || undefined;
+  const last_error = cleanString(obj.last_error, 2000) || undefined;
+  return { stage, openai_response_id, last_error };
+}
+
+async function advanceDemoBuildOneStep(env: Env, record: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const buildId = cleanString(record.build_id, 120);
+  const siteId = cleanString(record.site_id, 120);
+  const siteUrl = cleanString(record.site_url, 2000);
+  const runId = cleanString(record.research_run_id, 120);
+  const status = cleanString(record.status, 40);
+  const sourcePrefix = cleanString(record.source_r2_prefix, 500);
+  const outputPrefix = cleanString(record.output_r2_prefix, 500);
+  if (!buildId || !siteId || !siteUrl || !runId || !sourcePrefix || !outputPrefix) return record;
+  if (status !== "running") return record;
+  if (!env.MEMORY_R2) return record;
+
+  const progress = parseDemoBuildProgress(record.error_json);
+  try {
+    if (progress.stage === "fetch_source") {
+      const bundle = await fetchSiteSourceBundle(siteUrl);
+      await env.MEMORY_R2.put(`${sourcePrefix}index.html`, bundle.html, {
+        httpMetadata: { contentType: "text/html; charset=utf-8" },
+      });
+      for (let i = 0; i < bundle.css_assets.length; i += 1) {
+        await env.MEMORY_R2.put(`${sourcePrefix}css_${i + 1}.css`, bundle.css_assets[i].content, {
+          httpMetadata: { contentType: "text/css; charset=utf-8" },
+        });
+      }
+      for (let i = 0; i < bundle.js_assets.length; i += 1) {
+        await env.MEMORY_R2.put(`${sourcePrefix}js_${i + 1}.js`, bundle.js_assets[i].content, {
+          httpMetadata: { contentType: "application/javascript; charset=utf-8" },
+        });
+      }
+
+      await saveDemoBuildRecord(env, {
+        buildId,
+        siteId,
+        siteUrl,
+        researchRunId: runId,
+        status: "running",
+        keywordsJson: cleanString(record.keywords_json, 200_000) || "{}",
+        sourcePrefix,
+        outputPrefix,
+        errorJson: safeJsonStringify({ stage: "codegen_create" }, 2000),
+      });
+      return (await loadDemoBuildRecord(env, buildId)) ?? record;
+    }
+
+    if (progress.stage === "codegen_create") {
+      const site = await loadStep1Site(env, siteId);
+      const siteInput = safeJsonParseObject(site?.input_json ?? "") ?? {};
+      const businessName = cleanString(site?.site_name, 200) || "unknown";
+      const primaryLocation = cleanString(site?.primary_location_hint, 200) || "unknown";
+      const services = parseStringArray(siteInput.services, 200, 160);
+      const parsed = await getOrBuildStep1ParsedKeywords(env, { siteId, researchRunId: runId });
+      const keywordRows = Array.isArray(parsed?.keywords) ? parsed?.keywords : [];
+      const keywords = keywordRows
+        .map((row) => {
+          const obj = parseJsonObject(row) ?? {};
+          return { index: clampInt(obj.index, 1, 20, 0), keyword: cleanString(obj.keyword, 300), reason: cleanString(obj.reason, 2000) || null };
+        })
+        .filter((r) => r.index >= 1 && r.index <= 20 && r.keyword.length > 0)
+        .slice(0, 20);
+
+      const bundleHtmlObj = await env.MEMORY_R2.get(`${sourcePrefix}index.html`);
+      const bundleHtml = bundleHtmlObj ? await bundleHtmlObj.text() : "";
+
+      const prompt = buildDemoCodegenPrompt({
+        siteUrl,
+        businessName,
+        primaryLocation,
+        serviceTerms: services,
+        keywords,
+        source: { html: bundleHtml, css_assets: [], js_assets: [] },
+      });
+
+      const apiKey = cleanString(env.OPENAI_API_KEY, 500);
+      if (!apiKey) throw new Error("OPENAI_API_KEY_not_configured");
+
+      const createResp = await withHardTimeout(
+        fetch("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "gpt-5.2", input: prompt, temperature: 0.2, max_output_tokens: 2600, background: true }),
+        }),
+        25_000,
+        "openai_codegen_create"
+      );
+      const createRaw = await createResp.text();
+      if (!createResp.ok) throw new Error(`openai_codegen_create_failed:${createResp.status}:${createRaw.slice(0, 400)}`);
+      const created = safeJsonParseObject(createRaw) ?? { raw_text: createRaw };
+      const responseId = cleanString((created as any).id, 200);
+      if (!responseId) throw new Error("openai_codegen_missing_id");
+
+      await env.MEMORY_R2.put(`${outputPrefix}openai_create.json`, safeJsonStringify(created, 2_000_000), {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      });
+
+      await saveDemoBuildRecord(env, {
+        buildId,
+        siteId,
+        siteUrl,
+        researchRunId: runId,
+        status: "running",
+        keywordsJson: cleanString(record.keywords_json, 200_000) || "{}",
+        sourcePrefix,
+        outputPrefix,
+        errorJson: safeJsonStringify({ stage: "codegen_poll", openai_response_id: responseId }, 2000),
+      });
+      return (await loadDemoBuildRecord(env, buildId)) ?? record;
+    }
+
+    if (progress.stage === "codegen_poll") {
+      const apiKey = cleanString(env.OPENAI_API_KEY, 500);
+      if (!apiKey) throw new Error("OPENAI_API_KEY_not_configured");
+      if (!progress.openai_response_id) throw new Error("openai_response_id_missing");
+
+      const pollResp = await withHardTimeout(
+        fetch(`https://api.openai.com/v1/responses/${encodeURIComponent(progress.openai_response_id)}`, {
+          method: "GET",
+          headers: { Authorization: `Bearer ${apiKey}` },
+        }),
+        25_000,
+        "openai_codegen_poll"
+      );
+      const pollRaw = await pollResp.text();
+      if (!pollResp.ok) throw new Error(`openai_codegen_poll_failed:${pollResp.status}:${pollRaw.slice(0, 400)}`);
+      const polled = safeJsonParseObject(pollRaw) ?? { raw_text: pollRaw };
+      const st = cleanString((polled as any).status, 40).toLowerCase();
+      await env.MEMORY_R2.put(`${outputPrefix}openai_poll.json`, safeJsonStringify(polled, 5_000_000), {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      });
+      if (st !== "completed") {
+        if (st === "failed" || st === "cancelled" || st === "canceled") {
+          throw new Error(`openai_codegen_${st}`);
+        }
+        return record; // still running; next poll will advance
+      }
+
+      const outputText = extractOutputTextFromOpenAiResponse(polled);
+      const generated = tryParseJsonFromFreeText(outputText) ?? polled;
+      const files = Array.isArray((generated as any).files) ? (generated as any).files : [];
+      let fileCount = 0;
+      for (const f of files) {
+        const fo = parseJsonObject(f);
+        if (!fo) continue;
+        const path = cleanString(fo.path, 240).replace(/^\/+/, "");
+        const content = cleanString(fo.content, 2_000_000);
+        if (!path || !content) continue;
+        await env.MEMORY_R2.put(`${outputPrefix}${path}`, content, { httpMetadata: { contentType: guessContentType(path) } });
+        fileCount += 1;
+        if (fileCount >= 40) break;
+      }
+      if (fileCount === 0) {
+        await env.MEMORY_R2.put(
+          `${outputPrefix}index.html`,
+          "<!doctype html><html><body><h1>Demo build produced no files</h1></body></html>",
+          { httpMetadata: { contentType: "text/html; charset=utf-8" } }
+        );
+      }
+
+      await saveDemoBuildRecord(env, {
+        buildId,
+        siteId,
+        siteUrl,
+        researchRunId: runId,
+        status: "success",
+        keywordsJson: cleanString(record.keywords_json, 200_000) || "{}",
+        sourcePrefix,
+        outputPrefix,
+        errorJson: null,
+      });
+      return (await loadDemoBuildRecord(env, buildId)) ?? record;
+    }
+  } catch (e) {
+    await saveDemoBuildRecord(env, {
+      buildId,
+      siteId,
+      siteUrl,
+      researchRunId: runId,
+      status: "failed",
+      keywordsJson: cleanString(record.keywords_json, 200_000) || "{}",
+      sourcePrefix,
+      outputPrefix,
+      errorJson: safeJsonStringify({ error: cleanString((e as Error)?.message ?? e, 2000) }, 8000),
+    });
+    return (await loadDemoBuildRecord(env, buildId)) ?? record;
+  }
+  return record;
 }
 
 function toHex(bytes: ArrayBuffer): string {
@@ -6181,6 +6858,136 @@ function extractTop20FromResultFallback(result: Record<string, unknown>): Step1P
   return out;
 }
 
+type Step1TopKeywordRow = { keyword: string; reason: string | null };
+
+function extractTop20KeywordRowsFromOpenAiResponse(responseJson: Record<string, unknown> | null): Step1TopKeywordRow[] {
+  const outputText = extractOutputTextFromOpenAiResponse(responseJson);
+  const payload = tryParseJsonFromFreeText(outputText);
+  const arr = Array.isArray(payload?.top_20_keywords) ? payload.top_20_keywords : [];
+  const out: Step1TopKeywordRow[] = [];
+  for (const row of arr) {
+    const obj = parseJsonObject(row);
+    if (!obj) continue;
+    const keyword = cleanString(obj.keyword, 300);
+    if (!keyword) continue;
+    out.push({
+      keyword,
+      reason: cleanString(obj.reason, 2000) || null,
+    });
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+function extractTop20DraftJsonText(responseJson: Record<string, unknown> | null): string {
+  const outputText = extractOutputTextFromOpenAiResponse(responseJson);
+  const parsed = tryParseJsonFromFreeText(outputText);
+  if (parsed) return JSON.stringify(parsed, null, 2);
+  return outputText || "";
+}
+
+function shouldRequireCarDetailingReno(input: { primaryLocation: string | null; serviceTerms: string[] }): boolean {
+  const loc = cleanString(input.primaryLocation, 200).toLowerCase();
+  const hasRenoNv = /\breno\b/.test(loc) && (/\bnv\b/.test(loc) || /\bnevada\b/.test(loc));
+  if (!hasRenoNv) return false;
+  const services = input.serviceTerms.map((s) => s.toLowerCase());
+  return services.some((s) => s.includes("car detailing") || s.includes("auto detailing") || s.includes("detailing"));
+}
+
+function findMissingRequiredKeywords(input: { rows: Step1TopKeywordRow[]; requireCarDetailingReno: boolean }): string[] {
+  if (!input.requireCarDetailingReno) return [];
+  const set = new Set(input.rows.map((r) => toKeywordNorm(r.keyword)));
+  const missing: string[] = [];
+  if (!set.has("car detailing reno")) missing.push("car detailing Reno");
+  if (!set.has("car detailing reno nv")) missing.push("car detailing Reno NV");
+  return missing;
+}
+
+function parseCityStateTokens(primaryLocation: string | null): { city: string | null; state: string | null } {
+  const raw = cleanString(primaryLocation, 200);
+  if (!raw) return { city: null, state: null };
+  const m = raw.match(/([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Za-z]{2})\b/);
+  if (m) {
+    return { city: toKeywordNorm(m[1]), state: toKeywordNorm(m[2]) };
+  }
+  const t = tokenizeText(raw);
+  if (t.length >= 2) {
+    const st = t[t.length - 1];
+    if (st.length === 2) {
+      return { city: toKeywordNorm(t.slice(0, -1).join(" ")), state: st };
+    }
+  }
+  return { city: null, state: null };
+}
+
+function findBrandedPlusViolations(input: {
+  rows: Step1TopKeywordRow[];
+  businessName: string | null;
+  siteUrl: string;
+  primaryLocation: string | null;
+  serviceTerms: string[];
+  brandHints?: string[];
+}): string[] {
+  const brandCandidates = new Set<string>();
+  const businessBrand = toKeywordNorm(cleanString(input.businessName, 200));
+  if (businessBrand) brandCandidates.add(businessBrand);
+  const domain = normalizeRootDomain(input.siteUrl);
+  if (domain) {
+    const hostCore = domain.replace(/^www\./i, "").split(".")[0] || "";
+    const hostNorm = toKeywordNorm(hostCore);
+    if (hostNorm) brandCandidates.add(hostNorm);
+    const hostSpaced = toKeywordNorm(hostCore.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[-_]+/g, " "));
+  if (hostSpaced) brandCandidates.add(hostSpaced);
+  }
+  for (const hint of input.brandHints ?? []) {
+    const h = toKeywordNorm(cleanString(hint, 200));
+    if (h) brandCandidates.add(h);
+  }
+  if (brandCandidates.size === 0) return [];
+  const { city, state } = parseCityStateTokens(input.primaryLocation);
+  const allowedSuffix = new Set<string>();
+  if (city) {
+    allowedSuffix.add(city);
+    if (state) allowedSuffix.add(`${city} ${state}`);
+  }
+  const serviceTokenSet = new Set<string>([
+    "service",
+    "services",
+    "detailing",
+    "detail",
+    "coating",
+    "correction",
+    "mobile",
+    "interior",
+    "exterior",
+    "wash",
+    "wax",
+    "polish",
+    "rv",
+    "boat",
+    "car",
+    "auto",
+    ...input.serviceTerms.flatMap((s) => tokenizeText(s)),
+  ]);
+  const violations: string[] = [];
+  for (const row of input.rows) {
+    const kw = toKeywordNorm(row.keyword);
+    const matchedBrand = [...brandCandidates].find((b) => kw.startsWith(`${b} `));
+    if (!matchedBrand) continue;
+    const suffix = kw.slice(matchedBrand.length).trim();
+    if (!suffix) continue;
+    if (allowedSuffix.has(suffix)) continue;
+    const suffixTokens = tokenizeText(suffix);
+    const hasForbiddenSuffix = suffixTokens.some(
+      (t) => serviceTokenSet.has(t) || t === "pricing" || t === "price" || t === "cost" || t === "review" || t === "reviews" || t === "contact"
+    );
+    if (hasForbiddenSuffix || suffixTokens.length > 0) {
+      violations.push(row.keyword);
+    }
+  }
+  return violations;
+}
+
 async function loadSavedStep1ParsedKeywords(
   env: Env,
   siteId: string,
@@ -6227,15 +7034,101 @@ async function getOrBuildStep1ParsedKeywords(
   if (existing) {
     const hasVars =
       parseJsonObject(existing.keyword_variables) != null || parseJsonObject(existing.reason_variables) != null;
-    if (hasVars) return existing;
+    if (hasVars) {
+      // If we already have a parsed payload, only rebuild if it violates deterministic MUST rules.
+      const site = await loadStep1Site(env, input.siteId);
+      const siteInput = safeJsonParseObject(site?.input_json ?? "") ?? {};
+      const primaryLocation =
+        cleanString(site?.primary_location_hint, 200) || cleanString(siteInput.primary_location_hint, 200) || null;
+      const services = parseStringArray(siteInput.services, 200, 160);
+      const loc = cleanString(primaryLocation, 200).toLowerCase();
+      const rows = Array.isArray(existing.keywords) ? existing.keywords : [];
+      const hasDetailingHint =
+        services.some((s) => s.toLowerCase().includes("detailing")) ||
+        rows.some((row) => /\bdetailing\b/.test(cleanString(parseJsonObject(row)?.keyword, 300).toLowerCase()));
+      const hasRenoCity =
+        /\breno\b/.test(loc) ||
+        rows.some((row) => /\breno\b/.test(cleanString(parseJsonObject(row)?.keyword, 300).toLowerCase()));
+      const hasStateHint =
+        /\bnv\b/.test(loc) ||
+        /\bnevada\b/.test(loc) ||
+        rows.some((row) => /\bnv\b|\bnevada\b/.test(cleanString(parseJsonObject(row)?.keyword, 300).toLowerCase())) ||
+        hasRenoCity; // Reno is uniquely Reno, NV for our purposes.
+      const hasRenoNv = hasRenoCity && hasStateHint;
+      const require = hasRenoNv && hasDetailingHint;
+      if (!require) return existing;
+      const norms = new Set(
+        rows
+          .map((row) => toKeywordNorm(cleanString(parseJsonObject(row)?.keyword, 300)))
+          .filter((v) => v.length > 0)
+      );
+      if (norms.has("car detailing reno") && norms.has("car detailing reno nv")) return existing;
+      // fall through to rebuild and overwrite
+    }
   }
   const result = await loadStep1KeywordResearchResultsByRun(env, input.siteId, input.researchRunId);
   if (!result) return null;
   const site = await loadStep1Site(env, input.siteId);
+  const siteInput = safeJsonParseObject(site?.input_json ?? "") ?? {};
+  const primaryLocation =
+    cleanString(site?.primary_location_hint, 200) || cleanString(siteInput.primary_location_hint, 200) || null;
+  const services = parseStringArray(siteInput.services, 200, 160);
   const openAiObject = parseJsonObject(result.step1_openai_top20);
   let keywords = extractStep1Top20FromOpenAi(openAiObject);
   if (keywords.length === 0) keywords = extractTop20FromResultFallback(result);
   keywords = keywords.slice(0, 20).map((k, idx) => ({ ...k, index: idx + 1 }));
+
+  // Enforce MUST keywords for Step 1 contract deterministically (even if the LLM ignores the rule).
+  {
+    const loc = cleanString(primaryLocation, 200).toLowerCase();
+    const hasDetailingHint =
+      services.some((s) => s.toLowerCase().includes("detailing")) ||
+      keywords.some((k) => /\bdetailing\b/.test(cleanString(k.keyword, 300).toLowerCase()));
+    const hasRenoCity = /\breno\b/.test(loc) || keywords.some((k) => /\breno\b/.test(cleanString(k.keyword, 300).toLowerCase()));
+    const hasStateHint =
+      /\bnv\b/.test(loc) ||
+      /\bnevada\b/.test(loc) ||
+      keywords.some((k) => /\bnv\b|\bnevada\b/.test(cleanString(k.keyword, 300).toLowerCase())) ||
+      hasRenoCity;
+    const hasRenoNv = hasRenoCity && hasStateHint;
+    if (hasRenoNv && hasDetailingHint) {
+      const required = [
+        { keyword: "car detailing Reno", reason: "Required baseline local money keyword for tracking and page mapping." },
+        { keyword: "car detailing Reno NV", reason: "Required baseline local money keyword (city+state) for tracking and SERP comparisons." },
+      ];
+    const present = new Set(keywords.map((k) => toKeywordNorm(k.keyword)));
+    for (const r of required) {
+      if (!present.has(toKeywordNorm(r.keyword))) {
+        keywords.push({ index: 0, keyword: r.keyword, reason: r.reason });
+        present.add(toKeywordNorm(r.keyword));
+      }
+    }
+    // Trim back to 20 by dropping weakest non-geo, non-required items from the end.
+    const requiredSet = new Set(required.map((r) => toKeywordNorm(r.keyword)));
+    while (keywords.length > 20) {
+      let dropped = false;
+      for (let i = keywords.length - 1; i >= 0; i -= 1) {
+        const kwNorm = toKeywordNorm(keywords[i]?.keyword ?? "");
+        if (!kwNorm || requiredSet.has(kwNorm)) continue;
+        const kwLower = kwNorm.toLowerCase();
+        const isGeo = /\breno\b/.test(kwLower) || /\bnv\b/.test(kwLower) || /\bnevada\b/.test(kwLower);
+        const isNearMe = kwLower.includes("near me");
+        if (!isGeo && !isNearMe) {
+          keywords.splice(i, 1);
+          dropped = true;
+          break;
+        }
+      }
+      if (!dropped) {
+        // Fallback: drop the last non-required item.
+        const lastIdx = keywords.findIndex((k) => !requiredSet.has(toKeywordNorm(k.keyword)));
+        if (lastIdx >= 0) keywords.splice(lastIdx, 1);
+        else break;
+      }
+    }
+    keywords = keywords.slice(0, 20).map((k, idx) => ({ ...k, index: idx + 1 }));
+    }
+  }
   const keywordVariables: Record<string, string> = {};
   const reasonVariables: Record<string, string> = {};
   for (const row of keywords) {
@@ -6590,6 +7483,89 @@ function renderAfterPaymentKeywordDetailHtml(hostname: string, currentUrl: URL, 
 </html>`;
 }
 
+function renderAfterPaymentDemoLinkHtml(hostname: string, currentUrl: URL): string {
+  const buildId = cleanString(currentUrl.searchParams.get("build_id"), 120);
+  const siteId = cleanString(currentUrl.searchParams.get("site_id"), 120);
+  const demoBase = `https://${hostname}`;
+  const demoUrl = buildId ? `${demoBase}/demo/${encodeURIComponent(buildId)}/` : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Demo Site</title>
+  <style>
+    :root{--bg:#0b0f17;--card:#101826;--text:#e7eefc;--muted:#a9b6d0;--border:rgba(255,255,255,.14)}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Space Grotesk","Sora","Avenir Next",sans-serif;color:var(--text);background:radial-gradient(1200px 600px at 50% -10%, rgba(106,169,255,.18), transparent 60%), var(--bg);}
+    .wrap{max-width:860px;margin:0 auto;padding:28px 18px 64px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px}
+    h1{margin:0 0 10px;font-size:28px}
+    p{margin:0 0 12px;color:var(--muted)}
+    a{color:#9ec6ff;word-break:break-all}
+    .meta{font-size:12px;color:var(--muted);margin-top:10px}
+    .status{margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.03);color:var(--muted)}
+    .err{color:#ff7a7a}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <h1>Demo Site</h1>
+      <p>Preview your siloed, internally-linked demo build here:</p>
+      <p id="link">${demoUrl ? `<a href="${htmlEscape(demoUrl)}">${htmlEscape(demoUrl)}</a>` : "Missing build_id."}</p>
+      <div id="status" class="status">Checking build status...</div>
+      <div class="meta">site_id: ${htmlEscape(siteId)} | build_id: ${htmlEscape(buildId)}</div>
+      <p class="meta">If you want this on a custom hostname like <code>demo.yourdomain.com</code>, we will need DNS + a Worker route in your Cloudflare zone.</p>
+    </section>
+  </main>
+  <script>
+    (async function () {
+      const buildId = ${JSON.stringify(buildId)};
+      const demoUrl = ${JSON.stringify(demoUrl)};
+      const statusEl = document.getElementById("status");
+      const linkEl = document.getElementById("link");
+      if (!buildId) {
+        statusEl.textContent = "Missing build_id.";
+        statusEl.classList.add("err");
+        return;
+      }
+      async function poll() {
+        try {
+          const q = new URLSearchParams({ build_id: buildId });
+          const res = await fetch("/v1/post-payment/demo/build/status?" + q.toString(), { cache: "no-store" });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.ok) {
+            statusEl.textContent = "Status error: " + (data.error || res.status);
+            statusEl.classList.add("err");
+            return;
+          }
+          const rec = data.record || {};
+          const st = String(rec.status || "");
+          if (st === "success") {
+            statusEl.textContent = "Build complete.";
+            if (demoUrl) linkEl.innerHTML = '<a href="' + demoUrl + '">' + demoUrl + "</a>";
+            return;
+          }
+          if (st === "failed") {
+            statusEl.textContent = "Build failed: " + (rec.error_json || "unknown");
+            statusEl.classList.add("err");
+            return;
+          }
+          statusEl.textContent = "Build status: " + st + " (refreshing...)";
+          setTimeout(poll, 2500);
+        } catch (e) {
+          statusEl.textContent = "Status error: " + String(e && e.message ? e.message : e);
+          statusEl.classList.add("err");
+        }
+      }
+      await poll();
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 function parseSimpleTitle(html: string): string {
   const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   return cleanString(m?.[1] ?? "", 300);
@@ -6861,45 +7837,160 @@ async function runStep1OpenAiTop20Finalization(
     "   - Do NOT repeat the exact same geo modifier on more than 6 keywords.",
     "   (If city/state cannot be confidently derived from primaryLocation, avoid geo terms.)",
     "7) Avoid duplicates/near-duplicates (e.g., \"car detailing reno\" and \"auto detailing reno\" count as near-duplicates—keep only one unless they serve clearly different intent).",
+    "8) No keyword may repeat the brand and generic service word twice (e.g., avoid patterns like \"Raw Detailing mobile detailing\").",
+    "9) Include at least 3 pricing keywords that include the city when city is known (e.g., \"car detailing prices Reno\").",
+    "10) Do not output any keywords that start with or use the pattern \"Branded +\".",
     "Output JSON only with shape: {\"top_20_keywords\":[{\"keyword\":\"...\",\"reason\":\"...\"}],\"notes\":\"...\"}",
   ].join("\n");
-  const requestPayload = {
-    model: "gpt-5.2-pro",
-    input: prompt,
-  };
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(requestPayload),
-  });
-  const rawText = await response.text();
-  if (!response.ok) {
-    throw new Error(`step1_openai_finalization_failed:${response.status}:${rawText.slice(0, 400)}`);
+  async function callResponsesApi(model: string, inputPrompt: string): Promise<{ rawText: string; parsed: Record<string, unknown> }> {
+    const requestPayload = {
+      model,
+      input: inputPrompt,
+    };
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestPayload),
+    });
+    const rawText = await response.text();
+    if (!response.ok) {
+      throw new Error(`step1_openai_finalization_failed:${response.status}:${rawText.slice(0, 400)}`);
+    }
+    return { rawText, parsed: safeJsonParseObject(rawText) ?? { raw_text: rawText } };
   }
-  const parsed = safeJsonParseObject(rawText) ?? { raw_text: rawText };
-  const checksum = await sha256Hex(rawText);
+
+  // Pass 1: draft list from gpt-5.2
+  const draftCall = await callResponsesApi("gpt-5.2", prompt);
+  const draftResponseJson = draftCall.parsed;
+  const draftJsonForAudit = extractTop20DraftJsonText(draftResponseJson);
+
+  // Pass 2: audit list (FINAL) from gpt-5.2-pro
+  const auditPrompt = [
+    "You are an SEO auditor. Your job is to take a DRAFT keyword list and produce a FINAL top 20 list.",
+    "",
+    `Site: ${input.siteUrl}`,
+    `Business: ${input.businessName || "unknown"}`,
+    `Primary location: ${input.primaryLocation || "unknown"}`,
+    `Known services: ${input.serviceTerms.join(", ") || "unknown"}`,
+    "",
+    "Rules to enforce:",
+    "1) Exactly 20 keywords, each with a 1-sentence reason.",
+    "2) No placeholders.",
+    "3) Only include services present in serviceTerms (or clearly implied by page extracts if provided).",
+    "4) Remove near-duplicates (same intent phrasing/geo). If two overlap, keep the stronger/more common query.",
+    "5) Geo mix:",
+    "   - 4–6 city-only keywords (e.g., \"Reno\")",
+    "   - 3–5 city+state keywords (e.g., \"Reno NV\")",
+    "   - 2–4 \"near me\" keywords",
+    "6) Include at least 3 city-included pricing keywords (e.g., \"prices Reno\" or \"cost Reno\").",
+    "7) Branded keywords allowed only as: exact brand, brand + city, brand + city state.",
+    "8) MUST include: \"car detailing Reno\" and \"car detailing Reno NV\" if car detailing is a service and Reno NV is known.",
+    "9) Output JSON only with shape:",
+    "{\"top_20_keywords\":[{\"keyword\":\"...\",\"reason\":\"...\"}],\"notes\":\"...\"}",
+    "",
+    "DRAFT JSON:",
+    draftJsonForAudit || "{}",
+  ].join("\n");
+
+  let finalCall = await callResponsesApi("gpt-5.2-pro", auditPrompt);
+  let finalParsed = finalCall.parsed;
+  let finalRawText = finalCall.rawText;
+
+  const requireCarDetailingReno = shouldRequireCarDetailingReno({
+    primaryLocation: input.primaryLocation,
+    serviceTerms: input.serviceTerms,
+  });
+  let repairPrompt: string | null = null;
+  // Up to 2 repair attempts to handle "model ignored constraints" cases.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const finalRows = extractTop20KeywordRowsFromOpenAiResponse(finalParsed);
+    const brandedPlusViolations = findBrandedPlusViolations({
+      rows: finalRows,
+      businessName: input.businessName,
+      siteUrl: input.siteUrl,
+      primaryLocation: input.primaryLocation,
+      serviceTerms: input.serviceTerms,
+      brandHints: finalRows.slice(0, 3).map((r) => r.keyword),
+    });
+    const missingRequired = findMissingRequiredKeywords({
+      rows: finalRows,
+      requireCarDetailingReno,
+    });
+    const needsRepair = finalRows.length !== 20 || brandedPlusViolations.length > 0 || missingRequired.length > 0;
+    if (!needsRepair) break;
+
+    const issues: string[] = [];
+    if (finalRows.length !== 20) issues.push(`keyword_count=${finalRows.length}`);
+    if (brandedPlusViolations.length > 0) issues.push(`invalid_branded_keywords=[${brandedPlusViolations.join(", ")}]`);
+    if (missingRequired.length > 0) issues.push(`missing_required=[${missingRequired.join(", ")}]`);
+
+    const mustInclude = requireCarDetailingReno ? ["car detailing Reno", "car detailing Reno NV"] : [];
+    repairPrompt = [
+      "You are an SEO auditor. Fix the FINAL list to comply with all rules.",
+      `Site: ${input.siteUrl}`,
+      `Business: ${input.businessName || "unknown"}`,
+      `Primary location: ${input.primaryLocation || "unknown"}`,
+      `Known services: ${input.serviceTerms.join(", ") || "unknown"}`,
+      `Issues detected: ${issues.join("; ")}`,
+      ...(mustInclude.length > 0 ? [`MUST include these exact keywords: ${mustInclude.join(", ")}.`] : []),
+      "",
+      "Return corrected JSON only with shape:",
+      "{\"top_20_keywords\":[{\"keyword\":\"...\",\"reason\":\"...\"}],\"notes\":\"...\"}",
+      "",
+      "CURRENT JSON:",
+      extractTop20DraftJsonText(finalParsed),
+    ].join("\n");
+    const repaired = await callResponsesApi("gpt-5.2-pro", repairPrompt);
+    finalParsed = repaired.parsed;
+    finalRawText = repaired.rawText;
+  }
+
+  const checksum = await sha256Hex(finalRawText);
+  const draftChecksum = await sha256Hex(draftCall.rawText);
   let r2Key: string | null = null;
+  let draftR2Key: string | null = null;
   if (env.MEMORY_R2) {
-    r2Key = `openai/v1/site/${input.siteId}/day/${day}/step1/${input.researchRunId}/gpt52pro_top20.json`;
-    await env.MEMORY_R2.put(r2Key, rawText, {
+    draftR2Key = `openai/v1/site/${input.siteId}/day/${day}/step1/${input.researchRunId}/gpt52_draft_top20.json`;
+    await env.MEMORY_R2.put(draftR2Key, draftCall.rawText, {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        site_id: input.siteId,
+        research_run_id: input.researchRunId,
+        model: "gpt-5.2",
+        kind: "draft",
+      },
+    });
+    r2Key = `openai/v1/site/${input.siteId}/day/${day}/step1/${input.researchRunId}/gpt52pro_final_top20.json`;
+    await env.MEMORY_R2.put(r2Key, finalRawText, {
       httpMetadata: { contentType: "application/json" },
       customMetadata: {
         site_id: input.siteId,
         research_run_id: input.researchRunId,
         model: "gpt-5.2-pro",
+        kind: "final",
       },
     });
   }
+
   return {
     status: "succeeded",
     model: "gpt-5.2-pro",
     prompt,
-    response_json: parsed,
+    audit_prompt: auditPrompt,
+    repair_prompt: repairPrompt,
+    response_json: finalParsed,
     checksum,
     r2_key: r2Key,
+    draft: {
+      model: "gpt-5.2",
+      prompt,
+      response_json: draftResponseJson,
+      checksum: draftChecksum,
+      r2_key: draftR2Key,
+    },
   };
 }
 
@@ -6913,16 +8004,57 @@ async function runStep1KeywordResearch(
 }> {
   const researchRunId = uuid("krr");
   const day = toDateYYYYMMDD(nowMs());
-  // Step 1 starts with the secondary Step 1 actor only.
-  const secondaryActorRun = await runInitialApifyActorBootstrap(env, site, "step1_keyword_research_secondary_actor", {
-    forceRun: true,
-    actorId: APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_ID,
-    actorUrl: APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_URL,
-    useResidentialProxy: true,
-  });
-
   const siteInput = safeJsonParseObject(site.input_json) ?? {};
   const payload = requestBody ?? {};
+  const step1FastMode = parseBoolUnknown(payload.step1_fast_mode, parseBool(env.STEP1_FAST_MODE ?? "1", true));
+  const domain = normalizeRootDomain(site.site_url);
+  // Step 1 starts with the secondary Step 1 actor unless fast mode is enabled.
+  const secondaryActorRunMeta: Record<string, unknown> = step1FastMode
+    ? {
+        run_id: uuid("init"),
+        actor_id: APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_ID,
+        actor_url: APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_URL,
+        domain,
+        item_count: 0,
+        job_id: null,
+        r2_key: null,
+        status: "skipped",
+        skipped: true,
+        reason: "step1_fast_mode_enabled",
+      }
+    : {};
+
+  if (!step1FastMode) {
+    const secondaryActorRun = await runInitialApifyActorBootstrap(env, site, "step1_keyword_research_secondary_actor", {
+      forceRun: true,
+      actorId: APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_ID,
+      actorUrl: APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_URL,
+      useResidentialProxy: true,
+    });
+    if (secondaryActorRun.ok) {
+      secondaryActorRunMeta.run_id = secondaryActorRun.run_id;
+      secondaryActorRunMeta.actor_id = secondaryActorRun.actor_id;
+      secondaryActorRunMeta.actor_url = secondaryActorRun.actor_url;
+      secondaryActorRunMeta.domain = secondaryActorRun.domain;
+      secondaryActorRunMeta.item_count = secondaryActorRun.item_count;
+      secondaryActorRunMeta.job_id = secondaryActorRun.job_id;
+      secondaryActorRunMeta.r2_key = secondaryActorRun.r2_key;
+      secondaryActorRunMeta.skipped = secondaryActorRun.skipped;
+      secondaryActorRunMeta.status = secondaryActorRun.skipped ? "skipped" : "success";
+    } else {
+      secondaryActorRunMeta.run_id = secondaryActorRun.run_id;
+      secondaryActorRunMeta.actor_id = secondaryActorRun.actor_id;
+      secondaryActorRunMeta.actor_url = secondaryActorRun.actor_url;
+      secondaryActorRunMeta.domain = secondaryActorRun.domain;
+      secondaryActorRunMeta.item_count = 0;
+      secondaryActorRunMeta.job_id = secondaryActorRun.job_id;
+      secondaryActorRunMeta.r2_key = null;
+      secondaryActorRunMeta.status = "failed";
+      secondaryActorRunMeta.skipped = secondaryActorRun.skipped;
+      secondaryActorRunMeta.error = secondaryActorRun.error;
+    }
+  }
+
   const semrushMetrics = parseSemrushMetrics(payload.semrush_keywords ?? siteInput.semrush_keywords);
   const siteProfile = safeJsonParseObject(site.site_profile_json) ?? {};
   const offerTerms = extractOfferTerms(siteInput);
@@ -6933,9 +8065,14 @@ async function runStep1KeywordResearch(
   let scored: Step1KeywordCandidate[] = [];
   const dataforseoArtifacts: Array<Record<string, unknown>> = [];
 
-  const domain = normalizeRootDomain(site.site_url);
   const dataForSeoEnabled = !!cleanString(env.DATAFORSEO_LOGIN, 300) && !!cleanString(env.DATAFORSEO_PASSWORD, 500);
-  if (dataForSeoEnabled && domain) {
+  if (step1FastMode) {
+    dataforseoArtifacts.push({
+      kind: "skipped",
+      source: "dataforseo_step1",
+      reason: "step1_fast_mode_enabled",
+    });
+  } else if (dataForSeoEnabled && domain) {
     try {
       const dfKeywords = await fetchStep1DataForSeoKeywords(env, { domain, limit: 300 });
       const dfKeywordsSave = await saveStep1DataForSeoRawToR2(env, {
@@ -7118,27 +8255,6 @@ async function runStep1KeywordResearch(
     };
   }
 
-  const secondaryActorRunMeta = secondaryActorRun.ok
-    ? {
-        run_id: secondaryActorRun.run_id,
-        actor_id: secondaryActorRun.actor_id,
-        actor_url: secondaryActorRun.actor_url,
-        domain: secondaryActorRun.domain,
-        item_count: secondaryActorRun.item_count,
-        job_id: secondaryActorRun.job_id,
-        r2_key: secondaryActorRun.r2_key,
-      }
-    : {
-        run_id: secondaryActorRun.run_id,
-        actor_id: secondaryActorRun.actor_id,
-        actor_url: secondaryActorRun.actor_url,
-        domain: secondaryActorRun.domain,
-        item_count: 0,
-        job_id: secondaryActorRun.job_id,
-        r2_key: null,
-        status: "failed",
-        error: secondaryActorRun.error,
-      };
   await saveStep1KeywordResearchResults(env, {
     siteId: site.site_id,
     researchRunId,
@@ -7150,6 +8266,7 @@ async function runStep1KeywordResearch(
       secondary_actor_run: secondaryActorRunMeta,
       dataforseo_artifacts: dataforseoArtifacts,
       parse_mode: "none",
+      step1_fast_mode: step1FastMode,
     },
     step1OpenAiTop20,
   });
@@ -7164,6 +8281,7 @@ async function runStep1KeywordResearch(
         ({
           secondary_actor_run: secondaryActorRunMeta,
           parse_mode: "none",
+          step1_fast_mode: step1FastMode,
         } as Record<string, unknown>),
       step1_openai_top20:
         parseJsonObject(result.step1_openai_top20) ??
@@ -13306,10 +14424,35 @@ async function searchSemanticMemory(
 }
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
     const pluginV1Prefix = "/plugin/wp/v1";
     const host = cleanString(url.hostname, 255).toLowerCase();
+
+    // Optional: serve latest successful demo build via demo.<customer-domain>.
+    // This requires the customer domain to be routed to this Worker in Cloudflare.
+    if (req.method === "GET" || req.method === "HEAD") {
+      if (host.startsWith("demo.") && env.MEMORY_R2) {
+        const baseHost = host.slice("demo.".length);
+        const siteId = await loadSiteIdByHost(env, baseHost);
+        if (siteId) {
+          const record = await loadLatestSuccessfulDemoBuildForSite(env, siteId);
+          const prefix = cleanString(record?.output_r2_prefix, 500);
+          if (prefix) {
+            const tail = cleanString(url.pathname.replace(/^\/+/, ""), 500) || "index.html";
+            const key = `${prefix}${tail}`;
+            const obj = await env.MEMORY_R2.get(key);
+            if (obj) {
+              const headers = new Headers();
+              headers.set("content-type", guessContentType(tail));
+              headers.set("cache-control", "public, max-age=300");
+              return new Response(obj.body, { status: 200, headers });
+            }
+          }
+        }
+        return new Response("Demo not ready", { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+    }
 
     if (
       (req.method === "GET" || req.method === "HEAD") &&
@@ -13401,6 +14544,20 @@ export default {
       });
     }
 
+    if (
+      (req.method === "GET" || req.method === "HEAD") &&
+      (url.pathname === "/after-payment/demo" || url.pathname === "/after-payment/demo/")
+    ) {
+      const html = renderAfterPaymentDemoLinkHtml(url.hostname, url);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
     const keywordRouteMatch = url.pathname.match(/^\/after-payment\/results\/keyword(\d{1,2})\/?$/);
     if ((req.method === "GET" || req.method === "HEAD") && keywordRouteMatch) {
       const keywordIndex = clampInt(Number(keywordRouteMatch[1] ?? 0), 1, 20, 1);
@@ -13412,6 +14569,23 @@ export default {
           "cache-control": "no-store",
         },
       });
+    }
+
+    const demoRouteMatch = url.pathname.match(/^\/demo\/([a-z0-9_\-]{6,80})(?:\/(.*))?$/i);
+    if ((req.method === "GET" || req.method === "HEAD") && demoRouteMatch) {
+      const buildId = cleanString(demoRouteMatch[1], 120);
+      const tail = cleanString(demoRouteMatch[2] ?? "", 400) || "index.html";
+      if (!env.MEMORY_R2) return new Response("R2 not configured", { status: 500 });
+      const record = await loadDemoBuildRecord(env, buildId);
+      const prefix = cleanString(record?.output_r2_prefix, 500);
+      if (!record || !prefix) return new Response("Demo build not found", { status: 404 });
+      const key = `${prefix}${tail.replace(/^\/+/, "")}`;
+      const obj = await env.MEMORY_R2.get(key);
+      if (!obj) return new Response("Not found", { status: 404 });
+      const headers = new Headers();
+      headers.set("content-type", guessContentType(tail));
+      headers.set("cache-control", "public, max-age=300");
+      return new Response(obj.body, { status: 200, headers });
     }
 
     if (
@@ -13654,6 +14828,79 @@ export default {
         reason: cleanString(rowObj.reason, 4000) || "",
         url: cleanString(parsed.url, 2000) || "",
       });
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/post-payment/demo/build") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const siteId = cleanString(body.site_id, 120);
+      const researchRunId = cleanString(body.research_run_id, 120) || null;
+      if (!siteId) return Response.json({ ok: false, error: "site_id_required" }, { status: 400 });
+      if (!env.MEMORY_R2) return Response.json({ ok: false, error: "R2_not_configured" }, { status: 500 });
+
+      const site = await loadStep1Site(env, siteId);
+      if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+
+      const result =
+        researchRunId != null
+          ? await loadStep1KeywordResearchResultsByRun(env, siteId, researchRunId)
+          : await loadLatestStep1KeywordResearchResults(env, siteId);
+      if (!result) return Response.json({ ok: false, error: "keyword_research_results_not_found" }, { status: 404 });
+      const runId = researchRunId ?? cleanString(result.research_run_id, 120) ?? null;
+      if (!runId) return Response.json({ ok: false, error: "research_run_id_required" }, { status: 400 });
+
+      const parsed = await getOrBuildStep1ParsedKeywords(env, { siteId, researchRunId: runId });
+      const keywordRows = Array.isArray(parsed?.keywords) ? parsed?.keywords : [];
+      const keywords = keywordRows
+        .map((row) => {
+          const obj = parseJsonObject(row) ?? {};
+          return {
+            index: clampInt(obj.index, 1, 20, 0),
+            keyword: cleanString(obj.keyword, 300),
+            reason: cleanString(obj.reason, 2000) || null,
+          };
+        })
+        .filter((r) => r.index >= 1 && r.index <= 20 && r.keyword.length > 0)
+        .slice(0, 20);
+
+      const siteInput = safeJsonParseObject(site.input_json) ?? {};
+      const context = await fetchSeedSiteFactsWithFallback(site.site_url);
+      const businessName = cleanString(site.site_name, 200) || cleanString(context.siteName, 200) || "unknown";
+      const primaryLocation = cleanString(site.primary_location_hint, 200) || cleanString(context.primaryLocationHint, 200) || "unknown";
+      const services = parseStringArray(siteInput.services, 200, 160);
+      const buildId = uuid("demo");
+      const sourcePrefix = `demo/v1/site/${siteId}/build/${buildId}/source/`;
+      const outputPrefix = `demo/v1/site/${siteId}/build/${buildId}/out/`;
+
+      await saveDemoBuildRecord(env, {
+        buildId,
+        siteId,
+        siteUrl: site.site_url,
+        researchRunId: runId,
+        status: "running",
+        keywordsJson: safeJsonStringify({ keywords }, 200_000),
+        sourcePrefix,
+        outputPrefix,
+        errorJson: safeJsonStringify({ stage: "fetch_source" }, 2000),
+      });
+
+      const demoUrl = `/demo/${encodeURIComponent(buildId)}/`;
+      const linkPage = `/after-payment/demo?site_id=${encodeURIComponent(siteId)}&build_id=${encodeURIComponent(buildId)}`;
+      return Response.json({ ok: true, site_id: siteId, research_run_id: runId, build_id: buildId, demo_url: demoUrl, link_page: linkPage });
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/post-payment/demo/build/status") {
+      const buildId = cleanString(url.searchParams.get("build_id"), 120);
+      if (!buildId) return Response.json({ ok: false, error: "build_id_required" }, { status: 400 });
+      const record = await loadDemoBuildRecord(env, buildId);
+      if (!record) return Response.json({ ok: false, error: "not_found" }, { status: 404 });
+      const advanced = await advanceDemoBuildOneStep(env, record);
+      return Response.json({ ok: true, record: advanced });
     }
 
     if (req.method === "OPTIONS" && (url.pathname === "/api/validate-promo" || url.pathname === "/api/create-checkout-session")) {

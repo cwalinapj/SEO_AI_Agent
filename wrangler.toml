@@ -1,6 +1,12 @@
 name = "tolldns-seo-agent"
 main = "src/worker.ts"
 compatibility_date = "2026-02-24"
+workers_dev = true
+
+[[routes]]
+pattern = "www.onboarding.aiwpdev.com"
+zone_name = "aiwpdev.com"
+custom_domain = true
 
 # If you use Node APIs in tooling, keep this:
 # compatibility_flags = ["nodejs_compat"]
@@ -43,11 +49,19 @@ bucket_name = "seo-ai-memory"
 DEFAULT_PSI_STRATEGY = "mobile"
 # Optional: Apify actor for Google SERP (headless Chrome)
 APIFY_GOOGLE_ACTOR = "apify/google-search-scraper"
+# Decodo auth defaults (can be overridden by env-specific vars/secrets)
+DECODO_API_USERNAME = "SCRAPER"
+DECODO_AUTH_MODE = "basic"
+# Optional DataForSEO base URL override
+DATAFORSEO_BASE_URL = "https://api.dataforseo.com"
 
 # --- Secrets (set via wrangler secret put) ---
 # PAGESPEED_API_KEY is required for PSI calls:
 #   npx wrangler secret put PAGESPEED_API_KEY
 # APIFY_TOKEN is required for /serp/google/top20 and /serp/sample scraping:
 #   npx wrangler secret put APIFY_TOKEN
+# DataForSEO SERP provider secrets:
+#   npx wrangler secret put DATAFORSEO_LOGIN
+#   npx wrangler secret put DATAFORSEO_PASSWORD
 # PROXY_CONTROL_SECRET protects /proxy/admin/* routes:
 #   npx wrangler secret put PROXY_CONTROL_SECRET
