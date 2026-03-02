@@ -7,7 +7,12 @@ export interface Env {
   WP_PLUGIN_SHARED_SECRET?: string;
   TASK_AGENT_SIGNING_SECRET?: string;
   MOZ_API_TOKEN?: string;
+  DATAFORSEO_LOGIN?: string;
+  DATAFORSEO_PASSWORD?: string;
+  DATAFORSEO_BASE_URL?: string;
   DECODO_API_KEY?: string;
+  DECODO_API_USERNAME?: string;
+  DECODO_AUTH_MODE?: string;
   DECODO_TASKS_URL?: string;
   SERP_PROVIDER_PRIMARY?: string;
   SERP_PROVIDER_FALLBACK?: string;
@@ -17,7 +22,32 @@ export interface Env {
   PROVIDER_RETRY_BACKOFF_MS?: string;
   APIFY_TOKEN?: string;
   APIFY_GOOGLE_ACTOR?: string;
+  APIFY_INITIAL_ACTOR_ID?: string;
+  APIFY_INITIAL_ACTOR_URL?: string;
+  TEAM_ISSUER_WALLET?: string;
   PROXY_CONTROL_SECRET?: string;
+  CF_OAUTH_AUTHORIZE_URL?: string;
+  CF_OAUTH_TOKEN_URL?: string;
+  CF_OAUTH_CLIENT_ID?: string;
+  CF_OAUTH_CLIENT_SECRET?: string;
+  CF_OAUTH_SCOPES?: string;
+  CF_OAUTH_REDIRECT_URI?: string;
+  CONNECTIONS_ENCRYPTION_KEY?: string;
+  CHECKOUT_STARTER_URL?: string;
+  CHECKOUT_GROWTH_URL?: string;
+  CHECKOUT_AGENCY_URL?: string;
+  CONTACT_FORM_TO_EMAIL?: string;
+  CONTACT_FORM_FROM_EMAIL?: string;
+  CONTACT_WEBHOOK_URL?: string;
+  CONTACT_WEBHOOK_SECRET?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_SUCCESS_URL?: string;
+  STRIPE_CANCEL_URL?: string;
+  STRIPE_PRICE_STARTER?: string;
+  STRIPE_PRICE_GROWTH?: string;
+  STRIPE_PRICE_AGENCY?: string;
+  STRIPE_PROMO_MAP_JSON?: string;
+  CHECKOUT_ALLOW_ORIGIN?: string;
 }
 
 const COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
@@ -30,9 +60,15 @@ const SITE_MAX_BACKLINK_ENRICH_PER_DAY = 400;
 const SITE_MAX_GRAPH_DOMAINS_PER_DAY = 10;
 const TASK_MAX_CLAIM_MINUTES = 24 * 60;
 const MOZ_DEFAULT_COST_PER_1K_ROWS_USD = 5;
-const DECODO_DEFAULT_TASKS_URL = "https://scraper-api.decodo.com/v1/tasks";
+const DATAFORSEO_DEFAULT_BASE_URL = "https://api.dataforseo.com";
+const DECODO_DEFAULT_TASKS_URL = "https://scraper-api.decodo.com/v2/scrape";
+const APIFY_DEFAULT_INITIAL_ACTOR_ID = "X2JFXEVBxFPnnHs7g";
+const APIFY_DEFAULT_INITIAL_ACTOR_URL = "https://console.apify.com/actors/X2JFXEVBxFPnnHs7g/";
+const APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_ID = "rEbWw5H3urseNjdNw";
+const APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_URL = "https://console.apify.com/actors/rEbWw5H3urseNjdNw/";
 const MEMORY_EMBEDDING_MODEL = "text-embedding-3-small";
 const MEMORY_EMBEDDING_DIMS = 1536;
+const CLOUDFLARE_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
 type PlanDefinition = {
   key: "starter" | "growth" | "agency";
@@ -244,205 +280,696 @@ function htmlEscape(input: unknown): string {
     .replace(/'/g, "&#39;");
 }
 
-function renderPortalHtml(hostname: string): string {
-  const cards = PORTAL_PLAN_DEFINITIONS.map((plan) => {
-    const features = plan.features.map((f) => `<li>${htmlEscape(f)}</li>`).join("");
-    return `
-      <article class="plan-card" data-plan="${plan.key}">
-        <div class="plan-head">
-          <h3>${htmlEscape(plan.name)}</h3>
-          <p class="price">$${plan.monthly_usd}<span>/mo</span></p>
-        </div>
-        <p class="summary">${htmlEscape(plan.summary)}</p>
-        <ul>${features}</ul>
-        <button class="pick" data-plan="${plan.key}">${htmlEscape(plan.cta)}</button>
-      </article>
-    `;
-  }).join("");
+function getBaseOrigin(url: URL): string {
+  return `${url.protocol}//${url.host}`;
+}
 
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function base64ToBytes(raw: string): Uint8Array {
+  const decoded = atob(raw);
+  const out = new Uint8Array(decoded.length);
+  for (let i = 0; i < decoded.length; i += 1) out[i] = decoded.charCodeAt(i);
+  return out;
+}
+
+async function getConnectionsCryptoKey(env: Env): Promise<CryptoKey | null> {
+  const raw = cleanString(env.CONNECTIONS_ENCRYPTION_KEY, 5000);
+  if (!raw) return null;
+  try {
+    const keyBytes = base64ToBytes(raw);
+    if (keyBytes.length !== 32) return null;
+    return await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt", "decrypt"]);
+  } catch {
+    return null;
+  }
+}
+
+async function encryptConnectionSecret(env: Env, plaintext: string): Promise<string | null> {
+  const key = await getConnectionsCryptoKey(env);
+  if (!key) return null;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder().encode(plaintext);
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc));
+  return canonicalJson({
+    alg: "AES-GCM",
+    iv_b64: bytesToBase64(iv),
+    ct_b64: bytesToBase64(ciphertext),
+  });
+}
+
+function renderPortalHtml(hostname: string, env: Env): string {
+  const planByKey = new Map(PORTAL_PLAN_DEFINITIONS.map((plan) => [plan.key, plan]));
+  const starter = planByKey.get("starter");
+  const growth = planByKey.get("growth");
+  const agency = planByKey.get("agency");
+  const starterPrice = starter?.monthly_usd ?? 149;
+  const growthPrice = growth?.monthly_usd ?? 399;
+  const agencyPrice = agency?.monthly_usd ?? 999;
+  const checkoutStarter = cleanString(env.CHECKOUT_STARTER_URL, 2000) || "/checkout?plan=starter";
+  const checkoutGrowth = cleanString(env.CHECKOUT_GROWTH_URL, 2000) || "/checkout?plan=growth";
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AIWPDev Client Portal</title>
+  <title>AI SEO Agent - Plans</title>
   <style>
-    :root {
-      --bg: #0c1f1f;
-      --panel: #102b2b;
-      --ink: #f3f4ec;
-      --muted: #adc4b9;
-      --line: #295e58;
-      --cta: #ec6f2d;
-      --cta-ink: #1f120a;
-      --ok: #2f9e64;
-      --warn: #dc5537;
+    :root{
+      --bg:#0b0f17; --card:#101826; --card2:#0f1724; --text:#e7eefc; --muted:#a9b6d0;
+      --accent:#6aa9ff; --accent2:#7cf0c6; --border:rgba(255,255,255,.10); --ok:#9cf0c5; --err:#ff7a7a;
     }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Space Grotesk", "Sora", "Avenir Next", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(1200px 500px at 10% -20%, #1d4d4b 0, transparent 60%),
-        radial-gradient(900px 500px at 90% -10%, #7b3520 0, transparent 55%),
-        var(--bg);
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Space Grotesk","Sora","Avenir Next",sans-serif;color:var(--text);background:radial-gradient(1200px 600px at 50% -10%, rgba(106,169,255,.18), transparent 60%), var(--bg);}
+    a{color:inherit}
+    .wrap{max-width:1100px;margin:0 auto;padding:28px 18px 64px;}
+    .brand{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+    .brand strong{font-size:20px}
+    .brand span{font-size:12px;color:var(--muted)}
+    .packageLead{margin:6px 0 12px;color:var(--muted);font-size:15px}
+    .topPricing{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:6px;}
+    .plan{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid rgba(255,255,255,.14);border-radius:20px;padding:18px;position:relative;overflow:hidden;display:flex;flex-direction:column;min-height:260px;box-shadow:0 10px 30px rgba(0,0,0,.25);}
+    .plan h3{margin:0 0 10px;font-size:16px;letter-spacing:.2px;color:var(--muted);font-weight:600}
+    .price{font-size:44px;font-weight:800;line-height:1;margin:4px 0 6px;letter-spacing:-0.02em;}
+    .per{color:var(--muted);font-weight:600;margin-bottom:16px}
+    .mini{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px;margin:0 0 16px}
+    .pill{border:1px solid var(--border);padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.03)}
+    .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--border);background:rgba(255,255,255,.04);color:var(--text);font-weight:700;text-decoration:none;cursor:pointer}
+    .btnPrimary{background:linear-gradient(90deg,var(--accent),#8b7dff);border:none}
+    .btnAlt{background:linear-gradient(90deg,var(--accent2),#7cc7ff);border:none;color:#08101b}
+    .badge{position:absolute;top:14px;right:14px;font-size:12px;color:#08101b;background:linear-gradient(90deg,var(--accent2),#7cc7ff);padding:6px 10px;border-radius:999px;font-weight:800}
+    .ctaWrap{margin-top:auto}
+    .section{margin-top:28px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.14);border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.25);}
+    .section h2{margin:0 0 10px;font-size:18px}
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .featuresGrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .featureCard{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:18px;padding:16px}
+    .featureCard h3{margin:0 0 8px;font-size:16px}
+    ul{margin:10px 0 0 18px;color:var(--muted);line-height:1.6}
+    .muted{color:var(--muted)}
+    .formRow{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    label{display:block;font-size:12px;color:var(--muted);margin:10px 0 6px}
+    input,select,textarea{
+      width:100%;padding:12px 12px;border-radius:12px;border:1px solid var(--border);
+      background:rgba(10,16,28,.6);color:var(--text);outline:none
     }
-    .wrap { max-width: 1180px; margin: 0 auto; padding: 26px 20px 60px; }
-    .brand { display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; }
-    .brand strong { letter-spacing: .04em; font-size: 20px; }
-    .brand .host { color: var(--muted); font-size: 13px; }
-    h1 { margin: 0 0 10px; font-size: clamp(30px, 4vw, 52px); line-height: 1.05; }
-    .lead { color: var(--muted); max-width: 770px; font-size: 17px; margin-bottom: 26px; }
-    .plans { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 16px; margin-bottom: 30px; }
-    .plan-card {
-      background: linear-gradient(160deg, #133533 0, #0f2929 70%);
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 18px;
-      box-shadow: 0 20px 30px rgba(0,0,0,.25);
-    }
-    .plan-head { display:flex; justify-content: space-between; align-items: baseline; gap: 12px; }
-    .plan-head h3 { margin: 0; font-size: 24px; }
-    .price { margin: 0; font-size: 27px; font-weight: 700; color: #ffe7d9; }
-    .price span { color: var(--muted); font-size: 13px; margin-left: 4px; }
-    .summary { color: #d8e6dd; font-size: 14px; min-height: 42px; }
-    ul { margin: 12px 0 14px 20px; padding: 0; color: #d2e2d8; font-size: 14px; line-height: 1.45; }
-    .pick {
-      border: 0; width: 100%; padding: 11px 12px; font-weight: 700;
-      background: var(--cta); color: var(--cta-ink); border-radius: 10px; cursor: pointer;
-    }
-    .panels { display: grid; grid-template-columns: 1.1fr .9fr; gap: 16px; }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 18px;
-    }
-    label { display:block; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 5px; }
-    input, select, textarea {
-      width: 100%; border: 1px solid #3f7770; border-radius: 10px; background: #0f2525; color: var(--ink);
-      padding: 10px 11px; margin-bottom: 10px; font-family: inherit;
-    }
-    textarea { min-height: 86px; resize: vertical; }
-    .row { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .btn {
-      border: 0; padding: 10px 13px; border-radius: 10px; background: #2f9e64; color: #042212; font-weight: 700; cursor: pointer;
-    }
-    .btn.secondary { background: #355e91; color: #edf3ff; }
-    .status { font-size: 13px; margin-top: 8px; color: var(--muted); }
-    .status.ok { color: #9df0bf; }
-    .status.err { color: #ffb7a8; }
-    .report-box {
-      margin-top: 12px; background: #0c1d1d; border: 1px solid #305e58; border-radius: 10px;
-      padding: 10px; min-height: 170px; max-height: 460px; overflow: auto; font-family: "JetBrains Mono","IBM Plex Mono",monospace; font-size: 12px;
-    }
-    @media (max-width: 980px) {
-      .plans { grid-template-columns: 1fr; }
-      .panels { grid-template-columns: 1fr; }
-      .row { grid-template-columns: 1fr; }
+    textarea{min-height:90px;resize:vertical}
+    .small{font-size:12px;color:var(--muted);margin-top:10px}
+    .strongNote{margin-top:10px;font-size:13px;color:#d5e2ff}
+    .divider{height:1px;background:var(--border);margin:16px 0}
+    .status{font-size:13px;color:var(--muted);margin-top:10px}
+    .status.ok{color:var(--ok)}
+    .status.err{color:var(--err)}
+    @media (max-width: 920px){
+      .topPricing{grid-template-columns:1fr;}
+      .featuresGrid{grid-template-columns:1fr;}
     }
   </style>
 </head>
 <body>
   <main class="wrap">
-    <header class="brand">
-      <strong>AIWPDev Portal</strong>
-      <span class="host">${htmlEscape(hostname)}</span>
-    </header>
-    <h1>Client Reports And Plan Management</h1>
-    <p class="lead">Customers can choose a plan, then load live Step2 and Step3 reports by site ID. This portal is built to be hosted at <code>www.aiwpdev.com</code> on the same Worker.</p>
-    <section class="plans">${cards}</section>
-    <section class="panels">
-      <section class="panel">
-        <h2>Pick A Plan</h2>
-        <div class="row">
-          <div><label>Site ID</label><input id="plan-site-id" placeholder="site_..." /></div>
-          <div><label>Plan</label><select id="plan-key">${PORTAL_PLAN_DEFINITIONS.map((p)=>`<option value="${p.key}">${p.name} ($${p.monthly_usd}/mo)</option>`).join("")}</select></div>
+    <header class="brand"><strong>AI SEO Agent</strong><span>${htmlEscape(hostname)}</span></header>
+    <section class="topPricing">
+      <article class="plan">
+        <h3>Starter</h3>
+        <div class="price">$${starterPrice}</div>
+        <div class="per">one-time package</div>
+        <div class="mini">
+          <span class="pill">1 site</span>
+          <span class="pill">20 keywords</span>
+          <span class="pill">30-day SERP baseline</span>
         </div>
-        <div class="row">
-          <div><label>Company</label><input id="plan-company" placeholder="Acme Plumbing" /></div>
-          <div><label>Contact Email</label><input id="plan-email" placeholder="owner@acme.com" /></div>
+        <div class="ctaWrap">
+          <a class="btn btnPrimary" href="${htmlEscape(checkoutStarter)}">Start Starter</a>
         </div>
-        <label>Notes</label><textarea id="plan-notes" placeholder="Optional onboarding notes"></textarea>
-        <button id="plan-submit" class="btn">Save Plan Selection</button>
-        <p id="plan-status" class="status"></p>
-      </section>
-      <section class="panel">
-        <h2>View Client Reports</h2>
-        <div class="row">
-          <div><label>Site ID</label><input id="report-site-id" placeholder="site_..." /></div>
-          <div><label>Date (optional)</label><input id="report-date" placeholder="YYYY-MM-DD" /></div>
+      </article>
+      <article class="plan">
+        <div class="badge">Most Popular</div>
+        <h3>Growth</h3>
+        <div class="price">$${growthPrice}</div>
+        <div class="per">one-time package</div>
+        <div class="mini">
+          <span class="pill">Up to 5 sites</span>
+          <span class="pill">Up to 100 keywords</span>
+          <span class="pill">30-day SERP baseline</span>
         </div>
-        <div style="display:flex; gap:8px;">
-          <button id="load-step2" class="btn">Load Step2</button>
-          <button id="load-step3" class="btn secondary">Load Step3</button>
+        <div class="ctaWrap">
+          <a class="btn btnAlt" href="${htmlEscape(checkoutGrowth)}">Start Growth</a>
         </div>
-        <p id="report-status" class="status"></p>
-        <pre id="report-box" class="report-box"></pre>
-      </section>
+      </article>
+      <article class="plan">
+        <h3>Agency</h3>
+        <div class="price">$${agencyPrice}</div>
+        <div class="per">one-time package</div>
+        <div class="mini">
+          <span class="pill">Up to 20 sites</span>
+          <span class="pill">Up to 400 keywords</span>
+          <span class="pill">30-day SERP baseline</span>
+        </div>
+        <div class="ctaWrap">
+          <a class="btn" href="/contact">Contact Sales</a>
+        </div>
+      </article>
+    </section>
+    <p class="packageLead">One-time SEO setup package (not a subscription). Includes a 30-day SERP baseline report, on-page execution, one site redesign, and strategy handoff.</p>
+
+    <section class="section">
+      <h2>What you get</h2>
+      <div class="featuresGrid">
+        <div class="featureCard">
+          <h3>Keyword strategy</h3>
+          <ul>
+            <li><b>20 target keywords per site</b> (more on higher tiers) with page mapping.</li>
+            <li>Keyword-to-page mapping so each keyword has a clear target page.</li>
+          </ul>
+        </div>
+        <div class="featureCard">
+          <h3>On-page execution + updates</h3>
+          <ul>
+            <li>Internal linking structure, content quality/formatting, titles, H1s, meta descriptions, image metadata, and page speed improvements.</li>
+            <li>One-time site redesign so pages are structured to rank and convert.</li>
+          </ul>
+        </div>
+        <div class="featureCard">
+          <h3>30-day SERP baseline reporting</h3>
+          <ul>
+            <li>Daily or near-daily email updates with rank movement and competitor changes.</li>
+            <li>Daily activity log plus <b>tomorrow's plan</b> so you can see where your site ranks during the first 30 days.</li>
+          </ul>
+        </div>
+        <div class="featureCard">
+          <h3>Backlinks are recommended, not executed</h3>
+          <ul>
+            <li>Strategy includes GMB, directories, social profiles, web 2.0, and backlink opportunities.</li>
+            <li>Choose DIY or pay extra to have backlink execution outsourced and managed.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="muted" style="margin-top:10px">Tier controls how many sites and how many keywords we track and execute against.</p>
+      <p class="strongNote"><b>Important:</b> SERP reports are included for one month only (30 days).</p>
+    </section>
+
+    <section class="section">
+      <h2>This package is best for / not for</h2>
+      <div class="featuresGrid">
+        <div class="featureCard">
+          <h3>This package is best for</h3>
+          <ul>
+            <li>New sites or recently rebuilt sites that need strong structure and on-page setup.</li>
+            <li>Businesses that want a clean keyword plan plus a 30-day ranking baseline.</li>
+            <li>Owners who want one-time execution with a handoff plan for content and backlinks.</li>
+          </ul>
+        </div>
+        <div class="featureCard">
+          <h3>This package is not ideal if</h3>
+          <ul>
+            <li>You already have an established site with strong rankings and long history.</li>
+            <li>In that case we recommend an Established Site Strategy with competitor-driven keyword opportunities and content-gap optimization.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
+function renderContactHtml(hostname: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AIWPDev Contact Sales</title>
+  <style>
+    :root{--bg:#0b0f17;--card:#101826;--text:#e7eefc;--muted:#a9b6d0;--border:rgba(255,255,255,.14);--ok:#9cf0c5;--err:#ff7a7a}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Space Grotesk","Sora","Avenir Next",sans-serif;color:var(--text);background:radial-gradient(1200px 600px at 50% -10%, rgba(106,169,255,.18), transparent 60%), var(--bg);}
+    .wrap{max-width:760px;margin:0 auto;padding:28px 18px 64px}
+    .brand{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+    .brand strong{font-size:20px}
+    .brand span{font-size:12px;color:var(--muted)}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px}
+    h1{margin:0 0 8px;font-size:32px}
+    p{margin:0 0 14px;color:var(--muted)}
+    label{display:block;font-size:12px;color:var(--muted);margin:10px 0 6px}
+    input,textarea{width:100%;padding:12px;border-radius:12px;border:1px solid var(--border);background:rgba(10,16,28,.6);color:var(--text);outline:none}
+    textarea{min-height:120px;resize:vertical}
+    button{margin-top:14px;border:0;border-radius:12px;padding:12px 14px;font-weight:700;cursor:pointer;background:linear-gradient(90deg,#6aa9ff,#8b7dff);color:#fff;width:100%}
+    .status{margin-top:10px;font-size:13px;color:var(--muted)}
+    .status.ok{color:var(--ok)} .status.err{color:var(--err)}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="brand"><strong>AI SEO Agent</strong><span>${htmlEscape(hostname)}</span></header>
+    <section class="card">
+      <h1>Contact Sales</h1>
+      <p>Tell us about your site and goals. We will follow up by email.</p>
+      <form id="contact-form">
+        <label>Name</label>
+        <input id="name" required placeholder="Your name" />
+        <label>Email</label>
+        <input id="email" type="email" required placeholder="you@company.com" />
+        <label>Company</label>
+        <input id="company" placeholder="Company name" />
+        <label>Message</label>
+        <textarea id="message" required placeholder="What do you want us to help with?"></textarea>
+        <button type="submit">Send</button>
+        <p id="status" class="status"></p>
+      </form>
     </section>
   </main>
   <script>
-    const $ = (id) => document.getElementById(id);
-    for (const btn of document.querySelectorAll(".pick")) {
-      btn.addEventListener("click", () => {
-        const key = btn.getAttribute("data-plan");
-        $("plan-key").value = key || "starter";
-        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
-      });
-    }
-    $("plan-submit").addEventListener("click", async () => {
+    const form = document.getElementById("contact-form");
+    const statusEl = document.getElementById("status");
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      statusEl.textContent = "Sending...";
+      statusEl.className = "status";
       const payload = {
-        site_id: $("plan-site-id").value.trim(),
-        plan_key: $("plan-key").value,
-        company_name: $("plan-company").value.trim(),
-        contact_email: $("plan-email").value.trim(),
-        notes: $("plan-notes").value.trim()
+        name: document.getElementById("name").value.trim(),
+        email: document.getElementById("email").value.trim(),
+        company: document.getElementById("company").value.trim(),
+        message: document.getElementById("message").value.trim()
       };
-      const status = $("plan-status");
-      status.textContent = "Saving...";
-      status.className = "status";
-      const res = await fetch("/v1/plans/select", {
+      const res = await fetch("/v1/contact/submit", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload)
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) {
-        status.textContent = "Failed: " + (data.error || res.status);
-        status.className = "status err";
+        statusEl.textContent = "Failed to send. Please email paul@aiwpdev.com directly.";
+        statusEl.className = "status err";
         return;
       }
-      status.textContent = "Plan saved for " + (data.site_id || "site");
-      status.className = "status ok";
+      statusEl.textContent = "Message sent. We will contact you shortly.";
+      statusEl.className = "status ok";
+      form.reset();
     });
-    async function loadReport(kind) {
-      const siteId = $("report-site-id").value.trim();
-      const date = $("report-date").value.trim();
-      const status = $("report-status");
-      const box = $("report-box");
-      if (!siteId) {
-        status.textContent = "Site ID is required.";
-        status.className = "status err";
-        return;
-      }
-      const qs = date ? ("?date=" + encodeURIComponent(date)) : "";
-      status.textContent = "Loading " + kind + "...";
-      status.className = "status";
-      const res = await fetch("/v1/sites/" + encodeURIComponent(siteId) + "/" + kind + "/report" + qs);
-      const data = await res.json().catch(() => ({}));
-      box.textContent = JSON.stringify(data, null, 2);
-      if (!res.ok || !data.ok) {
-        status.textContent = "Failed: " + (data.error || res.status);
-        status.className = "status err";
-        return;
-      }
-      status.textContent = kind.toUpperCase() + " report loaded.";
-      status.className = "status ok";
+  </script>
+</body>
+</html>`;
+}
+
+async function sendContactSalesEmail(
+  env: Env,
+  payload: { name: string; email: string; company: string; message: string; host: string }
+): Promise<void> {
+  const toEmail = cleanString(env.CONTACT_FORM_TO_EMAIL, 320) || "paul@aiwpdev.com";
+  const fromEmail = cleanString(env.CONTACT_FORM_FROM_EMAIL, 320) || "noreply@aiwpdev.com";
+  const subject = `New Contact Form Submission - ${payload.host}`;
+  const bodyText = [
+    `Name: ${payload.name || "(not provided)"}`,
+    `Email: ${payload.email || "(not provided)"}`,
+    `Company: ${payload.company || "(not provided)"}`,
+    "",
+    "Message:",
+    payload.message || "(empty)",
+  ].join("\n");
+
+  const response = await fetch("https://api.mailchannels.net/tx/v1/send", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email: toEmail }] }],
+      from: { email: fromEmail, name: "AIWPDev Contact Form" },
+      subject,
+      content: [{ type: "text/plain", value: bodyText }],
+      reply_to: { email: payload.email || fromEmail, name: payload.name || "Website Lead" },
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`contact_email_failed:${response.status}:${errText.slice(0, 300)}`);
+  }
+}
+
+async function sendContactSalesWebhook(
+  env: Env,
+  payload: { name: string; email: string; company: string; message: string; host: string }
+): Promise<void> {
+  const webhookUrl = cleanString(env.CONTACT_WEBHOOK_URL, 2000);
+  const secret = cleanString(env.CONTACT_WEBHOOK_SECRET, 500);
+  if (!webhookUrl || !secret) {
+    throw new Error("contact_webhook_not_configured");
+  }
+  const ts = String(Math.floor(Date.now() / 1000));
+  const webhookPayload = canonicalJson({
+    source: "onboarding.aiwpdev.com",
+    host: payload.host,
+    submitted_at: new Date().toISOString(),
+    lead: payload,
+  });
+  const sig = await hmacSha256Hex(secret, `${ts}.${webhookPayload}`);
+  const response = await fetch(webhookUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-relay-timestamp": ts,
+      "x-relay-signature": sig,
+    },
+    body: webhookPayload,
+  });
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`contact_webhook_failed:${response.status}:${errText.slice(0, 300)}`);
+  }
+}
+
+type CheckoutPlanKey = "starter" | "growth" | "agency";
+
+function normalizeCheckoutPlan(value: unknown): CheckoutPlanKey | null {
+  const plan = cleanString(value, 40).toLowerCase();
+  if (plan === "starter" || plan === "growth" || plan === "agency") return plan;
+  return null;
+}
+
+function getCheckoutCorsHeaders(origin: string | null, env: Env): Record<string, string> {
+  const allow = cleanString(env.CHECKOUT_ALLOW_ORIGIN, 1000) || origin || "*";
+  return {
+    "Access-Control-Allow-Origin": allow,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+}
+
+function getStripePriceByPlan(env: Env): Record<CheckoutPlanKey, string> {
+  return {
+    starter: cleanString(env.STRIPE_PRICE_STARTER, 200),
+    growth: cleanString(env.STRIPE_PRICE_GROWTH, 200),
+    agency: cleanString(env.STRIPE_PRICE_AGENCY, 200),
+  };
+}
+
+function getPromoCouponMap(env: Env): Record<string, Partial<Record<CheckoutPlanKey, string>>> {
+  const raw = cleanString(env.STRIPE_PROMO_MAP_JSON, 20000);
+  if (!raw) return {};
+  try {
+    const parsed = parseJsonObject(JSON.parse(raw));
+    if (!parsed) return {};
+    const out: Record<string, Partial<Record<CheckoutPlanKey, string>>> = {};
+    for (const [promoRaw, mappingRaw] of Object.entries(parsed)) {
+      const promo = cleanString(promoRaw, 80).toUpperCase();
+      if (!promo) continue;
+      const mapping = parseJsonObject(mappingRaw);
+      if (!mapping) continue;
+      const normalized: Partial<Record<CheckoutPlanKey, string>> = {};
+      const starter = cleanString(mapping.starter, 200);
+      const growth = cleanString(mapping.growth, 200);
+      const agency = cleanString(mapping.agency, 200);
+      if (starter) normalized.starter = starter;
+      if (growth) normalized.growth = growth;
+      if (agency) normalized.agency = agency;
+      out[promo] = normalized;
     }
-    $("load-step2").addEventListener("click", () => loadReport("step2"));
-    $("load-step3").addEventListener("click", () => loadReport("step3"));
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function normalizePromoCode(promo: unknown): string {
+  return cleanString(promo, 80).toUpperCase();
+}
+
+async function createStripeCheckoutSession(
+  env: Env,
+  input: { plan: CheckoutPlanKey; email: string; promo: string | null }
+): Promise<{ url: string }> {
+  const stripeSecret = cleanString(env.STRIPE_SECRET_KEY, 500);
+  if (!stripeSecret) throw new Error("STRIPE_SECRET_KEY not configured");
+
+  const prices = getStripePriceByPlan(env);
+  const priceId = prices[input.plan];
+  if (!priceId) throw new Error(`missing_price_id_for_plan:${input.plan}`);
+
+  const successUrl =
+    cleanString(env.STRIPE_SUCCESS_URL, 2000) || "https://www.onboarding.aiwpdev.com/success?session_id={CHECKOUT_SESSION_ID}";
+  const cancelUrl = cleanString(env.STRIPE_CANCEL_URL, 2000) || "https://www.onboarding.aiwpdev.com/checkout";
+
+  const params = new URLSearchParams();
+  params.set("mode", "payment");
+  params.set("customer_email", input.email);
+  params.set("line_items[0][price]", priceId);
+  params.set("line_items[0][quantity]", "1");
+  params.set("success_url", successUrl);
+  params.set("cancel_url", cancelUrl);
+  params.set("metadata[plan]", input.plan);
+  if (input.promo) params.set("metadata[promo]", input.promo);
+
+  if (input.promo) {
+    const promoMap = getPromoCouponMap(env);
+    const couponId = promoMap[input.promo]?.[input.plan];
+    if (!couponId) throw new Error("invalid_promo_code");
+    params.set("discounts[0][coupon]", couponId);
+  }
+
+  const response = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${stripeSecret}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params.toString(),
+  });
+  const text = await response.text();
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = parseJsonObject(JSON.parse(text));
+  } catch {
+    parsed = null;
+  }
+  if (!response.ok || !parsed) {
+    throw new Error(`stripe_checkout_create_failed:${response.status}:${text.slice(0, 300)}`);
+  }
+  const url = cleanString(parsed.url, 4000);
+  if (!url) throw new Error("stripe_session_missing_url");
+  return { url };
+}
+
+function renderCheckoutHtml(hostname: string, currentUrl: URL): string {
+  const prefillPlan = normalizeCheckoutPlan(currentUrl.searchParams.get("plan")) || "starter";
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Checkout</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background:#0b0f17; color:#e7eefc; }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 28px 16px; }
+    .host{color:rgba(231,238,252,.7);font-size:12px;margin-bottom:6px}
+    .card { background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.12); border-radius: 16px; padding: 16px; }
+    label { display:block; margin-top: 12px; font-size: 13px; color: rgba(231,238,252,.75); }
+    input, select { width: 100%; padding: 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.25); color:#e7eefc; }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 720px){ .row{ grid-template-columns:1fr; } }
+    button { width:100%; margin-top: 16px; padding: 12px; border-radius: 12px; border: 0; font-weight: 800; cursor:pointer; background: linear-gradient(90deg,#6aa9ff,#8b7dff); color:#08101b; }
+    .muted { color: rgba(231,238,252,.7); font-size: 13px; margin-top: 10px; }
+    .ok { color: #7cf0c6; font-weight: 700; }
+    .bad { color: #ff7b7b; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="host">${htmlEscape(hostname)}</div>
+    <h1>Checkout</h1>
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>Plan</label>
+          <select id="plan">
+            <option value="starter"${prefillPlan === "starter" ? " selected" : ""}>Starter</option>
+            <option value="growth"${prefillPlan === "growth" ? " selected" : ""}>Growth</option>
+            <option value="agency"${prefillPlan === "agency" ? " selected" : ""}>Agency</option>
+          </select>
+        </div>
+        <div>
+          <label>Billing Email</label>
+          <input id="email" type="email" placeholder="you@domain.com" required />
+        </div>
+      </div>
+
+      <label>Promo code (optional)</label>
+      <div class="row">
+        <input id="promo" placeholder="PROMO2026" />
+        <button id="checkPromo" type="button" style="background:rgba(255,255,255,.08);color:#e7eefc;">Check code</button>
+      </div>
+      <div id="promoStatus" class="muted"></div>
+
+      <button id="pay">Continue to secure payment</button>
+      <div class="muted">
+        Card details are entered on Stripe's secure checkout page.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function validatePromo() {
+      const promo = document.getElementById("promo").value.trim();
+      const plan = document.getElementById("plan").value;
+      const el = document.getElementById("promoStatus");
+      if (!promo) { el.textContent = ""; return null; }
+      el.textContent = "Checking...";
+      const res = await fetch("/api/validate-promo", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ promo, plan })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        el.innerHTML = "<span class='bad'>" + (data.error || "Invalid code") + "</span>";
+        return null;
+      }
+      el.innerHTML = "<span class='ok'>Code applied:</span> " + (data.description || "Discount applied");
+      return promo;
+    }
+
+    document.getElementById("checkPromo").addEventListener("click", validatePromo);
+
+    document.getElementById("pay").addEventListener("click", async () => {
+      const plan = document.getElementById("plan").value;
+      const email = document.getElementById("email").value.trim();
+      const promo = document.getElementById("promo").value.trim();
+      if (!email) { alert("Please enter an email."); return; }
+      if (promo) await validatePromo();
+      const res = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ plan, email, promo: promo || null })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.url) {
+        alert(data.error || "Unable to start checkout.");
+        return;
+      }
+      window.location.href = data.url;
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function renderOnboardingHtml(hostname: string, currentUrl: URL): string {
+  const subscriptionId = cleanString(currentUrl.searchParams.get("subscription_id"), 120);
+  const prefillSiteId = cleanString(currentUrl.searchParams.get("site_id"), 120);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AIWPDev Onboarding</title>
+  <style>
+    :root { --bg:#0d1821; --panel:#122231; --ink:#e9f1f7; --muted:#9ab1c5; --line:#2f4f68; --cta:#3bb273; --cta2:#2f80ed; --bad:#ff7a7a; }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Space Grotesk","Sora","Avenir Next",sans-serif;color:var(--ink);background:linear-gradient(180deg,#0d1821,#081219)}
+    .wrap{max-width:980px;margin:0 auto;padding:28px 18px 56px}
+    .brand{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+    .brand strong{font-size:20px}
+    .brand span{font-size:12px;color:var(--muted)}
+    h1{margin:0 0 6px;font-size:34px}
+    .lead{margin:0 0 18px;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:1fr;gap:14px}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
+    input,select{width:100%;background:#0f1f2d;color:var(--ink);border:1px solid #3b5f7b;border-radius:10px;padding:10px;margin-bottom:10px}
+    button{border:0;border-radius:10px;padding:11px 14px;font-weight:700;cursor:pointer}
+    .btn{background:var(--cta);color:#062313}
+    .btn2{background:var(--cta2);color:#ecf4ff}
+    .status{font-size:13px;color:var(--muted);margin-top:8px}
+    .ok{color:#9cf0c5}.err{color:var(--bad)}
+    code{font-family:"JetBrains Mono","IBM Plex Mono",monospace;background:#0c1a26;border:1px solid #2f4f68;border-radius:6px;padding:2px 6px}
+    @media (max-width:800px){.row{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="brand"><strong>AIWPDev Onboarding</strong><span>${htmlEscape(hostname)}</span></header>
+    <h1>Connect Your Site</h1>
+    <p class="lead">After checkout, enter your website URL and connect Cloudflare with SSO so AIWPDev can provision Workers, email flows, and hosting automation for your account.</p>
+    <section class="grid">
+      <section class="card">
+        <h2>Step 1: Website</h2>
+        <div class="row">
+          <div><label>Website URL</label><input id="site-url" placeholder="https://rawdetailingreno.com" /></div>
+          <div><label>Site Name</label><input id="site-name" placeholder="Raw Detailing Reno" /></div>
+        </div>
+        <div class="row">
+          <div><label>Subscription ID</label><input id="subscription-id" value="${htmlEscape(subscriptionId)}" placeholder="plan_..." /></div>
+          <div><label>Platform Mode</label><select id="platform-mode"><option value="static_html_cloudflare">Cloudflare Static HTML</option><option value="wordpress">WordPress</option></select></div>
+        </div>
+        <button id="save-site" class="btn">Save Site And Continue</button>
+        <p id="site-status" class="status"></p>
+      </section>
+
+      <section class="card">
+        <h2>Step 2: Cloudflare SSO</h2>
+        <p class="lead">This will redirect to your Cloudflare authorization screen and return here after approval.</p>
+        <div class="row">
+          <div><label>Site ID</label><input id="site-id" value="${htmlEscape(prefillSiteId)}" placeholder="site_..." /></div>
+          <div><label>Status</label><input id="cf-status" disabled value="not_connected" /></div>
+        </div>
+        <button id="connect-cf" class="btn2">Connect Cloudflare (SSO)</button>
+        <p id="cf-msg" class="status"></p>
+      </section>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    async function refreshStatus() {
+      const siteId = $("site-id").value.trim();
+      if (!siteId) return;
+      const res = await fetch("/v1/cloudflare/connect/status?site_id=" + encodeURIComponent(siteId));
+      const data = await res.json().catch(() => ({}));
+      if (data && data.ok) {
+        $("cf-status").value = data.status || "unknown";
+      }
+    }
+    $("save-site").addEventListener("click", async () => {
+      const payload = {
+        site_url: $("site-url").value.trim(),
+        site_name: $("site-name").value.trim(),
+        site_type_hint: $("platform-mode").value,
+        subscription_id: $("subscription-id").value.trim(),
+        signals: { site_name: $("site-name").value.trim(), hosting_provider: "cloudflare", runtime_hint: "static_html", top_pages: [] },
+        plan: { hosting_provider: "cloudflare", runtime_hint: "static_html" }
+      };
+      const out = $("site-status");
+      out.className = "status";
+      out.textContent = "Saving...";
+      const res = await fetch("/v1/onboarding/site", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify(payload) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        out.className = "status err";
+        out.textContent = "Failed: " + (data.error || res.status);
+        return;
+      }
+      $("site-id").value = data.site_id || "";
+      out.className = "status ok";
+      out.textContent = "Site saved. Site ID: " + data.site_id;
+      refreshStatus();
+    });
+    $("connect-cf").addEventListener("click", async () => {
+      const siteId = $("site-id").value.trim();
+      const subId = $("subscription-id").value.trim();
+      const msg = $("cf-msg");
+      if (!siteId) {
+        msg.className = "status err";
+        msg.textContent = "Save site first to get a site_id.";
+        return;
+      }
+      const url = "/v1/cloudflare/connect/start?site_id=" + encodeURIComponent(siteId) + (subId ? "&subscription_id=" + encodeURIComponent(subId) : "");
+      window.location.href = url;
+    });
+    refreshStatus();
   </script>
 </body>
 </html>`;
@@ -673,6 +1200,7 @@ function normalizeRegion(input: unknown): Record<string, unknown> {
 
 function normalizeSerpProvider(input: unknown): SerpProvider {
   const raw = cleanString(input, 40).toLowerCase();
+  if (raw === "dataforseo_serp_api" || raw === "dataforseo") return "dataforseo_serp_api";
   if (raw === "decodo_serp_api" || raw === "decodo") return "decodo_serp_api";
   if (raw === "apify" || raw === "headless_google") return "headless_google";
   return "headless_google";
@@ -1298,17 +1826,522 @@ function parseSerpResultsFromDecodoPayload(payload: unknown, maxResults: number)
   return out.slice(0, maxResults).map((row, idx) => ({ ...row, rank: idx + 1 }));
 }
 
+function languageCodeToName(code: string): string {
+  const norm = cleanString(code, 10).toLowerCase();
+  if (norm === "en") return "English";
+  if (norm === "es") return "Spanish";
+  if (norm === "fr") return "French";
+  if (norm === "de") return "German";
+  return "English";
+}
+
+function countryCodeToName(code: string): string {
+  const norm = cleanString(code, 4).toUpperCase();
+  if (norm === "US") return "United States";
+  if (norm === "CA") return "Canada";
+  if (norm === "GB" || norm === "UK") return "United Kingdom";
+  if (norm === "AU") return "Australia";
+  return "United States";
+}
+
+function parseSerpResultsFromDataForSeoPayload(payload: unknown, maxResults: number): SerpResultRow[] {
+  const out: SerpResultRow[] = [];
+  const seen = new Set<string>();
+  const push = (raw: unknown, fallbackRank: number) => {
+    const row = parseOrganicCandidate(raw, fallbackRank);
+    if (!row) return;
+    if (seen.has(row.url)) return;
+    seen.add(row.url);
+    out.push(row);
+  };
+
+  const root = parseJsonObject(payload);
+  const tasks = Array.isArray(root?.tasks) ? (root?.tasks as unknown[]) : [];
+  for (const task of tasks) {
+    if (out.length >= maxResults) break;
+    const taskObj = parseJsonObject(task);
+    const results = Array.isArray(taskObj?.result) ? (taskObj?.result as unknown[]) : [];
+    for (const result of results) {
+      if (out.length >= maxResults) break;
+      const resultObj = parseJsonObject(result);
+      const items = Array.isArray(resultObj?.items) ? (resultObj?.items as unknown[]) : [];
+      for (const item of items) {
+        if (out.length >= maxResults) break;
+        const itemObj = parseJsonObject(item);
+        const itemType = cleanString(itemObj?.type, 80).toLowerCase();
+        if (itemType && itemType !== "organic") continue;
+        push(itemObj, out.length + 1);
+      }
+    }
+  }
+
+  out.sort((a, b) => a.rank - b.rank);
+  return out.slice(0, maxResults).map((row, idx) => ({ ...row, rank: idx + 1 }));
+}
+
+async function callDataForSeoSerp(
+  env: Env,
+  tasks: Array<Record<string, unknown>>
+): Promise<{ raw: string; parsed: unknown; runId: string | null }> {
+  const login = cleanString(env.DATAFORSEO_LOGIN ?? "", 300);
+  const password = cleanString(env.DATAFORSEO_PASSWORD ?? "", 500);
+  if (!login || !password) {
+    throw new Error("DATAFORSEO_LOGIN or DATAFORSEO_PASSWORD not configured");
+  }
+  const base = (cleanString(env.DATAFORSEO_BASE_URL ?? "", 2000) || DATAFORSEO_DEFAULT_BASE_URL).replace(/\/+$/, "");
+  const endpoint = `${base}/v3/serp/google/organic/live/advanced`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Basic ${btoa(`${login}:${password}`)}`,
+    },
+    body: JSON.stringify(tasks),
+  });
+  if (!response.ok) {
+    const rawErr = await response.text();
+    throw new Error(`DataForSEO request failed (${response.status}): ${rawErr.slice(0, 400)}`);
+  }
+  const raw = await response.text();
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("DataForSEO response parse failed: invalid JSON.");
+  }
+  const root = parseJsonObject(parsed);
+  const tasksRaw = Array.isArray(root?.tasks) ? (root?.tasks as unknown[]) : [];
+  const firstTask = parseJsonObject(tasksRaw[0]);
+  const statusCode = clampInt(firstTask?.status_code, 0, 999999, 0);
+  if (statusCode && statusCode !== 20000) {
+    const msg = cleanString(firstTask?.status_message, 500) || "unknown_dataforseo_status";
+    throw new Error(`DataForSEO task failed (${statusCode}): ${msg}`);
+  }
+  return {
+    raw,
+    parsed,
+    runId: cleanString(firstTask?.id, 200) || null,
+  };
+}
+
+async function callDataForSeoEndpoint(
+  env: Env,
+  path: string,
+  tasks: Array<Record<string, unknown>>
+): Promise<{ raw: string; parsed: unknown }> {
+  const login = cleanString(env.DATAFORSEO_LOGIN ?? "", 300);
+  const password = cleanString(env.DATAFORSEO_PASSWORD ?? "", 500);
+  if (!login || !password) {
+    throw new Error("DATAFORSEO_LOGIN or DATAFORSEO_PASSWORD not configured");
+  }
+  const base = (cleanString(env.DATAFORSEO_BASE_URL ?? "", 2000) || DATAFORSEO_DEFAULT_BASE_URL).replace(/\/+$/, "");
+  const endpoint = `${base}${path.startsWith("/") ? path : `/${path}`}`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Basic ${btoa(`${login}:${password}`)}`,
+    },
+    body: JSON.stringify(tasks),
+  });
+  if (!response.ok) {
+    const rawErr = await response.text();
+    throw new Error(`DataForSEO request failed (${response.status}): ${rawErr.slice(0, 400)}`);
+  }
+  const raw = await response.text();
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("DataForSEO response parse failed: invalid JSON.");
+  }
+  const root = parseJsonObject(parsed);
+  const statusCode = clampInt(root?.status_code, 0, 999999, 0);
+  if (statusCode && statusCode !== 20000) {
+    const msg = cleanString(root?.status_message, 500) || "unknown_dataforseo_status";
+    throw new Error(`DataForSEO request failed (${statusCode}): ${msg}`);
+  }
+  const task = parseJsonObject((Array.isArray(root?.tasks) ? root?.tasks[0] : null) ?? null);
+  const taskStatusCode = clampInt(task?.status_code, 0, 999999, 0);
+  if (taskStatusCode && taskStatusCode !== 20000) {
+    const msg = cleanString(task?.status_message, 500) || "unknown_dataforseo_task_status";
+    throw new Error(`DataForSEO task failed (${taskStatusCode}): ${msg}`);
+  }
+  return { raw, parsed };
+}
+
+type Step1DataForSeoGeo = {
+  key: string;
+  location_code: number;
+  language_code: string;
+};
+
+function pickStep1DataForSeoGeoTargets(
+  siteInput: Record<string, unknown>,
+  locationTerms: string[]
+): Step1DataForSeoGeo[] {
+  const rawProfile = siteInput.dataforseo_geo_profile;
+  let explicitRaw: unknown[] = [];
+  if (Array.isArray(rawProfile)) {
+    explicitRaw = rawProfile;
+  } else if (typeof rawProfile === "string" && rawProfile.trim()) {
+    try {
+      const parsed = JSON.parse(rawProfile);
+      if (Array.isArray(parsed)) explicitRaw = parsed;
+    } catch {
+      explicitRaw = [];
+    }
+  }
+  if (explicitRaw.length > 0) {
+    const explicit: Step1DataForSeoGeo[] = [];
+    for (const rowRaw of explicitRaw) {
+      const row = parseJsonObject(rowRaw);
+      if (!row) continue;
+      const key = cleanString(row.key, 60).toLowerCase();
+      const code = clampInt(row.location_code, 1, 99_999_999, 0);
+      const lang = cleanString(row.language_code, 8).toLowerCase() || "en";
+      if (key && code > 0) explicit.push({ key, location_code: code, language_code: lang });
+    }
+    if (explicit.length > 0) return explicit.slice(0, 6);
+  }
+
+  const joined = [cleanString(siteInput.primary_location_hint, 200), cleanString(siteInput.business_address, 400), ...locationTerms]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  const defaultTargets: Step1DataForSeoGeo[] = [{ key: "us", location_code: 2840, language_code: "en" }];
+  // DataForSEO city-level profile for Reno/Sparks.
+  if (/\breno\b|\bsparks\b|\bnevada\b|\bnv\b/.test(joined)) {
+    return [
+      { key: "us", location_code: 2840, language_code: "en" },
+      { key: "reno-city", location_code: 1022652, language_code: "en" },
+      { key: "sparks-city", location_code: 1022656, language_code: "en" },
+      { key: "reno-dma", location_code: 200811, language_code: "en" },
+    ];
+  }
+  return defaultTargets;
+}
+
+function deriveCityTermsFromGeoTargets(geoTargets: Step1DataForSeoGeo[]): string[] {
+  const out = new Set<string>();
+  for (const geo of geoTargets) {
+    const key = cleanString(geo.key, 80).toLowerCase();
+    if (key.includes("reno")) out.add("reno");
+    if (key.includes("sparks")) out.add("sparks");
+  }
+  return [...out];
+}
+
+function expandDataForSeoKeywordsWithLocalVariants(keywords: string[], cityTerms: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (kw: string) => {
+    const norm = toKeywordNorm(kw);
+    if (!norm || seen.has(norm)) return;
+    seen.add(norm);
+    out.push(norm);
+  };
+
+  for (const keyword of keywords) add(keyword);
+  const eligible = keywords
+    .map((kw) => toKeywordNorm(kw))
+    .filter((kw) => /\b(detail|detailing|auto|car|ceramic|paint|wax|coating|correction)\b/.test(kw))
+    .slice(0, 250);
+
+  for (const base of eligible) {
+    const alreadyLocal = /\b(reno|sparks|nevada|nv)\b/.test(base);
+    if (alreadyLocal) continue;
+    for (const city of cityTerms) {
+      add(`${base} ${city}`);
+      add(`${base} ${city} nv`);
+      if (!base.includes("mobile")) add(`mobile ${base} ${city}`);
+    }
+  }
+  return out.slice(0, 1200);
+}
+
+async function saveStep1DataForSeoRawToR2(
+  env: Env,
+  input: {
+    siteId: string;
+    day: string;
+    researchRunId: string;
+    kind: string;
+    geoKey?: string;
+    raw: string;
+    metadata?: Record<string, string>;
+  }
+): Promise<{ r2Key: string | null; checksum: string }> {
+  const checksum = await sha256Hex(input.raw);
+  const geoPart = cleanString(input.geoKey, 60);
+  const suffix = geoPart ? `${geoPart}_${input.kind}` : input.kind;
+  const key = `dataforseo/v1/site/${input.siteId}/day/${input.day}/step1/${input.researchRunId}/${suffix}.json`;
+  if (env.MEMORY_R2) {
+    await env.MEMORY_R2.put(key, input.raw, {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        site_id: input.siteId,
+        day: input.day,
+        research_run_id: input.researchRunId,
+        kind: input.kind,
+        geo_key: geoPart || "",
+        ...(input.metadata ?? {}),
+      },
+    });
+  }
+  return {
+    r2Key: `r2://${key}`,
+    checksum,
+  };
+}
+
+async function fetchStep1DataForSeoKeywords(
+  env: Env,
+  input: { domain: string; limit: number }
+): Promise<{ raw: string; keywords: string[] }> {
+  const response = await callDataForSeoEndpoint(env, "/v3/dataforseo_labs/google/keywords_for_site/live", [
+    {
+      target: input.domain,
+      location_name: "United States",
+      language_name: "English",
+      limit: Math.max(10, Math.min(700, input.limit)),
+      offset: 0,
+    },
+  ]);
+  const root = parseJsonObject(response.parsed) ?? {};
+  const tasks = Array.isArray(root.tasks) ? root.tasks : [];
+  const task = parseJsonObject(tasks[0]) ?? {};
+  const result = Array.isArray(task.result) ? task.result : [];
+  const firstResult = parseJsonObject(result[0]) ?? {};
+  const items = Array.isArray(firstResult.items) ? firstResult.items : [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const itemRaw of items) {
+    const item = parseJsonObject(itemRaw) ?? {};
+    const keywordData = parseJsonObject(item.keyword_data) ?? {};
+    const keyword = toKeywordNorm(keywordData.keyword ?? item.keyword);
+    if (!keyword || seen.has(keyword)) continue;
+    seen.add(keyword);
+    out.push(keyword);
+  }
+  return { raw: response.raw, keywords: out };
+}
+
+async function fetchStep1DataForSeoSearchVolume(
+  env: Env,
+  input: { keywords: string[]; locationCode: number; languageCode: string }
+): Promise<{ raw: string; byKeyword: Map<string, { search_volume: number | null; cpc: number | null; competition: string | null }> }> {
+  const response = await callDataForSeoEndpoint(env, "/v3/keywords_data/google_ads/search_volume/live", [
+    {
+      keywords: input.keywords.slice(0, 700),
+      location_code: input.locationCode,
+      language_code: input.languageCode || "en",
+    },
+  ]);
+  const root = parseJsonObject(response.parsed) ?? {};
+  const tasks = Array.isArray(root.tasks) ? root.tasks : [];
+  const task = parseJsonObject(tasks[0]) ?? {};
+  const result = Array.isArray(task.result) ? task.result : [];
+  const out = new Map<string, { search_volume: number | null; cpc: number | null; competition: string | null }>();
+  for (const rowRaw of result) {
+    const row = parseJsonObject(rowRaw) ?? {};
+    const keyword = toKeywordNorm(row.keyword);
+    if (!keyword) continue;
+    const searchVolumeRaw = row.search_volume;
+    const cpcRaw = row.cpc;
+    out.set(keyword, {
+      search_volume:
+        searchVolumeRaw == null || Number.isNaN(Number(searchVolumeRaw))
+          ? null
+          : Math.max(0, Math.round(Number(searchVolumeRaw))),
+      cpc: cpcRaw == null || Number.isNaN(Number(cpcRaw)) ? null : Math.max(0, Number(cpcRaw)),
+      competition: cleanString(row.competition, 40) || null,
+    });
+  }
+  return { raw: response.raw, byKeyword: out };
+}
+
+function buildStep1CandidatesFromDataForSeo(
+  input: {
+    keywords: string[];
+    offerTerms: string[];
+    locationTerms: string[];
+    siteType: string;
+    localMode: boolean;
+    usVolumes: Map<string, { search_volume: number | null; cpc: number | null; competition: string | null }>;
+    geoVolumes: Map<string, Map<string, { search_volume: number | null; cpc: number | null; competition: string | null }>>;
+    localCityTerms?: string[];
+  }
+): Step1KeywordCandidate[] {
+  const scored: Step1KeywordCandidate[] = [];
+  const kwSeen = new Set<string>();
+  const maxUs = Math.max(
+    1,
+    ...input.keywords.map((kw) => Math.max(0, input.usVolumes.get(kw)?.search_volume ?? 0))
+  );
+  for (const keywordRaw of input.keywords) {
+    const keyword = toKeywordNorm(keywordRaw);
+    if (!keyword || kwSeen.has(keyword)) continue;
+    kwSeen.add(keyword);
+    if (stripGarbageKeyword(keyword, input.siteType)) continue;
+
+    const cityTerms = input.localCityTerms ?? [];
+    const baseKeyword =
+      cityTerms.length > 0
+        ? toKeywordNorm(
+            keyword
+              .replace(/\bnv\b/g, " ")
+              .split(/\s+/)
+              .filter((token) => !cityTerms.includes(token))
+              .join(" ")
+          )
+        : keyword;
+
+    const us =
+      input.usVolumes.get(keyword) ??
+      input.usVolumes.get(baseKeyword) ??
+      { search_volume: null, cpc: null, competition: null };
+    const renoDma =
+      input.geoVolumes.get("reno-dma")?.get(keyword)?.search_volume ??
+      input.geoVolumes.get("reno-dma")?.get(baseKeyword)?.search_volume ??
+      null;
+    const renoCity =
+      input.geoVolumes.get("reno-city")?.get(keyword)?.search_volume ??
+      input.geoVolumes.get("reno-city")?.get(baseKeyword)?.search_volume ??
+      null;
+    const sparksCity =
+      input.geoVolumes.get("sparks-city")?.get(keyword)?.search_volume ??
+      input.geoVolumes.get("sparks-city")?.get(baseKeyword)?.search_volume ??
+      null;
+    const genericGeoKeys = [...input.geoVolumes.keys()].filter((k) => !["reno-dma", "reno-city", "sparks-city"].includes(k));
+    const genericSignals = genericGeoKeys
+      .map((k) => input.geoVolumes.get(k)?.get(keyword)?.search_volume ?? null)
+      .filter((v): v is number => typeof v === "number");
+    const genericGeoAvg =
+      genericSignals.length > 0 ? genericSignals.reduce((sum, v) => sum + v, 0) / genericSignals.length : null;
+    const localDemandScore =
+      (renoDma != null ? 0.65 * renoDma : 0) +
+      (sparksCity != null ? 0.25 * sparksCity : 0) +
+      (renoCity != null ? 0.1 * renoCity : 0) +
+      (genericGeoAvg != null ? 0.5 * genericGeoAvg : 0);
+
+    const intent = classifyIntent(keyword);
+    const localIntent = classifyLocalIntent(keyword, input.locationTerms, input.localMode);
+    const pageType = classifyPageType(intent, input.siteType, localIntent, keyword);
+    const cluster = clusterForKeyword(keyword, input.offerTerms);
+
+    const volumeUs = Math.max(0, us.search_volume ?? 0);
+    const cpc = Math.max(0, us.cpc ?? 0);
+    const kd = 45;
+    const competitiveness =
+      us.competition === "HIGH" ? 0.75 : us.competition === "MEDIUM" ? 0.5 : us.competition === "LOW" ? 0.25 : 0.35;
+    const relevanceBase = cluster === "general" ? 0.35 : 0.7;
+    const intentScore =
+      intent === "transactional" ? 1 : intent === "commercial" ? 0.82 : intent === "informational" ? 0.45 : 0.2;
+    const volumeScore = clamp01(Math.log10(volumeUs + 1) / Math.log10(maxUs + 1));
+    const localSignalScore = clamp01(localDemandScore > 0 ? Math.log10(localDemandScore + 1) / 3 : 0);
+    const hasExplicitCity = cityTerms.some((city) => keyword.includes(city));
+    const localBoost = input.localMode || hasExplicitCity ? (localIntent === "yes" ? 1 : localIntent === "weak" ? 0.65 : 0.35) : 0.25;
+    const opportunityScore =
+      100 *
+      (0.25 * relevanceBase + 0.2 * intentScore + 0.22 * volumeScore + 0.18 * localSignalScore + 0.15 * localBoost) *
+      (1 - 0.35 * competitiveness);
+
+    const slugBase = slugify(keyword, 80);
+    scored.push({
+      keyword,
+      keyword_norm: keyword,
+      intent,
+      local_intent: localIntent,
+      page_type: pageType,
+      cluster,
+      recommended_slug: pageType === "location landing" ? `locations/${slugBase}` : slugBase,
+      recommended_page_type: pageType === "location landing" ? "location landing" : pageType,
+      volume_us: Math.round(volumeUs),
+      kd,
+      cpc: Number(cpc.toFixed(2)),
+      competitive_density: Number(competitiveness.toFixed(3)),
+      serp_features: [],
+      relevance_score: Number(relevanceBase.toFixed(4)),
+      intent_score: Number(intentScore.toFixed(4)),
+      volume_score: Number(volumeScore.toFixed(4)),
+      cpc_proxy_score: Number(clamp01(cpc / 15).toFixed(4)),
+      winnability_score: Number(clamp01(1 - competitiveness).toFixed(4)),
+      local_boost: Number(localBoost.toFixed(4)),
+      difficulty_penalty: Number(clamp01(kd / 100).toFixed(4)),
+      serp_feature_penalty: 0,
+      opportunity_score: Number(opportunityScore.toFixed(2)),
+      supporting_terms: findSupportingTerms(keyword, input.offerTerms, input.localMode),
+    });
+  }
+  scored.sort((a, b) => b.opportunity_score - a.opportunity_score);
+  return scored;
+}
+
+async function fetchGoogleTop20ViaDataForSeo(
+  env: Env,
+  phrase: string,
+  region: Record<string, unknown>,
+  device: "mobile" | "desktop",
+  maxResults = SERP_MAX_RESULTS,
+  geoLabel: string | null = null
+): Promise<{
+  rows: SerpResultRow[];
+  provider: string;
+  actor: string;
+  runId: string | null;
+  rawPayloadSha256: string;
+}> {
+  const languageCode = cleanString(region.language, 2).toLowerCase() || "en";
+  const countryCode = cleanString(region.country, 2).toUpperCase() || "US";
+  const regionCity = cleanString(region.city, 120) || cleanString(region.region, 120);
+  const normalizedGeoLabel = cleanString(geoLabel, 120);
+  const metro =
+    normalizedGeoLabel && normalizedGeoLabel.startsWith("metro:")
+      ? cleanString(normalizedGeoLabel.slice("metro:".length), 120)
+      : normalizedGeoLabel;
+  const locationName = metro || regionCity || countryCodeToName(countryCode);
+  const task: Record<string, unknown> = {
+    keyword: phrase,
+    language_name: languageCodeToName(languageCode),
+    location_name: locationName,
+    se_domain: "google.com",
+    depth: Math.max(1, Math.min(100, maxResults)),
+    device: device === "mobile" ? "mobile" : "desktop",
+    os: device === "mobile" ? "android" : "windows",
+  };
+  const dataforseo = await callDataForSeoSerp(env, [task]);
+  const rows = parseSerpResultsFromDataForSeoPayload(dataforseo.parsed, maxResults);
+  return {
+    rows,
+    provider: "dataforseo-serp-api",
+    actor: "dataforseo/google_organic_live_advanced",
+    runId: dataforseo.runId,
+    rawPayloadSha256: await sha256Hex(dataforseo.raw),
+  };
+}
+
 async function callDecodoTask(env: Env, payload: Record<string, unknown>): Promise<{ raw: string; parsed: unknown }> {
   const token = cleanString(env.DECODO_API_KEY ?? "", 500);
   if (!token) {
     throw new Error("DECODO_API_KEY not configured");
   }
   const endpoint = cleanString(env.DECODO_TASKS_URL ?? "", 2000) || DECODO_DEFAULT_TASKS_URL;
+  const authMode = cleanString(env.DECODO_AUTH_MODE ?? "", 20).toLowerCase();
+  const username = cleanString(env.DECODO_API_USERNAME ?? "", 120);
+  let authorization = `Bearer ${token}`;
+  if (token.includes(":")) {
+    authorization = `Basic ${btoa(token)}`;
+  } else if (authMode === "basic" || username) {
+    authorization = `Basic ${btoa(`${username || "scraper"}:${token}`)}`;
+  }
   const res = await fetch(endpoint, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${token}`,
+      authorization,
     },
     body: JSON.stringify(payload),
   });
@@ -1434,7 +2467,7 @@ async function fetchGoogleTop20ViaApify(
     mobileResults: device === "mobile",
   };
 
-  const country = cleanString(region.country ?? "", 2).toUpperCase();
+  const country = cleanString(region.country ?? "", 2).toLowerCase();
   const language = cleanString(region.language ?? "", 2).toLowerCase();
   if (country) inputPayload.countryCode = country;
   if (language) inputPayload.languageCode = language;
@@ -1635,7 +2668,7 @@ type SerpCollectionResult =
       actor: string;
       runId: string | null;
       rawPayloadSha256: string;
-      extractorMode: "decodo_serp_api" | "apify";
+      extractorMode: "dataforseo_serp_api" | "decodo_serp_api" | "apify";
       fallbackReason: string | null;
     }
   | {
@@ -1643,6 +2676,12 @@ type SerpCollectionResult =
       serpId: string;
       error: string;
     };
+
+function parserVersionForExtractorMode(mode: "dataforseo_serp_api" | "decodo_serp_api" | "apify"): string {
+  if (mode === "dataforseo_serp_api") return "dataforseo-google-v1";
+  if (mode === "decodo_serp_api") return "decodo-google-v1";
+  return "apify-google-v1";
+}
 
 async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput): Promise<SerpCollectionResult> {
   const serpId = uuid("serp");
@@ -1655,10 +2694,23 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
   const primaryProvider = resolveSerpPrimary(env, input.provider);
   const fallbackProvider = resolveSerpFallback(env);
   const actor =
-    primaryProvider === "decodo_serp_api"
-      ? "decodo/google_search"
-      : cleanString(env.APIFY_GOOGLE_ACTOR ?? "apify/google-search-scraper", 200);
-  const providerLabel = primaryProvider === "decodo_serp_api" ? "decodo-serp-api" : "apify-headless-chrome";
+    primaryProvider === "dataforseo_serp_api"
+      ? "dataforseo/google_organic_live_advanced"
+      : primaryProvider === "decodo_serp_api"
+        ? "decodo/google_search"
+        : cleanString(env.APIFY_GOOGLE_ACTOR ?? "apify/google-search-scraper", 200);
+  const providerLabel =
+    primaryProvider === "dataforseo_serp_api"
+      ? "dataforseo-serp-api"
+      : primaryProvider === "decodo_serp_api"
+        ? "decodo-serp-api"
+        : "apify-headless-chrome";
+  const initialExtractorMode: "dataforseo_serp_api" | "decodo_serp_api" | "apify" =
+    primaryProvider === "dataforseo_serp_api"
+      ? "dataforseo_serp_api"
+      : primaryProvider === "decodo_serp_api"
+        ? "decodo_serp_api"
+        : "apify";
   await insertSerpRun(env, {
     serpId,
     userId: input.userId,
@@ -1675,9 +2727,9 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
     regionKey,
     deviceKey,
     serpKey,
-    parserVersion: primaryProvider === "decodo_serp_api" ? "decodo-google-v1" : "apify-google-v1",
+    parserVersion: parserVersionForExtractorMode(initialExtractorMode),
     rawPayloadSha256: null,
-    extractorMode: primaryProvider === "decodo_serp_api" ? "decodo_serp_api" : "apify",
+    extractorMode: initialExtractorMode,
     fallbackReason: null,
   });
 
@@ -1689,12 +2741,77 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
           actor: string;
           runId: string | null;
           rawPayloadSha256: string;
-          extractorMode: "decodo_serp_api" | "apify";
+          extractorMode: "dataforseo_serp_api" | "decodo_serp_api" | "apify";
           fallbackReason: string | null;
         }
       | null = null;
 
-    if (primaryProvider === "decodo_serp_api") {
+    if (primaryProvider === "dataforseo_serp_api") {
+      try {
+        let dataforseo: Awaited<ReturnType<typeof fetchGoogleTop20ViaDataForSeo>> | null = null;
+        let lastErr: string | null = null;
+        for (let attempt = 1; attempt <= retryMax(env); attempt += 1) {
+          try {
+            dataforseo = await fetchGoogleTop20ViaDataForSeo(
+              env,
+              input.phrase,
+              input.region,
+              input.device,
+              input.maxResults,
+              input.geoLabel ? cleanString(input.geoLabel, 120) || null : null
+            );
+            if ((dataforseo.rows ?? []).length > 0) break;
+            lastErr = "empty_dataforseo_rows";
+          } catch (err) {
+            lastErr = cleanString((err as Error)?.message ?? err, 180) || "dataforseo_error";
+          }
+          if (attempt < retryMax(env)) {
+            await sleepMs(retryBackoffMs(env) * attempt);
+          }
+        }
+        if (!dataforseo || dataforseo.rows.length < 1) {
+          throw new Error(lastErr || "dataforseo_failed_after_retries");
+        }
+        collected = {
+          ...dataforseo,
+          extractorMode: "dataforseo_serp_api",
+          fallbackReason: null,
+        };
+      } catch (dataforseoError) {
+        const fallbackReason = `dataforseo_failed:${cleanString((dataforseoError as Error)?.message ?? dataforseoError, 180)}`;
+        if (fallbackProvider === "decodo_serp_api") {
+          const decodo = await fetchGoogleTop20ViaDecodo(
+            env,
+            input.phrase,
+            input.region,
+            input.device,
+            input.maxResults,
+            input.geoProvider === "decodo_geo" ? cleanString(input.geoLabel, 120) || null : null
+          );
+          collected = {
+            ...decodo,
+            extractorMode: "decodo_serp_api",
+            fallbackReason,
+          };
+        } else if (fallbackProvider === "headless_google") {
+          const apify = await fetchGoogleTop20ViaApify(
+            env,
+            input.phrase,
+            input.region,
+            input.device,
+            input.maxResults,
+            input.proxyUrl
+          );
+          collected = {
+            ...apify,
+            extractorMode: "apify",
+            fallbackReason,
+          };
+        } else {
+          throw dataforseoError;
+        }
+      }
+    } else if (primaryProvider === "decodo_serp_api") {
       try {
         let decodo: Awaited<ReturnType<typeof fetchGoogleTop20ViaDecodo>> | null = null;
         let lastErr: string | null = null;
@@ -1766,7 +2883,7 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
     }
     if (collected.rows.length < 1) {
       await updateSerpRunStatus(env, serpId, "error", "no_results", collected.runId, {
-        parserVersion: collected.extractorMode === "decodo_serp_api" ? "decodo-google-v1" : "apify-google-v1",
+        parserVersion: parserVersionForExtractorMode(collected.extractorMode),
         extractorMode: collected.extractorMode,
       });
       return {
@@ -1778,7 +2895,7 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
 
     await insertSerpResults(env, serpId, collected.rows);
     await updateSerpRunStatus(env, serpId, "ok", null, collected.runId, {
-      parserVersion: collected.extractorMode === "decodo_serp_api" ? "decodo-google-v1" : "apify-google-v1",
+      parserVersion: parserVersionForExtractorMode(collected.extractorMode),
       rawPayloadSha256: collected.rawPayloadSha256,
       extractorMode: collected.extractorMode,
       fallbackReason: collected.fallbackReason,
@@ -1812,9 +2929,15 @@ async function collectAndPersistSerpTop20(env: Env, input: SerpCollectionInput):
     };
   } catch (error) {
     const message = String((error as Error)?.message ?? error).slice(0, 500);
+    const fallbackExtractorMode: "dataforseo_serp_api" | "decodo_serp_api" | "apify" =
+      primaryProvider === "dataforseo_serp_api"
+        ? "dataforseo_serp_api"
+        : primaryProvider === "decodo_serp_api"
+          ? "decodo_serp_api"
+          : "apify";
     await updateSerpRunStatus(env, serpId, "error", message, null, {
-      parserVersion: "apify-google-v1",
-      extractorMode: "apify",
+      parserVersion: parserVersionForExtractorMode(fallbackExtractorMode),
+      extractorMode: fallbackExtractorMode,
     });
     return {
       ok: false,
@@ -1913,9 +3036,10 @@ type Step1SiteRecord = {
   last_research_at: number | null;
   created_at: number;
   updated_at: number;
+  is_new_install?: boolean;
 };
 
-type SerpProvider = "decodo_serp_api" | "headless_google";
+type SerpProvider = "dataforseo_serp_api" | "decodo_serp_api" | "headless_google";
 type PageProvider = "decodo_web_api" | "direct_fetch";
 type GeoProvider = "decodo_geo" | "proxy_lease_pool";
 
@@ -2723,6 +3847,78 @@ function validateTaskSpec(spec: MarketplaceTaskSpec): string | null {
   return null;
 }
 
+async function createMarketplaceTaskFromSpec(
+  env: Env,
+  input: {
+    taskId: string;
+    spec: MarketplaceTaskSpec;
+    actorWallet: string;
+  }
+): Promise<
+  | { ok: true; task_id: string; status: "open"; taskSpecHash: string; agentSignature: string; created: boolean }
+  | { ok: false; error: string }
+> {
+  const validationError = validateTaskSpec(input.spec);
+  if (validationError) {
+    return { ok: false, error: validationError };
+  }
+  const specJson = canonicalJson(input.spec);
+  const taskSpecHash = await sha256Hex(specJson);
+  const agentSignature = await signAgentPayload(env, `${input.taskId}.${taskSpecHash}`);
+  if (!agentSignature) {
+    return { ok: false, error: "task_signing_secret_not_configured" };
+  }
+  const existing = await loadMarketplaceTask(env, input.taskId);
+  if (existing) {
+    return {
+      ok: true,
+      task_id: existing.task_id,
+      status: "open",
+      taskSpecHash: cleanString(existing.task_spec_hash, 200) || taskSpecHash,
+      agentSignature,
+      created: false,
+    };
+  }
+  try {
+    await env.DB.prepare(
+      `INSERT INTO task_market_tasks (
+         task_id, status, platform, issuer_wallet, payout_amount, payout_token, payout_chain,
+         deadline_at, task_spec_json, task_spec_hash, created_at, updated_at
+       ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        input.taskId,
+        input.spec.platform,
+        input.spec.issuer_wallet,
+        input.spec.payout.amount,
+        input.spec.payout.token,
+        input.spec.payout.chain,
+        input.spec.deadline_at,
+        specJson,
+        taskSpecHash,
+        nowMs(),
+        nowMs()
+      )
+      .run();
+  } catch {
+    return { ok: false, error: "task_id_already_exists" };
+  }
+  await writeTaskAuditLog(env, {
+    taskId: input.taskId,
+    eventType: "task_created",
+    actorWallet: input.actorWallet,
+    payload: { task_spec_hash: taskSpecHash, platform: input.spec.platform, payout: input.spec.payout },
+  });
+  return {
+    ok: true,
+    task_id: input.taskId,
+    status: "open",
+    taskSpecHash,
+    agentSignature,
+    created: true,
+  };
+}
+
 function normalizeEvidenceBundle(input: Record<string, unknown>): MarketplaceEvidenceBundle {
   const fieldsRaw = parseJsonObject(input.fields ?? input.structured_fields) ?? {};
   const fields: Record<string, string> = {};
@@ -2818,6 +4014,221 @@ async function evaluateEvidenceAgainstSpec(
   };
 }
 
+function buildMarketplaceSpecFromStep3Task(
+  task: Step3TaskV1,
+  input: {
+    issuerWallet: string;
+    deadlineDays: number;
+    payoutToken: string;
+    payoutChain: string | null;
+    payoutByPriority: Record<string, string>;
+  }
+): MarketplaceTaskSpec {
+  const payoutAmount = cleanString(input.payoutByPriority[task.priority], 80) || "25";
+  const requiredProfileFields = task.requires.inputs
+    .map((v) => cleanString(v, 120).toLowerCase())
+    .filter((v) => v && v !== "none");
+  const minScreenshotsByPriority: Record<Step3TaskPriority, number> = {
+    P0: 4,
+    P1: 3,
+    P2: 2,
+    P3: 1,
+  };
+  const requireTrace =
+    task.category === "AUTHORITY" ||
+    task.type === "OUTREACH_TARGET_LIST" ||
+    task.type === "LOCAL_PARTNERSHIP_OPPORTUNITIES" ||
+    task.type === "DIGITAL_PR_IDEA";
+  return {
+    title: task.title,
+    description: task.summary,
+    platform: "seo_agency_execution",
+    issuer_wallet: input.issuerWallet.toLowerCase(),
+    required_profile_fields: requiredProfileFields,
+    required_media_hashes: {},
+    verification_rules: {
+      min_screenshots: minScreenshotsByPriority[task.priority],
+      require_trace: requireTrace,
+      acceptance_criteria: task.instructions.acceptance_criteria,
+      guardrails: task.instructions.guardrails,
+    },
+    payout: {
+      amount: payoutAmount,
+      token: cleanString(input.payoutToken, 80).toUpperCase() || "USDC",
+      chain: cleanString(input.payoutChain, 80) || null,
+    },
+    deadline_at: nowMs() + Math.max(1, input.deadlineDays) * 24 * 60 * 60 * 1000,
+    metadata: {
+      source: "step3_orchestrator",
+      step3_task_id: task.task_id,
+      site_id: task.site_id,
+      site_run_id: task.site_run_id,
+      category: task.category,
+      type: task.type,
+      priority: task.priority,
+      scope: task.scope,
+    },
+  };
+}
+
+async function runStep3ExecutionOrchestrator(
+  env: Env,
+  input: {
+    siteId: string;
+    runId: string;
+    autoApplyAutoTasks: boolean;
+    routeModes: Step3TaskMode[];
+    issuerWallet: string;
+    deadlineDays: number;
+    payoutToken: string;
+    payoutChain: string | null;
+  }
+): Promise<Record<string, unknown>> {
+  const rows = await loadStep3TasksFiltered(env, {
+    siteId: input.siteId,
+    runId: input.runId,
+    executionModes: [],
+    taskGroups: [],
+    statuses: ["planned"],
+  });
+  const selectedModes = new Set(input.routeModes);
+  const tasks = rows.map((row) => parseTaskV1FromStored(row, input.siteId, input.runId));
+
+  const payoutByPriority: Record<string, string> = {
+    P0: "60",
+    P1: "40",
+    P2: "25",
+    P3: "15",
+  };
+
+  const summary = {
+    site_id: input.siteId,
+    site_run_id: input.runId,
+    attempted: 0,
+    routed_auto: 0,
+    routed_diy: 0,
+    routed_team: 0,
+    auto_applied: 0,
+    marketplace_created: 0,
+    marketplace_existing: 0,
+    skipped: 0,
+    failed: 0,
+    results: [] as Array<Record<string, unknown>>,
+  };
+
+  for (const task of tasks) {
+    if (task.status !== "READY") {
+      summary.skipped += 1;
+      continue;
+    }
+    if (!selectedModes.has(task.mode)) {
+      summary.skipped += 1;
+      continue;
+    }
+    summary.attempted += 1;
+
+    if (task.mode === "AUTO") {
+      const targetStatus: Step3TaskStatus = input.autoApplyAutoTasks ? "DONE" : "IN_PROGRESS";
+      const transitioned = await updateStep3TaskStatus(env, {
+        siteId: input.siteId,
+        taskId: task.task_id,
+        targetStatus,
+        blockers: [],
+      });
+      if (!transitioned.ok) {
+        summary.failed += 1;
+        summary.results.push({ task_id: task.task_id, lane: "AUTO", ok: false, error: transitioned.error });
+        continue;
+      }
+      summary.routed_auto += 1;
+      if (targetStatus === "DONE") summary.auto_applied += 1;
+      summary.results.push({ task_id: task.task_id, lane: "AUTO", ok: true, status: targetStatus });
+      continue;
+    }
+
+    if (task.mode === "DIY") {
+      const hasMissingAccess = task.requires.access.some((v) => cleanString(v, 40).toUpperCase() !== "NONE");
+      const targetStatus: Step3TaskStatus = hasMissingAccess ? "BLOCKED" : "IN_PROGRESS";
+      const blockers =
+        targetStatus === "BLOCKED"
+          ? [{ code: "MISSING_ACCESS", message: "Connect required accounts before assisted execution can start." }]
+          : [];
+      const transitioned = await updateStep3TaskStatus(env, {
+        siteId: input.siteId,
+        taskId: task.task_id,
+        targetStatus,
+        blockers,
+      });
+      if (!transitioned.ok) {
+        summary.failed += 1;
+        summary.results.push({ task_id: task.task_id, lane: "DIY", ok: false, error: transitioned.error });
+        continue;
+      }
+      summary.routed_diy += 1;
+      summary.results.push({ task_id: task.task_id, lane: "DIY", ok: true, status: targetStatus });
+      continue;
+    }
+
+    if (task.mode === "TEAM") {
+      const marketTaskId = `s3mkt_${(await sha256Hex(task.task_id)).slice(0, 24)}`;
+      const spec = buildMarketplaceSpecFromStep3Task(task, {
+        issuerWallet: input.issuerWallet,
+        deadlineDays: input.deadlineDays,
+        payoutToken: input.payoutToken,
+        payoutChain: input.payoutChain,
+        payoutByPriority,
+      });
+      const created = await createMarketplaceTaskFromSpec(env, {
+        taskId: marketTaskId,
+        spec,
+        actorWallet: input.issuerWallet,
+      });
+      if (!created.ok) {
+        summary.failed += 1;
+        summary.results.push({
+          task_id: task.task_id,
+          lane: "TEAM",
+          ok: false,
+          error: created.error,
+        });
+        continue;
+      }
+      const transitioned = await updateStep3TaskStatus(env, {
+        siteId: input.siteId,
+        taskId: task.task_id,
+        targetStatus: "IN_PROGRESS",
+        blockers: [],
+      });
+      if (!transitioned.ok) {
+        summary.failed += 1;
+        summary.results.push({
+          task_id: task.task_id,
+          lane: "TEAM",
+          ok: false,
+          error: transitioned.error,
+          marketplace_task_id: created.task_id,
+        });
+        continue;
+      }
+      summary.routed_team += 1;
+      if (created.created) summary.marketplace_created += 1;
+      else summary.marketplace_existing += 1;
+      summary.results.push({
+        task_id: task.task_id,
+        lane: "TEAM",
+        ok: true,
+        status: "IN_PROGRESS",
+        marketplace_task_id: created.task_id,
+        taskSpecHash: created.taskSpecHash,
+        agentSignature: created.agentSignature,
+      });
+      continue;
+    }
+  }
+
+  return summary;
+}
+
 function parseTopPages(input: unknown): Array<{ url: string; title: string; h1: string; meta: string }> {
   if (!Array.isArray(input)) return [];
   const out: Array<{ url: string; title: string; h1: string; meta: string }> = [];
@@ -2838,6 +4249,7 @@ function parseTopPages(input: unknown): Array<{ url: string; title: string; h1: 
 function normalizeSiteUpsertPayload(payload: Record<string, unknown>): Record<string, unknown> {
   const signals = parseJsonObject(payload.signals) ?? {};
   const plan = parseJsonObject(payload.plan) ?? {};
+  const services = parseStringArray(payload.services ?? signals.services, 200, 160);
   const topPagesRaw = Array.isArray(signals.top_pages) ? signals.top_pages : [];
 
   const topPages = topPagesRaw
@@ -2861,7 +4273,17 @@ function normalizeSiteUpsertPayload(payload: Record<string, unknown>): Record<st
     .slice(0, 500);
 
   const isWoo = parseBoolUnknown(signals.is_woocommerce, false);
+  const explicitSiteTypeHint = cleanString(payload.site_type_hint, 60).toLowerCase();
+  const hostingProvider = cleanString(
+    payload.hosting_provider ?? signals.hosting_provider ?? plan.hosting_provider,
+    80
+  ).toLowerCase();
+  const runtimeHint = cleanString(payload.runtime_hint ?? signals.runtime_hint ?? plan.runtime_hint, 80).toLowerCase();
+  const looksCloudflareStatic =
+    explicitSiteTypeHint === "static_html_cloudflare" ||
+    (hostingProvider.includes("cloudflare") && (runtimeHint.includes("static") || runtimeHint.includes("html")));
   const inferredSiteType =
+    (looksCloudflareStatic ? "static_html_cloudflare" : "") ||
     cleanString(payload.site_type_hint, 60) ||
     cleanString(signals.industry_hint, 60) ||
     (isWoo ? "woo" : "general");
@@ -2878,6 +4300,7 @@ function normalizeSiteUpsertPayload(payload: Record<string, unknown>): Record<st
       payload.primary_location_hint ?? plan.metro ?? signals.detected_address ?? "",
       200
     ),
+    services,
     site_type_hint: inferredSiteType,
     top_pages: topPages.map((row) => ({
       url: row.url,
@@ -2890,6 +4313,8 @@ function normalizeSiteUpsertPayload(payload: Record<string, unknown>): Record<st
     plan: {
       metro_proxy: parseBoolUnknown(plan.metro_proxy, false),
       metro: cleanString(plan.metro, 120) || null,
+      hosting_provider: hostingProvider || null,
+      runtime_hint: runtimeHint || null,
     },
     provider_profile: {
       serp_provider: normalizeSerpProvider(payload.serp_provider ?? plan.serp_provider),
@@ -2972,6 +4397,7 @@ function detectSiteTypeHint(input: {
   tags: string[];
 }): "local" | "woo" | "saas" | "publisher" | "general" {
   const hinted = cleanString(input.siteTypeHint, 60).toLowerCase();
+  if (hinted.includes("static_html_cloudflare") || hinted.includes("cloudflare_static")) return "general";
   if (hinted.includes("local")) return "local";
   if (hinted.includes("woo") || hinted.includes("ecom") || hinted.includes("shop")) return "woo";
   if (hinted.includes("saas") || hinted.includes("software")) return "saas";
@@ -2981,6 +4407,25 @@ function detectSiteTypeHint(input: {
   if (input.tags.length > 10 && input.services.length < 3) return "publisher";
   if (/app|saas|software/.test(input.siteUrl.toLowerCase())) return "saas";
   return "general";
+}
+
+function inferExecutionPlatform(input: Record<string, unknown>): "wordpress" | "cloudflare_static_html" {
+  const siteTypeHint = cleanString(input.site_type_hint, 120).toLowerCase();
+  const plan = parseJsonObject(input.plan) ?? {};
+  const signals = parseJsonObject(input.signals) ?? {};
+  const hostingProvider = cleanString(
+    input.hosting_provider ?? plan.hosting_provider ?? signals.hosting_provider,
+    120
+  ).toLowerCase();
+  const runtimeHint = cleanString(input.runtime_hint ?? plan.runtime_hint ?? signals.runtime_hint, 120).toLowerCase();
+  if (
+    siteTypeHint.includes("static_html_cloudflare") ||
+    siteTypeHint.includes("cloudflare_static") ||
+    (hostingProvider.includes("cloudflare") && (runtimeHint.includes("static") || runtimeHint.includes("html")))
+  ) {
+    return "cloudflare_static_html";
+  }
+  return "wordpress";
 }
 
 function detectLocalMode(input: {
@@ -3139,9 +4584,12 @@ function buildStep1SiteProfile(input: Record<string, unknown>): Record<string, u
     topPagesCount: topPages.length,
     contentExtractCount: contentExtract.length,
   });
+  const executionPlatform = inferExecutionPlatform(input);
+  const plan = parseJsonObject(input.plan) ?? {};
 
   return {
     site_type_detected: siteType,
+    execution_platform: executionPlatform,
     local_mode: localMode,
     offer_terms: offerTerms,
     top_pages_count: topPages.length,
@@ -3158,6 +4606,11 @@ function buildStep1SiteProfile(input: Record<string, unknown>): Record<string, u
       content_type_mix: contentMix,
       pricing_tier: pricingTier,
       primary_goals: primaryGoals,
+    },
+    deployment_target: {
+      platform: executionPlatform,
+      hosting_provider: cleanString(plan.hosting_provider, 120) || null,
+      runtime_hint: cleanString(plan.runtime_hint, 120) || null,
     },
   };
 }
@@ -3177,6 +4630,11 @@ async function upsertStep1Site(env: Env, payload: Record<string, unknown>): Prom
   const ts = nowMs();
   const siteIdentity = wpSiteId ? `${siteUrl.toLowerCase()}|${wpSiteId.toLowerCase()}` : siteUrl.toLowerCase();
   const siteId = `site_${await sha256Hex(siteIdentity)}`.slice(0, 48);
+  const existing = await env.DB
+    .prepare("SELECT site_id FROM wp_ai_seo_sites WHERE site_id = ? LIMIT 1")
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+  const isNewInstall = !existing;
   const inputJson = safeJsonStringify(payload, 320000);
   const profileJson = safeJsonStringify(profile, 32000);
 
@@ -3227,6 +4685,7 @@ async function upsertStep1Site(env: Env, payload: Record<string, unknown>): Prom
     last_research_at: null,
     created_at: ts,
     updated_at: ts,
+    is_new_install: isNewInstall,
   };
 }
 
@@ -3257,7 +4716,345 @@ async function loadStep1Site(env: Env, siteId: string): Promise<Step1SiteRecord 
       row.last_research_at == null ? null : clampInt(row.last_research_at, 0, Number.MAX_SAFE_INTEGER, 0),
     created_at: clampInt(row.created_at, 0, Number.MAX_SAFE_INTEGER, 0),
     updated_at: clampInt(row.updated_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    is_new_install: false,
   };
+}
+
+async function resolveInitialApifyActor(env: Env): Promise<{ actorId: string; actorUrl: string }> {
+  const envActorId = cleanString(env.APIFY_INITIAL_ACTOR_ID, 120);
+  const envActorUrl = cleanString(env.APIFY_INITIAL_ACTOR_URL, 1000);
+  if (envActorId) {
+    return {
+      actorId: envActorId,
+      actorUrl: envActorUrl || `https://console.apify.com/actors/${envActorId}/`,
+    };
+  }
+  const row = await env.DB
+    .prepare(
+      `SELECT actor_id, actor_url
+       FROM provider_actor_registry
+       WHERE provider = 'apify' AND is_default_initial = 1 AND is_active = 1
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    )
+    .first<Record<string, unknown>>();
+  const actorId = cleanString(row?.actor_id, 120) || APIFY_DEFAULT_INITIAL_ACTOR_ID;
+  const actorUrl = cleanString(row?.actor_url, 1000) || APIFY_DEFAULT_INITIAL_ACTOR_URL;
+  return { actorId, actorUrl };
+}
+
+async function hasSuccessfulInitialApifyRun(env: Env, siteId: string, actorId: string): Promise<boolean> {
+  const row = await env.DB
+    .prepare(
+      `SELECT run_id
+       FROM site_initial_enrichment_runs
+       WHERE site_id = ? AND provider = 'apify' AND actor_id = ? AND status = 'succeeded'
+       LIMIT 1`
+    )
+    .bind(siteId, actorId)
+    .first<Record<string, unknown>>();
+  return !!row;
+}
+
+async function saveInitialApifyRunRecord(
+  env: Env,
+  input: {
+    runId: string;
+    siteId: string;
+    actorId: string;
+    actorUrl: string;
+    domain: string;
+    triggerSource: string;
+    status: "running" | "succeeded" | "failed" | "skipped";
+    itemCount?: number;
+    jobId?: string | null;
+    r2Key?: string | null;
+    checksum?: string | null;
+    preview?: unknown;
+    error?: unknown;
+  }
+): Promise<void> {
+  const ts = nowMs();
+  await env.DB
+    .prepare(
+      `INSERT INTO site_initial_enrichment_runs (
+         run_id, site_id, provider, actor_id, actor_url, domain, trigger_source, status,
+         item_count, job_id, r2_key, checksum, payload_preview_json, error_json, created_at, updated_at
+       ) VALUES (?, ?, 'apify', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(run_id) DO UPDATE SET
+         status = excluded.status,
+         item_count = excluded.item_count,
+         job_id = excluded.job_id,
+         r2_key = excluded.r2_key,
+         checksum = excluded.checksum,
+         payload_preview_json = excluded.payload_preview_json,
+         error_json = excluded.error_json,
+         updated_at = excluded.updated_at`
+    )
+    .bind(
+      input.runId,
+      input.siteId,
+      input.actorId,
+      input.actorUrl,
+      input.domain,
+      cleanString(input.triggerSource, 120) || "unknown",
+      input.status,
+      Math.max(0, clampInt(input.itemCount, 0, Number.MAX_SAFE_INTEGER, 0)),
+      cleanString(input.jobId, 120) || null,
+      cleanString(input.r2Key, 500) || null,
+      cleanString(input.checksum, 128) || null,
+      input.preview == null ? null : safeJsonStringify(input.preview, 32000),
+      input.error == null ? null : safeJsonStringify(input.error, 16000),
+      ts,
+      ts
+    )
+    .run();
+}
+
+async function runInitialApifyActorBootstrap(
+  env: Env,
+  site: Step1SiteRecord,
+  triggerSource: string,
+  options?: {
+    forceRun?: boolean;
+    actorId?: string;
+    actorUrl?: string;
+    useResidentialProxy?: boolean;
+    extraInput?: Record<string, unknown>;
+  }
+): Promise<
+  | { ok: true; skipped: boolean; run_id: string; actor_id: string; actor_url: string; domain: string; item_count: number; job_id: string | null; r2_key: string | null }
+  | { ok: false; skipped: boolean; run_id: string; actor_id: string; actor_url: string; domain: string; job_id: string | null; error: string }
+> {
+  const domain = normalizeRootDomain(site.site_url);
+  if (!domain) {
+    return {
+      ok: false,
+      skipped: true,
+      run_id: uuid("init"),
+      actor_id: APIFY_DEFAULT_INITIAL_ACTOR_ID,
+      actor_url: APIFY_DEFAULT_INITIAL_ACTOR_URL,
+      domain: "",
+      job_id: null,
+      error: "invalid_site_domain",
+    };
+  }
+  const defaultActor = await resolveInitialApifyActor(env);
+  const actor = {
+    actorId: cleanString(options?.actorId, 120) || defaultActor.actorId,
+    actorUrl:
+      cleanString(options?.actorUrl, 1000) ||
+      (cleanString(options?.actorId, 120)
+        ? `https://console.apify.com/actors/${cleanString(options?.actorId, 120)}/`
+        : defaultActor.actorUrl),
+  };
+  if (!options?.forceRun && (await hasSuccessfulInitialApifyRun(env, site.site_id, actor.actorId))) {
+    const runId = uuid("init");
+    await saveInitialApifyRunRecord(env, {
+      runId,
+      siteId: site.site_id,
+      actorId: actor.actorId,
+      actorUrl: actor.actorUrl,
+      domain,
+      triggerSource,
+      status: "skipped",
+      itemCount: 0,
+      preview: { reason: "existing_successful_run" },
+    });
+    return {
+      ok: true,
+      skipped: true,
+      run_id: runId,
+      actor_id: actor.actorId,
+      actor_url: actor.actorUrl,
+      domain,
+      item_count: 0,
+      job_id: null,
+      r2_key: null,
+    };
+  }
+
+  const token = cleanString(env.APIFY_TOKEN, 500);
+  if (!token) {
+    return {
+      ok: false,
+      skipped: false,
+      run_id: uuid("init"),
+      actor_id: actor.actorId,
+      actor_url: actor.actorUrl,
+      domain,
+      job_id: null,
+      error: "APIFY_TOKEN not configured",
+    };
+  }
+
+  const runId = uuid("init");
+  const jobId = await createJobRecord(env, {
+    siteId: site.site_id,
+    type: "apify_initial_actor_bootstrap",
+    request: {
+      site_id: site.site_id,
+      site_url: site.site_url,
+      domain,
+      actor_id: actor.actorId,
+      actor_url: actor.actorUrl,
+      trigger_source: triggerSource,
+    },
+  });
+
+  await saveInitialApifyRunRecord(env, {
+    runId,
+    siteId: site.site_id,
+    actorId: actor.actorId,
+    actorUrl: actor.actorUrl,
+    domain,
+    triggerSource,
+    status: "running",
+    jobId,
+  });
+
+  try {
+    const endpoint = new URL(
+      `https://api.apify.com/v2/acts/${encodeURIComponent(actor.actorId)}/run-sync-get-dataset-items`
+    );
+    endpoint.searchParams.set("token", token);
+    const inputPayload: Record<string, unknown> = {
+      urls: [`https://${domain}`],
+      domain,
+      VAR: domain,
+      site_domain: domain,
+      site_url: site.site_url,
+    };
+    if (options?.useResidentialProxy) {
+      inputPayload.proxyConfiguration = {
+        useApifyProxy: true,
+        apifyProxyGroups: ["RESIDENTIAL"],
+      };
+    }
+    const extraInput = parseJsonObject(options?.extraInput) ?? {};
+    for (const [k, v] of Object.entries(extraInput)) {
+      if (k in inputPayload) continue;
+      inputPayload[k] = v;
+    }
+    const response = await fetch(endpoint.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(inputPayload),
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Apify actor run failed (${response.status}): ${errText.slice(0, 500)}`);
+    }
+    const raw = await response.text();
+    const checksum = await sha256Hex(raw);
+    const day = toDateYYYYMMDD(nowMs());
+    const r2Key = `apify/v1/site/${site.site_id}/day/${day}/actor/${actor.actorId}/${runId}.json`;
+    if (env.MEMORY_R2) {
+      await env.MEMORY_R2.put(r2Key, raw, {
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: {
+          site_id: site.site_id,
+          actor_id: actor.actorId,
+          actor_url: actor.actorUrl,
+          domain,
+          run_id: runId,
+          trigger_source: triggerSource,
+        },
+      });
+    }
+    await createArtifactRecord(env, {
+      jobId,
+      kind: "apify.initial_actor.summary",
+      r2Key: `r2://${r2Key}`,
+      payload: {
+        run_id: runId,
+        actor_id: actor.actorId,
+        actor_url: actor.actorUrl,
+        domain,
+        item_count: 0,
+        checksum,
+        raw_saved: true,
+        parse_mode: "none",
+      },
+    });
+    await finalizeJobSuccess(env, jobId, 1);
+    await saveInitialApifyRunRecord(env, {
+      runId,
+      siteId: site.site_id,
+      actorId: actor.actorId,
+      actorUrl: actor.actorUrl,
+      domain,
+      triggerSource,
+      status: "succeeded",
+      itemCount: 0,
+      jobId,
+      r2Key: `r2://${r2Key}`,
+      checksum,
+      preview: {
+        raw_saved: true,
+        parse_mode: "none",
+      },
+    });
+    return {
+      ok: true,
+      skipped: false,
+      run_id: runId,
+      actor_id: actor.actorId,
+      actor_url: actor.actorUrl,
+      domain,
+      item_count: 0,
+      job_id: jobId,
+      r2_key: `r2://${r2Key}`,
+    };
+  } catch (error) {
+    const message = cleanString((error as Error)?.message ?? error, 2000) || "apify_initial_run_failed";
+    await finalizeJobFailure(env, jobId, "apify_initial_run_failed", { error: message });
+    await createArtifactRecord(env, {
+      jobId,
+      kind: "apify.initial_actor.error",
+      payload: { error: message, actor_id: actor.actorId, actor_url: actor.actorUrl, domain },
+    });
+    await saveInitialApifyRunRecord(env, {
+      runId,
+      siteId: site.site_id,
+      actorId: actor.actorId,
+      actorUrl: actor.actorUrl,
+      domain,
+      triggerSource,
+      status: "failed",
+      itemCount: 0,
+      jobId,
+      error: { error: message },
+    });
+    return {
+      ok: false,
+      skipped: false,
+      run_id: runId,
+      actor_id: actor.actorId,
+      actor_url: actor.actorUrl,
+      domain,
+      job_id: jobId,
+      error: message,
+    };
+  }
+}
+
+async function loadLatestInitialEnrichmentRun(
+  env: Env,
+  siteId: string
+): Promise<Record<string, unknown> | null> {
+  return await env.DB
+    .prepare(
+      `SELECT
+         run_id, site_id, provider, actor_id, actor_url, domain, trigger_source, status,
+         item_count, job_id, r2_key, checksum, payload_preview_json, error_json, created_at, updated_at
+       FROM site_initial_enrichment_runs
+       WHERE site_id = ?
+       ORDER BY created_at DESC
+       LIMIT 1`
+    )
+    .bind(siteId)
+    .first<Record<string, unknown>>();
 }
 
 function parseSiteIdFromPath(pathname: string, suffix: string): string | null {
@@ -4082,10 +5879,18 @@ async function saveStep1KeywordResearchResults(
       suggested_pillar_page: string;
     }>;
     step2Contract: Array<Record<string, unknown>>;
+    step1InitialActorRun?: Record<string, unknown> | null;
+    step1OpenAiTop20?: Record<string, unknown> | null;
   }
 ): Promise<void> {
   const ts = nowMs();
 
+  await env.DB.prepare(
+    `DELETE FROM wp_ai_seo_keyword_metrics
+     WHERE keyword_id IN (SELECT keyword_id FROM wp_ai_seo_keywords WHERE site_id = ?)`
+  )
+    .bind(input.siteId)
+    .run();
   await env.DB.prepare("DELETE FROM wp_ai_seo_keywords WHERE site_id = ?").bind(input.siteId).run();
 
   const selectedTierByKeyword = new Map<string, "primary" | "secondary" | "none">();
@@ -4236,6 +6041,8 @@ async function saveStep1KeywordResearchResults(
     secondary_top_10: secondaryOutput,
     cluster_map: input.clusters,
     step2_contract: input.step2Contract,
+    step1_initial_actor_run: parseJsonObject(input.step1InitialActorRun) ?? null,
+    step1_openai_top20: parseJsonObject(input.step1OpenAiTop20) ?? null,
   };
 
   await env.DB.prepare(
@@ -4273,6 +6080,452 @@ async function loadLatestStep1KeywordResearchResults(env: Env, siteId: string): 
   return parsed;
 }
 
+async function loadStep1KeywordResearchResultsByRun(
+  env: Env,
+  siteId: string,
+  researchRunId: string
+): Promise<Record<string, unknown> | null> {
+  const row = await env.DB.prepare(
+    `SELECT payload_json
+     FROM wp_ai_seo_selections
+     WHERE site_id = ? AND research_run_id = ? AND selection_type = 'keyword_research_results'
+     ORDER BY created_at DESC
+     LIMIT 1`
+  )
+    .bind(siteId, researchRunId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return safeJsonParseObject(cleanString(row.payload_json, 1_000_000));
+}
+
+function renderAfterPaymentStartHtml(hostname: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Post-Payment Step 1</title>
+  <style>
+    :root{--bg:#0b0f17;--card:#101826;--text:#e7eefc;--muted:#a9b6d0;--border:rgba(255,255,255,.14);--ok:#9cf0c5;--err:#ff7a7a}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Space Grotesk","Sora","Avenir Next",sans-serif;color:var(--text);background:radial-gradient(1200px 600px at 50% -10%, rgba(106,169,255,.18), transparent 60%), var(--bg);}
+    .wrap{max-width:780px;margin:0 auto;padding:28px 18px 64px}
+    .host{font-size:12px;color:var(--muted);margin-bottom:8px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px}
+    h1{margin:0 0 8px;font-size:30px}
+    p{margin:0 0 12px;color:var(--muted)}
+    label{display:block;font-size:12px;color:var(--muted);margin:10px 0 6px}
+    input{width:100%;padding:12px;border-radius:12px;border:1px solid var(--border);background:rgba(10,16,28,.6);color:var(--text);outline:none}
+    button{margin-top:14px;border:0;border-radius:12px;padding:12px 14px;font-weight:700;cursor:pointer;background:linear-gradient(90deg,#6aa9ff,#8b7dff);color:#fff;width:100%}
+    .status{margin-top:10px;font-size:13px;color:var(--muted)}
+    .status.ok{color:var(--ok)} .status.err{color:var(--err)}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="host">${htmlEscape(hostname)}</div>
+    <section class="card">
+      <h1>Step 1 Setup</h1>
+      <p>enter your current website URL in order for your AI to generate your top 20 Key Words.</p>
+      <label>Website URL</label>
+      <input id="site-url" placeholder="https://example.com" />
+      <button id="run-step1">Continue</button>
+      <p id="status" class="status"></p>
+    </section>
+  </main>
+  <script>
+    const statusEl = document.getElementById("status");
+    document.getElementById("run-step1").addEventListener("click", async () => {
+      const siteUrl = document.getElementById("site-url").value.trim();
+      if (!siteUrl) {
+        statusEl.textContent = "Please enter a website URL.";
+        statusEl.className = "status err";
+        return;
+      }
+      statusEl.textContent = "Preparing site details...";
+      statusEl.className = "status";
+      const res = await fetch("/v1/post-payment/step1/prepare", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ site_url: siteUrl }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        statusEl.textContent = "Failed: " + (data.error || res.status);
+        statusEl.className = "status err";
+        return;
+      }
+      window.location.href = data.review_url;
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function renderAfterPaymentReviewHtml(hostname: string, currentUrl: URL): string {
+  const siteId = cleanString(currentUrl.searchParams.get("site_id"), 120);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Step 1 Review</title>
+  <style>
+    :root{--bg:#0b0f17;--card:#101826;--text:#e7eefc;--muted:#a9b6d0;--border:rgba(255,255,255,.14);--ok:#9cf0c5;--err:#ff7a7a}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Space Grotesk","Sora","Avenir Next",sans-serif;color:var(--text);background:radial-gradient(1200px 600px at 50% -10%, rgba(106,169,255,.18), transparent 60%), var(--bg);}
+    .wrap{max-width:860px;margin:0 auto;padding:28px 18px 64px}
+    .host{font-size:12px;color:var(--muted);margin-bottom:8px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px}
+    h1{margin:0 0 8px;font-size:30px}
+    p{margin:0 0 12px;color:var(--muted)}
+    label{display:block;font-size:12px;color:var(--muted);margin:10px 0 6px}
+    input,textarea,select{width:100%;padding:12px;border-radius:12px;border:1px solid var(--border);background:rgba(10,16,28,.6);color:var(--text);outline:none}
+    textarea{min-height:90px;resize:vertical}
+    button{margin-top:14px;border:0;border-radius:12px;padding:12px 14px;font-weight:700;cursor:pointer;background:linear-gradient(90deg,#6aa9ff,#8b7dff);color:#fff;width:100%}
+    .status{margin-top:10px;font-size:13px;color:var(--muted)}
+    .status.ok{color:var(--ok)} .status.err{color:var(--err)}
+    .meta{font-size:12px;color:var(--muted);margin-top:8px}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="host">${htmlEscape(hostname)}</div>
+    <section class="card">
+      <h1>Verify Site Details</h1>
+      <p>Please confirm this information so we can better assist you.</p>
+      <div class="meta">site_id: <span id="site-id">${htmlEscape(siteId)}</span></div>
+      <label>Website URL</label>
+      <input id="site-url" readonly />
+      <label>Business name</label>
+      <input id="business-name" placeholder="Business name" />
+      <label>Primary location</label>
+      <input id="primary-location" placeholder="City, State" />
+      <label>Service terms (comma-separated)</label>
+      <textarea id="service-terms" placeholder=""></textarea>
+      <button id="run-step1">Run Step 1 + OpenAI Finalization</button>
+      <p id="status" class="status"></p>
+    </section>
+  </main>
+  <script>
+    const siteId = ${JSON.stringify(siteId)};
+    const statusEl = document.getElementById("status");
+    async function loadContext() {
+      if (!siteId) {
+        statusEl.textContent = "Missing site_id.";
+        statusEl.className = "status err";
+        return;
+      }
+      const res = await fetch("/v1/post-payment/step1/context?site_id=" + encodeURIComponent(siteId));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        statusEl.textContent = "Failed to load context: " + (data.error || res.status);
+        statusEl.className = "status err";
+        return;
+      }
+      document.getElementById("site-url").value = data.site_url || "";
+      document.getElementById("business-name").value = data.business_name || "";
+      document.getElementById("primary-location").value = data.primary_location_hint || "";
+      document.getElementById("service-terms").value = (data.service_terms || []).join(", ");
+    }
+    document.getElementById("run-step1").addEventListener("click", async () => {
+      const payload = {
+        site_id: siteId,
+        business_name: document.getElementById("business-name").value.trim(),
+        primary_location_hint: document.getElementById("primary-location").value.trim(),
+        service_terms: document.getElementById("service-terms").value.split(",").map(v => v.trim()).filter(Boolean),
+      };
+      statusEl.textContent = "Running Step 1. This can take a minute...";
+      statusEl.className = "status";
+      const res = await fetch("/v1/post-payment/step1/confirm-run", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        statusEl.textContent = "Failed: " + (data.error || res.status);
+        statusEl.className = "status err";
+        return;
+      }
+      window.location.href = data.results_url;
+    });
+    loadContext();
+  </script>
+</body>
+</html>`;
+}
+
+function renderAfterPaymentResultsHtml(hostname: string, currentUrl: URL): string {
+  const siteId = cleanString(currentUrl.searchParams.get("site_id"), 120);
+  const runId = cleanString(currentUrl.searchParams.get("research_run_id"), 120);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Step 1 OpenAI Results</title>
+  <style>
+    :root{--bg:#0b0f17;--card:#101826;--text:#e7eefc;--muted:#a9b6d0;--border:rgba(255,255,255,.14);--err:#ff7a7a}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Space Grotesk","Sora","Avenir Next",sans-serif;color:var(--text);background:radial-gradient(1200px 600px at 50% -10%, rgba(106,169,255,.18), transparent 60%), var(--bg);}
+    .wrap{max-width:980px;margin:0 auto;padding:28px 18px 64px}
+    .host{font-size:12px;color:var(--muted);margin-bottom:8px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px}
+    h1{margin:0 0 8px;font-size:30px}
+    .meta{font-size:12px;color:var(--muted);margin-bottom:12px}
+    pre{margin:0;padding:12px;border:1px solid var(--border);border-radius:12px;overflow:auto;max-height:70vh;background:rgba(0,0,0,.3)}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="host">${htmlEscape(hostname)}</div>
+    <section class="card">
+      <h1>Step 1 OpenAI JSON</h1>
+      <p class="meta">site_id=${htmlEscape(siteId)} · research_run_id=${htmlEscape(runId)}</p>
+      <pre id="json">Loading...</pre>
+    </section>
+  </main>
+  <script>
+    async function load() {
+      const siteId = ${JSON.stringify(siteId)};
+      const runId = ${JSON.stringify(runId)};
+      const q = new URLSearchParams({ site_id: siteId, research_run_id: runId });
+      const res = await fetch("/v1/post-payment/step1/results?" + q.toString());
+      const data = await res.json().catch(() => ({}));
+      document.getElementById("json").textContent = JSON.stringify(data, null, 2);
+    }
+    load();
+  </script>
+</body>
+</html>`;
+}
+
+function parseSimpleTitle(html: string): string {
+  const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return cleanString(m?.[1] ?? "", 300);
+}
+
+function parseSimpleH1(html: string): string {
+  const m = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  const raw = (m?.[1] ?? "").replace(/<[^>]+>/g, " ");
+  return cleanString(raw, 300);
+}
+
+function parseSimpleMetaDescription(html: string): string {
+  const m = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["'][^>]*>/i);
+  return cleanString(m?.[1] ?? "", 400);
+}
+
+function htmlToPlainExcerpt(html: string, maxLen = 1200): string {
+  const body = (html.match(/<body[^>]*>([\s\S]*?)<\/body>/i)?.[1] ?? html).replace(/<script[\s\S]*?<\/script>/gi, " ");
+  const text = body.replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+  return cleanString(text, maxLen);
+}
+
+function normalizeSubmittedSiteUrl(raw: string): string | null {
+  const input = cleanString(raw, 2000);
+  if (!input) return null;
+  const withScheme = /^[a-z][a-z0-9+\-.]*:\/\//i.test(input) ? input : `https://${input}`;
+  try {
+    const u = new URL(withScheme);
+    if (!u.hostname) return null;
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    const path = u.pathname === "/" ? "" : u.pathname.replace(/\/+$/, "");
+    const normalized = `${u.protocol}//${u.hostname}${path}${u.search}${u.hash}`;
+    return cleanString(normalized, 2000) || null;
+  } catch {
+    return null;
+  }
+}
+
+function inferPrimaryLocationFromText(text: string): string | null {
+  const matchCityState = text.match(/\b([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2})\b/);
+  if (matchCityState) {
+    const city = cleanString(matchCityState[1], 120);
+    const st = cleanString(matchCityState[2], 2).toUpperCase();
+    if (city && st) return `${city}, ${st}`;
+  }
+  const hay = text.toLowerCase();
+  if (hay.includes("reno") && hay.includes("sparks")) return "Reno/Sparks, NV";
+  if (hay.includes("reno")) return "Reno, NV";
+  if (hay.includes("sparks")) return "Sparks, NV";
+  return null;
+}
+
+function inferServiceTermsFromText(text: string): string[] {
+  const hay = text.toLowerCase();
+  const candidates = [
+    "car detailing",
+    "auto detailing",
+    "mobile detailing",
+    "mobile car detailing",
+    "ceramic coating",
+    "paint correction",
+    "interior detailing",
+    "exterior detailing",
+    "car wash",
+    "car waxing",
+    "car polishing",
+    "headlight restoration",
+    "odor removal",
+    "pet hair removal",
+    "engine bay detailing",
+    "rv detailing",
+    "boat detailing",
+    "motorcycle detailing",
+  ];
+  const out: string[] = [];
+  for (const c of candidates) {
+    if (hay.includes(c)) out.push(c);
+  }
+  if (out.length === 0 && /\bdetail(?:ing)?\b/.test(hay)) out.push("car detailing");
+  if (out.length === 0 && /\bceramic\b/.test(hay)) out.push("ceramic coating");
+  return out.slice(0, 20);
+}
+
+function pickMeaningfulSiteName(title: string, h1: string): string | null {
+  const titleClean = cleanString(title, 200);
+  const h1Clean = cleanString(h1, 200);
+  const noisyH1 = /^(home|shop|services?|products?|interior|exterior)$/i.test(h1Clean);
+  if (titleClean && !/^(home|homepage)$/i.test(titleClean)) return titleClean;
+  if (h1Clean && !noisyH1 && h1Clean.length >= 6) return h1Clean;
+  return titleClean || h1Clean || null;
+}
+
+async function fetchSeedSiteFacts(siteUrl: string): Promise<{
+  siteName: string | null;
+  primaryLocationHint: string | null;
+  serviceTerms: string[];
+  topPage: { url: string; title: string; h1: string; meta: string; text_extract: string };
+}> {
+  try {
+    const response = await fetch(siteUrl, {
+      method: "GET",
+      headers: {
+        "user-agent": "AIWPDev-Step1-Seed/1.0 (+https://www.onboarding.aiwpdev.com)",
+        accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+      },
+    });
+    if (!response.ok) throw new Error(`seed_fetch_failed_${response.status}`);
+    const html = await response.text();
+    const title = parseSimpleTitle(html);
+    const h1 = parseSimpleH1(html);
+    const meta = parseSimpleMetaDescription(html);
+    const textExtract = htmlToPlainExcerpt(html, 3000);
+    const textWide = htmlToPlainExcerpt(html, 12000);
+    const siteName = pickMeaningfulSiteName(title, h1);
+    const primaryLocationHint = inferPrimaryLocationFromText(`${title} ${h1} ${meta} ${textWide}`);
+    const serviceTerms = inferServiceTermsFromText(`${title} ${h1} ${meta} ${textWide}`);
+    return {
+      siteName,
+      primaryLocationHint,
+      serviceTerms,
+      topPage: {
+        url: siteUrl,
+        title,
+        h1,
+        meta,
+        text_extract: textExtract,
+      },
+    };
+  } catch {
+    return {
+      siteName: null,
+      primaryLocationHint: null,
+      serviceTerms: [],
+      topPage: {
+        url: siteUrl,
+        title: "",
+        h1: "",
+        meta: "",
+        text_extract: "",
+      },
+    };
+  }
+}
+
+async function runStep1OpenAiTop20Finalization(
+  env: Env,
+  input: {
+    siteId: string;
+    siteUrl: string;
+    researchRunId: string;
+    primaryTop10: string[];
+    secondaryTop10: string[];
+    businessName: string | null;
+    primaryLocation: string | null;
+    serviceTerms: string[];
+    siteTypeHint: string | null;
+    topPages: Array<{ url: string; title: string; h1: string; text_extract: string }>;
+  }
+): Promise<Record<string, unknown> | null> {
+  const apiKey = cleanString(env.OPENAI_API_KEY, 500);
+  if (!apiKey) {
+    return {
+      status: "skipped",
+      reason: "OPENAI_API_KEY_not_configured",
+    };
+  }
+  const day = toDateYYYYMMDD(nowMs());
+  const prompt = [
+    "You are an SEO expert.",
+    `Generate a top 20 keyword target list for website: ${input.siteUrl}.`,
+    `Business name: ${input.businessName || "unknown"}.`,
+    `Primary location: ${input.primaryLocation || "unknown"}.`,
+    `Site type hint: ${input.siteTypeHint || "unknown"}.`,
+    `Known services/offers: ${input.serviceTerms.join(", ") || "unknown"}.`,
+    `Homepage/page extracts (partial): ${input.topPages.slice(0, 6).map((p) => `${p.title || p.h1 || p.url}`).join(" | ") || "none"}.`,
+    `My SEO webapp suggested primary 1-10: ${input.primaryTop10.join(", ")}.`,
+    `My SEO webapp suggested secondary 11-20: ${input.secondaryTop10.join(", ")}.`,
+    "Rules:",
+    "1) Return exactly 20 keywords.",
+    "2) No placeholders like [city]. Use actual city/state if known.",
+    "3) Do not include noise terms like 'general', 'com cost', 'business services'.",
+    "4) Prefer localized service + city money terms and branded terms.",
+    "5) Use only services likely present from provided data.",
+    "Output JSON only with shape: {\"top_20_keywords\":[{\"keyword\":\"...\",\"reason\":\"...\"}],\"notes\":\"...\"}",
+  ].join("\n");
+  const requestPayload = {
+    model: "gpt-5.2-pro",
+    input: prompt,
+  };
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(requestPayload),
+  });
+  const rawText = await response.text();
+  if (!response.ok) {
+    throw new Error(`step1_openai_finalization_failed:${response.status}:${rawText.slice(0, 400)}`);
+  }
+  const parsed = safeJsonParseObject(rawText) ?? { raw_text: rawText };
+  const checksum = await sha256Hex(rawText);
+  let r2Key: string | null = null;
+  if (env.MEMORY_R2) {
+    r2Key = `openai/v1/site/${input.siteId}/day/${day}/step1/${input.researchRunId}/gpt52pro_top20.json`;
+    await env.MEMORY_R2.put(r2Key, rawText, {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        site_id: input.siteId,
+        research_run_id: input.researchRunId,
+        model: "gpt-5.2-pro",
+      },
+    });
+  }
+  return {
+    status: "succeeded",
+    model: "gpt-5.2-pro",
+    prompt,
+    response_json: parsed,
+    checksum,
+    r2_key: r2Key,
+  };
+}
+
 async function runStep1KeywordResearch(
   env: Env,
   site: Step1SiteRecord,
@@ -4281,6 +6534,16 @@ async function runStep1KeywordResearch(
   researchRunId: string;
   result: Record<string, unknown>;
 }> {
+  const researchRunId = uuid("krr");
+  const day = toDateYYYYMMDD(nowMs());
+  // Step 1 starts with the secondary Step 1 actor only.
+  const secondaryActorRun = await runInitialApifyActorBootstrap(env, site, "step1_keyword_research_secondary_actor", {
+    forceRun: true,
+    actorId: APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_ID,
+    actorUrl: APIFY_DEFAULT_STEP1_SECONDARY_ACTOR_URL,
+    useResidentialProxy: true,
+  });
+
   const siteInput = safeJsonParseObject(site.input_json) ?? {};
   const payload = requestBody ?? {};
   const semrushMetrics = parseSemrushMetrics(payload.semrush_keywords ?? siteInput.semrush_keywords);
@@ -4290,35 +6553,155 @@ async function runStep1KeywordResearch(
   const siteType = cleanString(siteProfile.site_type_detected, 60) || "general";
   const localMode = site.local_mode || parseBoolUnknown(siteProfile.local_mode, false);
 
-  const candidateKeywords = generateCandidateKeywords({
-    offerTerms,
-    locationTerms,
-    siteType,
-    localMode,
-    semrushMetrics,
-  });
-  if (candidateKeywords.length < 40) {
-    const fallback = buildDeterministicFallbackKeywords({
-      siteUrl: cleanString(siteInput.site_url, 2000),
-      siteName: cleanString(siteInput.site_name, 200),
-      industry: cleanString(parseJsonObject(siteProfile.site_brief)?.industry, 120),
-      locationTerms,
-    });
-    for (const kw of fallback) {
-      if (!candidateKeywords.includes(kw)) {
-        candidateKeywords.push(kw);
+  let scored: Step1KeywordCandidate[] = [];
+  const dataforseoArtifacts: Array<Record<string, unknown>> = [];
+
+  const domain = normalizeRootDomain(site.site_url);
+  const dataForSeoEnabled = !!cleanString(env.DATAFORSEO_LOGIN, 300) && !!cleanString(env.DATAFORSEO_PASSWORD, 500);
+  if (dataForSeoEnabled && domain) {
+    try {
+      const dfKeywords = await fetchStep1DataForSeoKeywords(env, { domain, limit: 300 });
+      const dfKeywordsSave = await saveStep1DataForSeoRawToR2(env, {
+        siteId: site.site_id,
+        day,
+        researchRunId,
+        kind: "keywords_for_site",
+        raw: dfKeywords.raw,
+        metadata: { domain },
+      });
+      dataforseoArtifacts.push({
+        kind: "keywords_for_site",
+        domain,
+        r2_key: dfKeywordsSave.r2Key,
+        checksum: dfKeywordsSave.checksum,
+        keywords_count: dfKeywords.keywords.length,
+      });
+
+      const geoTargets = pickStep1DataForSeoGeoTargets(
+        {
+          ...siteInput,
+          ...(parseJsonObject(payload) ?? {}),
+        },
+        locationTerms
+      );
+      const localCityTerms = deriveCityTermsFromGeoTargets(geoTargets);
+      const expandedKeywords = expandDataForSeoKeywordsWithLocalVariants(dfKeywords.keywords, localCityTerms);
+      const usGeo = geoTargets.find((g) => g.key === "us") ?? geoTargets[0];
+      const usVol = await fetchStep1DataForSeoSearchVolume(env, {
+        keywords: expandedKeywords,
+        locationCode: usGeo.location_code,
+        languageCode: usGeo.language_code,
+      });
+      const usVolSave = await saveStep1DataForSeoRawToR2(env, {
+        siteId: site.site_id,
+        day,
+        researchRunId,
+        kind: "search_volume",
+        geoKey: usGeo.key,
+        raw: usVol.raw,
+      });
+      dataforseoArtifacts.push({
+        kind: "search_volume",
+        geo_key: usGeo.key,
+        location_code: usGeo.location_code,
+        r2_key: usVolSave.r2Key,
+        checksum: usVolSave.checksum,
+      });
+
+      const geoVolumes = new Map<string, Map<string, { search_volume: number | null; cpc: number | null; competition: string | null }>>();
+      for (const geo of geoTargets) {
+        if (geo.key === usGeo.key) continue;
+        try {
+          const vol = await fetchStep1DataForSeoSearchVolume(env, {
+            keywords: expandedKeywords,
+            locationCode: geo.location_code,
+            languageCode: geo.language_code,
+          });
+          const volSave = await saveStep1DataForSeoRawToR2(env, {
+            siteId: site.site_id,
+            day,
+            researchRunId,
+            kind: "search_volume",
+            geoKey: geo.key,
+            raw: vol.raw,
+          });
+          dataforseoArtifacts.push({
+            kind: "search_volume",
+            geo_key: geo.key,
+            location_code: geo.location_code,
+            r2_key: volSave.r2Key,
+            checksum: volSave.checksum,
+          });
+          geoVolumes.set(geo.key, vol.byKeyword);
+        } catch (geoError) {
+          dataforseoArtifacts.push({
+            kind: "error",
+            source: "dataforseo_step1_geo",
+            geo_key: geo.key,
+            location_code: geo.location_code,
+            error: cleanString((geoError as Error)?.message ?? geoError, 2000) || "dataforseo_geo_failed",
+          });
+        }
       }
-      if (candidateKeywords.length >= 2000) break;
+
+      scored = buildStep1CandidatesFromDataForSeo({
+        keywords: expandedKeywords,
+        offerTerms,
+        locationTerms,
+        siteType,
+        localMode,
+        usVolumes: usVol.byKeyword,
+        geoVolumes,
+        localCityTerms,
+      });
+    } catch (error) {
+      dataforseoArtifacts.push({
+        kind: "error",
+        source: "dataforseo_step1",
+        error: cleanString((error as Error)?.message ?? error, 2000) || "dataforseo_step1_failed",
+      });
+      scored = [];
     }
   }
-  const scored = scoreKeywordCandidates({
-    keywords: candidateKeywords,
-    semrushMetrics,
-    offerTerms,
-    locationTerms,
-    siteType,
-    localMode,
-  });
+
+  if (scored.length < 20) {
+    const candidateKeywords = generateCandidateKeywords({
+      offerTerms,
+      locationTerms,
+      siteType,
+      localMode,
+      semrushMetrics,
+    });
+    if (candidateKeywords.length < 40) {
+      const fallback = buildDeterministicFallbackKeywords({
+        siteUrl: cleanString(siteInput.site_url, 2000),
+        siteName: cleanString(siteInput.site_name, 200),
+        industry: cleanString(parseJsonObject(siteProfile.site_brief)?.industry, 120),
+        locationTerms,
+      });
+      for (const kw of fallback) {
+        if (!candidateKeywords.includes(kw)) {
+          candidateKeywords.push(kw);
+        }
+        if (candidateKeywords.length >= 2000) break;
+      }
+    }
+    const fallbackScored = scoreKeywordCandidates({
+      keywords: candidateKeywords,
+      semrushMetrics,
+      offerTerms,
+      locationTerms,
+      siteType,
+      localMode,
+    });
+    const existing = new Set(scored.map((row) => row.keyword_norm));
+    for (const row of fallbackScored) {
+      if (existing.has(row.keyword_norm)) continue;
+      scored.push(row);
+      existing.add(row.keyword_norm);
+    }
+    scored.sort((a, b) => b.opportunity_score - a.opportunity_score);
+  }
   const primaryBase = pickPrimaryKeywords(scored, locationTerms);
   const primary = fillPrimaryToTop10(primaryBase, scored, locationTerms);
   const secondaryBase = pickSecondaryKeywords(scored, primary, locationTerms);
@@ -4329,8 +6712,56 @@ async function runStep1KeywordResearch(
   );
   const topPages = parseTopPages(siteInput.top_pages);
   const step2Contract = buildStep1Step2Contract(primary, secondary, topPages);
+  const businessName = cleanString(site.site_name, 200) || cleanString(siteInput.site_name, 200) || null;
+  const primaryLocation = cleanString(site.primary_location_hint, 200) || cleanString(siteInput.primary_location_hint, 200) || null;
+  const serviceTermsForPrompt = offerTerms.slice(0, 20);
+  let step1OpenAiTop20: Record<string, unknown> | null = null;
+  try {
+    step1OpenAiTop20 = await runStep1OpenAiTop20Finalization(env, {
+      siteId: site.site_id,
+      siteUrl: site.site_url,
+      researchRunId,
+      primaryTop10: primary.map((row) => row.keyword),
+      secondaryTop10: secondary.map((row) => row.keyword),
+      businessName,
+      primaryLocation,
+      serviceTerms: serviceTermsForPrompt,
+      siteTypeHint: cleanString(site.site_type_hint, 80) || null,
+      topPages: topPages.map((p) => ({
+        url: cleanString(p.url, 2000),
+        title: cleanString((p as Record<string, unknown>).title, 300),
+        h1: cleanString((p as Record<string, unknown>).h1, 300),
+        text_extract: cleanString((p as Record<string, unknown>).text_extract, 1000),
+      })),
+    });
+  } catch (error) {
+    step1OpenAiTop20 = {
+      status: "failed",
+      error: cleanString((error as Error)?.message ?? error, 2000) || "openai_finalization_failed",
+    };
+  }
 
-  const researchRunId = uuid("krr");
+  const secondaryActorRunMeta = secondaryActorRun.ok
+    ? {
+        run_id: secondaryActorRun.run_id,
+        actor_id: secondaryActorRun.actor_id,
+        actor_url: secondaryActorRun.actor_url,
+        domain: secondaryActorRun.domain,
+        item_count: secondaryActorRun.item_count,
+        job_id: secondaryActorRun.job_id,
+        r2_key: secondaryActorRun.r2_key,
+      }
+    : {
+        run_id: secondaryActorRun.run_id,
+        actor_id: secondaryActorRun.actor_id,
+        actor_url: secondaryActorRun.actor_url,
+        domain: secondaryActorRun.domain,
+        item_count: 0,
+        job_id: secondaryActorRun.job_id,
+        r2_key: null,
+        status: "failed",
+        error: secondaryActorRun.error,
+      };
   await saveStep1KeywordResearchResults(env, {
     siteId: site.site_id,
     researchRunId,
@@ -4338,12 +6769,30 @@ async function runStep1KeywordResearch(
     secondary,
     clusters,
     step2Contract,
+    step1InitialActorRun: {
+      secondary_actor_run: secondaryActorRunMeta,
+      dataforseo_artifacts: dataforseoArtifacts,
+      parse_mode: "none",
+    },
+    step1OpenAiTop20,
   });
 
   const result = (await loadLatestStep1KeywordResearchResults(env, site.site_id)) ?? {};
   return {
     researchRunId,
-    result,
+    result: {
+      ...result,
+      step1_initial_actor_run:
+        parseJsonObject(result.step1_initial_actor_run) ??
+        ({
+          secondary_actor_run: secondaryActorRunMeta,
+          parse_mode: "none",
+        } as Record<string, unknown>),
+      step1_openai_top20:
+        parseJsonObject(result.step1_openai_top20) ??
+        parseJsonObject(step1OpenAiTop20) ??
+        null,
+    },
   };
 }
 
@@ -6364,6 +8813,60 @@ function makeStep3Task(input: {
   };
 }
 
+function isCloudflareStaticExecutionSite(site: Step1SiteRecord): boolean {
+  const hint = cleanString(site.site_type_hint, 120).toLowerCase();
+  if (hint.includes("static_html_cloudflare") || hint.includes("cloudflare_static")) return true;
+  const profile = safeJsonParseObject(site.site_profile_json) ?? {};
+  const execution = cleanString(profile.execution_platform, 120).toLowerCase();
+  if (execution === "cloudflare_static_html") return true;
+  const deploy = parseJsonObject(profile.deployment_target) ?? {};
+  const deployPlatform = cleanString(deploy.platform, 120).toLowerCase();
+  if (deployPlatform === "cloudflare_static_html") return true;
+  const inputJson = safeJsonParseObject(site.input_json) ?? {};
+  const plan = parseJsonObject(inputJson.plan) ?? {};
+  const host = cleanString(plan.hosting_provider ?? inputJson.hosting_provider, 120).toLowerCase();
+  const runtime = cleanString(plan.runtime_hint ?? inputJson.runtime_hint, 120).toLowerCase();
+  return host.includes("cloudflare") && (runtime.includes("static") || runtime.includes("html"));
+}
+
+function toStaticHtmlActionType(actionType: string): string {
+  const map: Record<string, string> = {
+    WP_CREATE_PAGE: "STATIC_HTML_CREATE_PAGE",
+    WP_UPDATE_PAGE: "STATIC_HTML_UPDATE_PAGE",
+    WP_ADD_SCHEMA: "STATIC_HTML_ADD_SCHEMA",
+    WP_ADD_INTERNAL_LINKS: "STATIC_HTML_ADD_INTERNAL_LINKS",
+    WP_UPDATE_META: "STATIC_HTML_UPDATE_META",
+  };
+  return map[actionType] ?? actionType;
+}
+
+function transformTasksForCloudflareStaticSite(tasks: Step3TaskV1[]): Step3TaskV1[] {
+  return tasks.map((task) => {
+    const newAccess = task.requires.access.map((access) => (access === "WP_ADMIN" ? "CLOUDFLARE_ACCOUNT" : access));
+    const newActions = task.automation.actions.map((action) => ({
+      action_type: toStaticHtmlActionType(cleanString(action.action_type, 120)),
+      payload: {
+        ...action.payload,
+        deploy_target: "cloudflare_static_html",
+      },
+    }));
+    return {
+      ...task,
+      requires: {
+        ...task.requires,
+        access: newAccess,
+      },
+      summary: task.summary.includes("WordPress")
+        ? task.summary.replace(/WordPress/gi, "Cloudflare static site")
+        : task.summary,
+      automation: {
+        ...task.automation,
+        actions: newActions,
+      },
+    };
+  });
+}
+
 function buildStep3KeywordSignals(report: Record<string, unknown>): Map<string, Step3KeywordSignal> {
   const out = new Map<string, Step3KeywordSignal>();
   const rows = Array.isArray(report.keyword_reports) ? report.keyword_reports : [];
@@ -6671,6 +9174,17 @@ function buildStep3Tasks(input: {
   };
 
   const primaryRows = input.primaryRows.slice(0, 6);
+  const siteDomain = normalizeRootDomain(input.site.site_url);
+  const localHintJoined = `${cleanString(input.site.primary_location_hint, 200)} ${cleanString(input.site.business_address, 400)}`.toLowerCase();
+  const keywordJoined = input.primaryRows.map((row) => cleanString(row.keyword, 200).toLowerCase()).join(" ");
+  const isDetailingSite =
+    /\b(detail|detailing|ceramic|paint correction|auto detail)\b/.test(
+      `${siteDomain} ${cleanString(input.site.site_name, 200).toLowerCase()} ${keywordJoined}`
+    ) || siteDomain.includes("supremexdetail.com");
+  const isRenoSparksContext =
+    /\b(reno|sparks|nevada|nv)\b/.test(localHintJoined) ||
+    /\b(reno|sparks|nevada|nv)\b/.test(keywordJoined) ||
+    siteDomain.includes("supremexdetail.com");
   for (const row of primaryRows) {
     const keyword = cleanString(row.keyword, 300);
     if (!keyword) continue;
@@ -7068,6 +9582,266 @@ function buildStep3Tasks(input: {
     }
   }
 
+  if (isDetailingSite && isRenoSparksContext) {
+    const localPageSpecs = [
+      {
+        keyword: "mobile car detailing reno nv",
+        slug: "mobile-car-detailing-reno-nv",
+        title: "Create/upgrade Reno mobile detailing page",
+      },
+      {
+        keyword: "mobile car detailing sparks nv",
+        slug: "mobile-car-detailing-sparks-nv",
+        title: "Create/upgrade Sparks mobile detailing page",
+      },
+      {
+        keyword: "ceramic coating reno nv",
+        slug: "ceramic-coating-reno-nv",
+        title: "Create/upgrade Reno ceramic coating page",
+      },
+      {
+        keyword: "paint correction reno nv",
+        slug: "paint-correction-reno-nv",
+        title: "Create/upgrade Reno paint correction page",
+      },
+    ];
+    for (const spec of localPageSpecs) {
+      add(
+        makeStep3Task({
+          siteId: input.site.site_id,
+          siteRunId: input.siteRunId,
+          category: "ON_PAGE",
+          type: "LOCATION_PAGE_CREATE",
+          title: spec.title,
+          summary:
+            "Build a location service page with FAQ, starting-at pricing, before/after gallery, and conversion CTA.",
+          priority: "P1",
+          effort: "M",
+          confidence: 0.91,
+          estimatedImpact: { seo: "high", leads: "high", timeToEffectDays: 14 },
+          mode: "AUTO",
+          requiresAccess: ["WP_ADMIN"],
+          scope: {
+            keyword: spec.keyword,
+            cluster: "local_service_pages",
+            target_slug: spec.slug,
+            target_url: `${cleanString(input.site.site_url, 2000).replace(/\/+$/, "")}/${spec.slug}`,
+            geo: "both",
+          },
+          evidence: {
+            based_on: ["SERP", "ON_PAGE"],
+            citations: [
+              {
+                kind: "BEST_PRACTICE",
+                text: "Local money pages should include service-specific FAQ, starting price, trust media, and direct CTA.",
+                data: { source: "step3_local_detailing_pack" },
+              },
+            ],
+          },
+          instructions: {
+            steps: [
+              "Create or update page at target slug.",
+              "Add service-specific FAQ module with local intent questions.",
+              "Add pricing module with clear 'starting at' language and disclaimer.",
+              "Add before/after gallery section.",
+              "Place call/book/quote CTA above the fold and at page end.",
+            ],
+            acceptance_criteria: [
+              "Page exists and is indexable.",
+              "FAQ + pricing + before/after + CTA sections are present.",
+            ],
+            guardrails: [
+              "No copied competitor copy.",
+              "No thin doorway duplicate pages.",
+            ],
+          },
+          automation: {
+            can_auto_apply: true,
+            auto_apply_default: false,
+            actions: [
+              {
+                action_type: "WP_CREATE_PAGE",
+                payload: {
+                  target_slug: spec.slug,
+                  title: spec.keyword.replace(/\b\w/g, (v) => v.toUpperCase()),
+                  template: "service_location",
+                },
+              },
+              {
+                action_type: "WP_UPDATE_PAGE",
+                payload: {
+                  target_slug: spec.slug,
+                  modules: ["faq", "pricing_starting_at", "before_after_photos", "cta_quote_call"],
+                },
+              },
+              {
+                action_type: "WP_ADD_SCHEMA",
+                payload: { target_slug: spec.slug, schema_types: ["LocalBusiness", "Service", "Review"] },
+              },
+            ],
+          },
+          outputs: {
+            artifacts: [{ kind: "DRAFT_HTML", data: { target_slug: spec.slug, include_modules: 4 } }],
+          },
+        })
+      );
+    }
+
+    add(
+      makeStep3Task({
+        siteId: input.site.site_id,
+        siteRunId: input.siteRunId,
+        category: "LOCAL_SEO",
+        type: "REVIEW_REQUEST_CAMPAIGN_SETUP",
+        title: "Launch review request + SMS follow-up engine",
+        summary: "Push review velocity past leading competitors and maintain active response cadence.",
+        priority: "P1",
+        effort: "M",
+        confidence: 0.87,
+        estimatedImpact: { seo: "high", leads: "high", timeToEffectDays: 10 },
+        mode: "DIY",
+        requiresAccess: ["SMS", "EMAIL", "GBP"],
+        requiresInputs: ["BRAND_VOICE"],
+        requiresApprovals: ["PUBLISH"],
+        scope: { cluster: "local_reputation", geo: "both" },
+        instructions: {
+          steps: [
+            "Enable post-service review ask via SMS + email.",
+            "Schedule follow-up reminder at +24h and +72h for non-responders.",
+            "Respond to all new reviews within SLA.",
+          ],
+          acceptance_criteria: [
+            "Automated request flow enabled.",
+            "Review response templates approved and active.",
+          ],
+          guardrails: ["No incentivized reviews.", "No fake review generation."],
+        },
+      })
+    );
+
+    add(
+      makeStep3Task({
+        siteId: input.site.site_id,
+        siteRunId: input.siteRunId,
+        category: "LOCAL_SEO",
+        type: "CITATION_CLEANUP",
+        title: "Run NAP cleanup across core directories",
+        summary: "Normalize exact Name/Address/Phone across key local listings and suppress duplicates.",
+        priority: "P1",
+        effort: "M",
+        confidence: 0.85,
+        estimatedImpact: { seo: "med", leads: "med", timeToEffectDays: 21 },
+        mode: "AUTO",
+        requiresAccess: ["NONE"],
+        scope: { cluster: "local_citations", geo: "both" },
+        outputs: { artifacts: [{ kind: "CITATION_LIST", data: { mode: "cleanup_and_dedupe" } }] },
+      })
+    );
+
+    add(
+      makeStep3Task({
+        siteId: input.site.site_id,
+        siteRunId: input.siteRunId,
+        category: "LOCAL_SEO",
+        type: "CITATION_CREATE",
+        title: "Expand citations to top local directories + aggregators",
+        summary: "Submit/refresh listings in high-trust local ecosystems to reinforce location authority.",
+        priority: "P1",
+        effort: "M",
+        confidence: 0.8,
+        estimatedImpact: { seo: "med", leads: "med", timeToEffectDays: 30 },
+        mode: "DIY",
+        requiresAccess: ["NONE"],
+        requiresInputs: ["BUSINESS_HOURS", "SERVICE_LIST"],
+        requiresApprovals: ["PUBLISH"],
+        scope: { cluster: "local_citations", geo: "both" },
+        outputs: { artifacts: [{ kind: "CITATION_LIST", data: { mode: "expansion" } }] },
+      })
+    );
+
+    add(
+      makeStep3Task({
+        siteId: input.site.site_id,
+        siteRunId: input.siteRunId,
+        category: "ON_PAGE",
+        type: "CONTENT_REFRESH",
+        title: "Refresh homepage for topical relevance (mobile detailing Reno/Sparks)",
+        summary:
+          "Remove non-detailing template sections and align homepage narrative to local mobile detailing intent.",
+        priority: "P1",
+        effort: "M",
+        confidence: 0.89,
+        estimatedImpact: { seo: "high", leads: "high", timeToEffectDays: 7 },
+        mode: "AUTO",
+        requiresAccess: ["WP_ADMIN"],
+        scope: { target_slug: "", target_url: cleanString(input.site.site_url, 2000), geo: "both" },
+        instructions: {
+          steps: [
+            "Audit homepage sections for off-topic template content.",
+            "Replace generic/irrelevant booking flow language with detailing-focused sections.",
+            "Highlight Reno/Sparks service area, proof, and conversion CTA.",
+          ],
+          acceptance_criteria: [
+            "Homepage message is clearly local detailing-focused end-to-end.",
+            "Primary CTA appears above fold and near footer.",
+          ],
+          guardrails: ["Do not remove legal/compliance sections.", "Keep UX flow concise."],
+        },
+        automation: {
+          can_auto_apply: true,
+          auto_apply_default: false,
+          actions: [
+            {
+              action_type: "WP_UPDATE_PAGE",
+              payload: {
+                target_slug: "",
+                replace_patterns: ["rideshare", "driver booking", "unrelated onboarding"],
+                enforce_topic: "mobile car detailing reno sparks",
+              },
+            },
+          ],
+        },
+      })
+    );
+
+    add(
+      makeStep3Task({
+        siteId: input.site.site_id,
+        siteRunId: input.siteRunId,
+        category: "ON_PAGE",
+        type: "CONTENT_MODULE_ADD",
+        title: "Deploy LocalBusiness + Service + Review schema set",
+        summary: "Add structured data for business entity, services, and review snippets where policy allows.",
+        priority: "P1",
+        effort: "S",
+        confidence: 0.86,
+        estimatedImpact: { seo: "med", leads: "med", timeToEffectDays: 7 },
+        mode: "AUTO",
+        requiresAccess: ["WP_ADMIN"],
+        scope: { cluster: "schema", geo: "both" },
+        automation: {
+          can_auto_apply: true,
+          auto_apply_default: false,
+          actions: [
+            {
+              action_type: "WP_ADD_SCHEMA",
+              payload: {
+                schema_types: ["LocalBusiness", "Service", "Review"],
+                target_slugs: [
+                  "mobile-car-detailing-reno-nv",
+                  "mobile-car-detailing-sparks-nv",
+                  "ceramic-coating-reno-nv",
+                  "paint-correction-reno-nv",
+                ],
+              },
+            },
+          ],
+        },
+        outputs: { artifacts: [{ kind: "SCHEMA_JSONLD", data: { schema_pack: "local_service_reviews" } }] },
+      })
+    );
+  }
+
   add(
     makeStep3Task({
       siteId: input.site.site_id,
@@ -7381,7 +10155,11 @@ function buildStep3Tasks(input: {
     })
   );
 
-  return tasks.slice(0, 80);
+  const trimmed = tasks.slice(0, 80);
+  if (isCloudflareStaticExecutionSite(input.site)) {
+    return transformTasksForCloudflareStaticSite(trimmed);
+  }
+  return trimmed;
 }
 
 function buildStep3RiskFlags(input: {
@@ -9729,6 +12507,200 @@ async function savePlanSelection(
   return { subscriptionId };
 }
 
+async function bindSubscriptionToSite(env: Env, subscriptionId: string, siteId: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE billing_site_subscriptions
+     SET site_id = ?, updated_at = strftime('%s','now')
+     WHERE subscription_id = ?`
+  )
+    .bind(siteId, subscriptionId)
+    .run();
+}
+
+async function createCloudflareOauthState(
+  env: Env,
+  input: { siteId: string; subscriptionId: string | null }
+): Promise<string> {
+  const state = uuid("cfoauth");
+  const now = nowMs();
+  await env.DB.prepare(
+    `INSERT INTO cloudflare_oauth_states (
+      state, site_id, subscription_id, created_at, expires_at, consumed_at
+    ) VALUES (?, ?, ?, ?, ?, NULL)`
+  )
+    .bind(state, input.siteId, input.subscriptionId, now, now + CLOUDFLARE_OAUTH_STATE_TTL_MS)
+    .run();
+  return state;
+}
+
+async function consumeCloudflareOauthState(
+  env: Env,
+  state: string
+): Promise<{ siteId: string; subscriptionId: string | null } | null> {
+  const now = nowMs();
+  const row = await env.DB.prepare(
+    `SELECT state, site_id, subscription_id, expires_at, consumed_at
+     FROM cloudflare_oauth_states
+     WHERE state = ?
+     LIMIT 1`
+  )
+    .bind(state)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  if (clampInt(row.consumed_at, 0, Number.MAX_SAFE_INTEGER, 0) > 0) return null;
+  const expiresAt = clampInt(row.expires_at, 0, Number.MAX_SAFE_INTEGER, 0);
+  if (!expiresAt || now > expiresAt) return null;
+  await env.DB.prepare(
+    `UPDATE cloudflare_oauth_states
+     SET consumed_at = ?
+     WHERE state = ?`
+  )
+    .bind(now, state)
+    .run();
+  return {
+    siteId: cleanString(row.site_id, 120),
+    subscriptionId: cleanString(row.subscription_id, 120) || null,
+  };
+}
+
+async function saveCloudflareConnection(env: Env, input: {
+  siteId: string;
+  subscriptionId: string | null;
+  status: string;
+  authMode: "oauth" | "api_token";
+  tokenPlaintext: string | null;
+  scopes: string[];
+  tokenExpiresAt: number | null;
+  cloudflareUserId?: string | null;
+  cloudflareAccountId?: string | null;
+  cloudflareAccountName?: string | null;
+  lastError?: string | null;
+}): Promise<void> {
+  const tokenCiphertext = input.tokenPlaintext ? await encryptConnectionSecret(env, input.tokenPlaintext) : null;
+  if (input.tokenPlaintext && !tokenCiphertext) {
+    throw new Error("connections_encryption_key_missing_or_invalid");
+  }
+  const existing = await env.DB.prepare(
+    `SELECT connection_id FROM cloudflare_site_connections WHERE site_id = ? LIMIT 1`
+  )
+    .bind(input.siteId)
+    .first<Record<string, unknown>>();
+  const connectionId = cleanString(existing?.connection_id, 120) || uuid("cfconn");
+  await env.DB.prepare(
+    `INSERT INTO cloudflare_site_connections (
+      connection_id, site_id, subscription_id, status, auth_mode,
+      cloudflare_user_id, cloudflare_account_id, cloudflare_account_name,
+      scopes_json, token_ciphertext, token_expires_at, last_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'))
+    ON CONFLICT(site_id) DO UPDATE SET
+      subscription_id = excluded.subscription_id,
+      status = excluded.status,
+      auth_mode = excluded.auth_mode,
+      cloudflare_user_id = excluded.cloudflare_user_id,
+      cloudflare_account_id = excluded.cloudflare_account_id,
+      cloudflare_account_name = excluded.cloudflare_account_name,
+      scopes_json = excluded.scopes_json,
+      token_ciphertext = excluded.token_ciphertext,
+      token_expires_at = excluded.token_expires_at,
+      last_error = excluded.last_error,
+      updated_at = strftime('%s','now')`
+  )
+    .bind(
+      connectionId,
+      input.siteId,
+      input.subscriptionId,
+      cleanString(input.status, 60),
+      input.authMode,
+      cleanString(input.cloudflareUserId, 120) || null,
+      cleanString(input.cloudflareAccountId, 120) || null,
+      cleanString(input.cloudflareAccountName, 240) || null,
+      canonicalJson(input.scopes),
+      tokenCiphertext,
+      input.tokenExpiresAt ?? null,
+      cleanString(input.lastError, 2000) || null
+    )
+    .run();
+}
+
+async function getCloudflareConnectionStatus(env: Env, siteId: string): Promise<Record<string, unknown>> {
+  const row = await env.DB.prepare(
+    `SELECT
+      status, auth_mode, cloudflare_user_id, cloudflare_account_id, cloudflare_account_name,
+      scopes_json, token_expires_at, updated_at, last_error
+     FROM cloudflare_site_connections
+     WHERE site_id = ?
+     LIMIT 1`
+  )
+    .bind(siteId)
+    .first<Record<string, unknown>>();
+  if (!row) {
+    return { ok: true, site_id: siteId, status: "not_connected" };
+  }
+  const parsedScopes = safeJsonParseObject(`{"x":${cleanString(row.scopes_json, 8000) || "[]"}}`) ?? {};
+  return {
+    ok: true,
+    site_id: siteId,
+    status: cleanString(row.status, 60) || "unknown",
+    auth_mode: cleanString(row.auth_mode, 40) || null,
+    cloudflare_user_id: cleanString(row.cloudflare_user_id, 120) || null,
+    cloudflare_account_id: cleanString(row.cloudflare_account_id, 120) || null,
+    cloudflare_account_name: cleanString(row.cloudflare_account_name, 240) || null,
+    scopes: parseStringArray(parsedScopes.x, 100, 120),
+    token_expires_at: row.token_expires_at == null ? null : clampInt(row.token_expires_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    updated_at: clampInt(row.updated_at, 0, Number.MAX_SAFE_INTEGER, 0),
+    last_error: cleanString(row.last_error, 2000) || null,
+  };
+}
+
+async function exchangeCloudflareOAuthCode(
+  env: Env,
+  input: { code: string; redirectUri: string }
+): Promise<{ accessToken: string; refreshToken: string | null; expiresAtMs: number | null; scopes: string[] }> {
+  const tokenUrl = cleanString(env.CF_OAUTH_TOKEN_URL, 2000);
+  const clientId = cleanString(env.CF_OAUTH_CLIENT_ID, 300);
+  const clientSecret = cleanString(env.CF_OAUTH_CLIENT_SECRET, 500);
+  if (!tokenUrl || !clientId || !clientSecret) {
+    throw new Error("cloudflare_oauth_not_configured");
+  }
+  const body = new URLSearchParams();
+  body.set("grant_type", "authorization_code");
+  body.set("code", input.code);
+  body.set("client_id", clientId);
+  body.set("client_secret", clientSecret);
+  body.set("redirect_uri", input.redirectUri);
+
+  const response = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+  const raw = cleanString(await response.text(), 5000);
+  if (!response.ok) {
+    throw new Error(`cloudflare_oauth_token_exchange_failed:${response.status}:${raw}`);
+  }
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = parseJsonObject(JSON.parse(raw));
+  } catch {
+    parsed = null;
+  }
+  if (!parsed) throw new Error("cloudflare_oauth_token_invalid_json");
+  const accessToken = cleanString(parsed.access_token, 2000);
+  if (!accessToken) throw new Error("cloudflare_oauth_access_token_missing");
+  const refreshToken = cleanString(parsed.refresh_token, 2000) || null;
+  const expiresIn = clampInt(parsed.expires_in, 0, Number.MAX_SAFE_INTEGER, 0);
+  const scopeRaw = cleanString(parsed.scope, 3000);
+  const scopes = scopeRaw
+    ? scopeRaw.split(/[,\s]+/g).map((s) => cleanString(s, 120)).filter(Boolean)
+    : [];
+  return {
+    accessToken,
+    refreshToken,
+    expiresAtMs: expiresIn > 0 ? nowMs() + expiresIn * 1000 : null,
+    scopes,
+  };
+}
+
 async function makeMemoryVectorId(input: {
   namespace: string;
   siteId: string;
@@ -9960,9 +12932,14 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const pluginV1Prefix = "/plugin/wp/v1";
+    const host = cleanString(url.hostname, 255).toLowerCase();
 
-    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/portal" || url.pathname === "/pricing")) {
-      const html = renderPortalHtml(url.hostname);
+    if (
+      (req.method === "GET" || req.method === "HEAD") &&
+      (host === "www.onboarding.aiwpdev.com" || host === "www.onboarding.aiwbdev.com") &&
+      (url.pathname === "/" || url.pathname === "/index.html")
+    ) {
+      const html = renderPortalHtml(url.hostname, env);
       return new Response(html, {
         status: 200,
         headers: {
@@ -9970,6 +12947,465 @@ export default {
           "cache-control": "no-store",
         },
       });
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && (url.pathname === "/" || url.pathname === "/portal" || url.pathname === "/pricing")) {
+      const html = renderPortalHtml(url.hostname, env);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/contact") {
+      const html = renderContactHtml(url.hostname);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/checkout") {
+      const html = renderCheckoutHtml(url.hostname, url);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/after-payment") {
+      const html = renderAfterPaymentStartHtml(url.hostname);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/after-payment/results") {
+      const html = renderAfterPaymentResultsHtml(url.hostname, url);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/after-payment/review") {
+      const html = renderAfterPaymentReviewHtml(url.hostname, url);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/post-payment/step1/prepare") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const submittedSiteUrl = cleanString(body.site_url, 2000);
+      const siteUrl = normalizeSubmittedSiteUrl(submittedSiteUrl ?? "");
+      if (!siteUrl) return Response.json({ ok: false, error: "site_url_required" }, { status: 400 });
+      const seed = await fetchSeedSiteFacts(siteUrl);
+      const normalized = normalizeSiteUpsertPayload({
+        site_url: siteUrl,
+        site_name: seed.siteName ?? cleanString(body.site_name, 200) ?? null,
+        primary_location_hint: seed.primaryLocationHint ?? null,
+        site_type_hint: "static_html_cloudflare",
+        services: seed.serviceTerms,
+        top_pages: [seed.topPage],
+        content_extract: seed.topPage.text_extract ? [seed.topPage.text_extract] : [],
+        signals: {
+          site_name: seed.siteName,
+          hosting_provider: "cloudflare",
+          runtime_hint: "static_html",
+          top_pages: [seed.topPage],
+          services: seed.serviceTerms,
+        },
+        plan: { hosting_provider: "cloudflare", runtime_hint: "static_html" },
+      });
+      const site = await upsertStep1Site(env, normalized);
+      return Response.json({
+        ok: true,
+        submitted_site_url: submittedSiteUrl ?? siteUrl,
+        normalized_site_url: site.site_url,
+        site_id: site.site_id,
+        review_url: `/after-payment/review?site_id=${encodeURIComponent(site.site_id)}`,
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/post-payment/step1/context") {
+      const siteId = cleanString(url.searchParams.get("site_id"), 120);
+      if (!siteId) return Response.json({ ok: false, error: "site_id_required" }, { status: 400 });
+      const site = await loadStep1Site(env, siteId);
+      if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      const siteInput = safeJsonParseObject(site.input_json) ?? {};
+      const services = parseStringArray(siteInput.services, 200, 120);
+      return Response.json({
+        ok: true,
+        site_id: site.site_id,
+        site_url: site.site_url,
+        business_name: cleanString(site.site_name, 200) || cleanString(siteInput.site_name, 200) || "",
+        primary_location_hint:
+          cleanString(site.primary_location_hint, 200) || cleanString(siteInput.primary_location_hint, 200) || "",
+        site_type_hint: cleanString(site.site_type_hint, 80) || "static_html_cloudflare",
+        service_terms: services,
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/post-payment/step1/confirm-run") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const siteId = cleanString(body.site_id, 120);
+      if (!siteId) return Response.json({ ok: false, error: "site_id_required" }, { status: 400 });
+      const existing = await loadStep1Site(env, siteId);
+      if (!existing) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      const existingInput = safeJsonParseObject(existing.input_json) ?? {};
+      const services = parseStringArray(body.service_terms, 200, 160);
+      const normalized = normalizeSiteUpsertPayload({
+        ...existingInput,
+        site_url: existing.site_url,
+        site_name: cleanString(body.business_name, 200) || existing.site_name,
+        primary_location_hint: cleanString(body.primary_location_hint, 200) || existing.primary_location_hint,
+        site_type_hint: cleanString(body.site_type_hint, 80) || existing.site_type_hint || "static_html_cloudflare",
+        services: services.length > 0 ? services : parseStringArray(existingInput.services, 200, 160),
+      });
+      const site = await upsertStep1Site(env, normalized);
+      try {
+        const executed = await runStep1KeywordResearch(env, site, body);
+        const resultsUrl = `/after-payment/results?site_id=${encodeURIComponent(site.site_id)}&research_run_id=${encodeURIComponent(executed.researchRunId)}`;
+        return Response.json({
+          ok: true,
+          site_id: site.site_id,
+          research_run_id: executed.researchRunId,
+          results_url: resultsUrl,
+          openai_r2_key: cleanString(parseJsonObject(executed.result["step1_openai_top20"])?.r2_key, 500) || null,
+        });
+      } catch (error) {
+        return Response.json(
+          {
+            ok: false,
+            error: cleanString((error as Error)?.message ?? error, 500) || "step1_run_failed",
+          },
+          { status: 500 }
+        );
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/post-payment/step1/run") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const submittedSiteUrl = cleanString(body.site_url, 2000);
+      const siteUrl = normalizeSubmittedSiteUrl(submittedSiteUrl ?? "");
+      if (!siteUrl) return Response.json({ ok: false, error: "site_url_required" }, { status: 400 });
+      const site = await upsertStep1Site(
+        env,
+        normalizeSiteUpsertPayload({
+          site_url: siteUrl,
+          site_name: cleanString(body.site_name, 200) || null,
+          site_type_hint: "static_html_cloudflare",
+          signals: {
+            site_name: cleanString(body.site_name, 200) || null,
+            hosting_provider: "cloudflare",
+            runtime_hint: "static_html",
+            top_pages: [],
+          },
+          plan: { hosting_provider: "cloudflare", runtime_hint: "static_html" },
+        })
+      );
+      try {
+        const executed = await runStep1KeywordResearch(env, site, body);
+        const resultsUrl = `/after-payment/results?site_id=${encodeURIComponent(site.site_id)}&research_run_id=${encodeURIComponent(executed.researchRunId)}`;
+        return Response.json({
+          ok: true,
+          submitted_site_url: submittedSiteUrl ?? siteUrl,
+          normalized_site_url: site.site_url,
+          site_id: site.site_id,
+          research_run_id: executed.researchRunId,
+          results_url: resultsUrl,
+          openai_r2_key: cleanString(parseJsonObject(executed.result["step1_openai_top20"])?.r2_key, 500) || null,
+        });
+      } catch (error) {
+        return Response.json(
+          {
+            ok: false,
+            error: cleanString((error as Error)?.message ?? error, 500) || "step1_run_failed",
+          },
+          { status: 500 }
+        );
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/post-payment/step1/results") {
+      const siteId = cleanString(url.searchParams.get("site_id"), 120);
+      const researchRunId = cleanString(url.searchParams.get("research_run_id"), 120);
+      if (!siteId || !researchRunId) {
+        return Response.json({ ok: false, error: "site_id_and_research_run_id_required" }, { status: 400 });
+      }
+      const result = await loadStep1KeywordResearchResultsByRun(env, siteId, researchRunId);
+      if (!result) {
+        return Response.json({ ok: false, error: "keyword_research_results_not_found" }, { status: 404 });
+      }
+      const openai = parseJsonObject(result.step1_openai_top20) ?? null;
+      return Response.json({
+        ok: true,
+        site_id: siteId,
+        research_run_id: researchRunId,
+        openai,
+        openai_response_json: parseJsonObject(openai?.response_json) ?? null,
+      });
+    }
+
+    if (req.method === "OPTIONS" && (url.pathname === "/api/validate-promo" || url.pathname === "/api/create-checkout-session")) {
+      return new Response(null, { status: 204, headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/validate-promo") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ error: "Missing promo or plan." }, { status: 400, headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) });
+      const plan = normalizeCheckoutPlan(body.plan);
+      const promo = normalizePromoCode(body.promo);
+      if (!plan || !promo) {
+        return Response.json({ error: "Missing promo or plan." }, { status: 400, headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) });
+      }
+      const coupon = getPromoCouponMap(env)[promo]?.[plan];
+      if (!coupon) {
+        return Response.json({ error: "Invalid promo code for this plan." }, { status: 400, headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) });
+      }
+      return Response.json(
+        { ok: true, coupon, description: `Discount applied for ${plan}.` },
+        { headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) }
+      );
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/create-checkout-session") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ error: "Missing plan or email." }, { status: 400, headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) });
+      const plan = normalizeCheckoutPlan(body.plan);
+      const email = cleanString(body.email, 320);
+      const promo = normalizePromoCode(body.promo) || null;
+      if (!plan || !email) {
+        return Response.json({ error: "Missing plan or email." }, { status: 400, headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) });
+      }
+      try {
+        const session = await createStripeCheckoutSession(env, { plan, email, promo });
+        return Response.json({ url: session.url }, { headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) });
+      } catch (error) {
+        const detail = cleanString((error as Error)?.message ?? error, 500);
+        if (detail.includes("invalid_promo_code")) {
+          return Response.json({ error: "Invalid promo code." }, { status: 400, headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) });
+        }
+        return Response.json({ error: "Unable to start checkout.", detail }, { status: 500, headers: getCheckoutCorsHeaders(req.headers.get("origin"), env) });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/contact/submit") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const name = cleanString(body.name, 200);
+      const email = cleanString(body.email, 320);
+      const company = cleanString(body.company, 200);
+      const message = cleanString(body.message, 5000);
+      if (!name || !email || !message) {
+        return Response.json({ ok: false, error: "name_email_message_required" }, { status: 400 });
+      }
+      try {
+        const contactPayload = { name, email, company, message, host: url.hostname };
+        const hasWebhook = !!cleanString(env.CONTACT_WEBHOOK_URL, 2000) && !!cleanString(env.CONTACT_WEBHOOK_SECRET, 500);
+        if (hasWebhook) {
+          await sendContactSalesWebhook(env, contactPayload);
+        } else {
+          await sendContactSalesEmail(env, contactPayload);
+        }
+      } catch (error) {
+        return Response.json(
+          {
+            ok: false,
+            error: "contact_email_send_failed",
+            detail: cleanString((error as Error)?.message ?? error, 500),
+          },
+          { status: 502 }
+        );
+      }
+      return Response.json({ ok: true });
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/portal/onboarding") {
+      const html = renderOnboardingHtml(url.hostname, url);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/onboarding/site") {
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      const siteUrl = cleanString(body.site_url, 2000);
+      if (!siteUrl) return Response.json({ ok: false, error: "site_url_required" }, { status: 400 });
+      const payload: Record<string, unknown> = {
+        site_url: siteUrl,
+        site_name: cleanString(body.site_name, 200),
+        site_type_hint: cleanString(body.site_type_hint, 120) || "static_html_cloudflare",
+        plan: parseJsonObject(body.plan) ?? {
+          hosting_provider: "cloudflare",
+          runtime_hint: "static_html",
+        },
+        signals: parseJsonObject(body.signals) ?? {
+          site_name: cleanString(body.site_name, 200),
+          hosting_provider: "cloudflare",
+          runtime_hint: "static_html",
+          top_pages: [],
+        },
+      };
+      const site = await upsertStep1Site(env, normalizeSiteUpsertPayload(payload));
+      const subscriptionId = cleanString(body.subscription_id, 120);
+      if (subscriptionId) {
+        await bindSubscriptionToSite(env, subscriptionId, site.site_id);
+      }
+      return Response.json({
+        ok: true,
+        site_id: site.site_id,
+        site_url: site.site_url,
+        next: {
+          connect_cloudflare_url: `/v1/cloudflare/connect/start?site_id=${encodeURIComponent(site.site_id)}${subscriptionId ? `&subscription_id=${encodeURIComponent(subscriptionId)}` : ""}`,
+          onboarding_url: `/portal/onboarding?site_id=${encodeURIComponent(site.site_id)}${subscriptionId ? `&subscription_id=${encodeURIComponent(subscriptionId)}` : ""}`,
+        },
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/cloudflare/connect/status") {
+      const siteId = cleanString(url.searchParams.get("site_id"), 120);
+      if (!siteId) return Response.json({ ok: false, error: "site_id_required" }, { status: 400 });
+      const site = await loadStep1Site(env, siteId);
+      if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      return Response.json(await getCloudflareConnectionStatus(env, siteId));
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/cloudflare/connect/start") {
+      const siteId = cleanString(url.searchParams.get("site_id"), 120);
+      const subscriptionId = cleanString(url.searchParams.get("subscription_id"), 120) || null;
+      if (!siteId) return Response.json({ ok: false, error: "site_id_required" }, { status: 400 });
+      const site = await loadStep1Site(env, siteId);
+      if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+
+      const authUrlBase = cleanString(env.CF_OAUTH_AUTHORIZE_URL, 2000);
+      const clientId = cleanString(env.CF_OAUTH_CLIENT_ID, 300);
+      if (!authUrlBase || !clientId) {
+        return Response.json(
+          {
+            ok: false,
+            error: "cloudflare_oauth_not_configured",
+            required_env: ["CF_OAUTH_AUTHORIZE_URL", "CF_OAUTH_CLIENT_ID", "CF_OAUTH_TOKEN_URL", "CF_OAUTH_CLIENT_SECRET", "CONNECTIONS_ENCRYPTION_KEY"],
+          },
+          { status: 503 }
+        );
+      }
+      const state = await createCloudflareOauthState(env, { siteId, subscriptionId });
+      const redirectUri = cleanString(env.CF_OAUTH_REDIRECT_URI, 2000) || `${getBaseOrigin(url)}/v1/cloudflare/connect/callback`;
+      const scopes = cleanString(env.CF_OAUTH_SCOPES, 2000) || "account.read workers.write pages.write";
+      const authUrl = new URL(authUrlBase);
+      authUrl.searchParams.set("response_type", "code");
+      authUrl.searchParams.set("client_id", clientId);
+      authUrl.searchParams.set("redirect_uri", redirectUri);
+      authUrl.searchParams.set("scope", scopes);
+      authUrl.searchParams.set("state", state);
+      return Response.redirect(authUrl.toString(), 302);
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/cloudflare/connect/callback") {
+      const code = cleanString(url.searchParams.get("code"), 4000);
+      const stateRaw = cleanString(url.searchParams.get("state"), 120);
+      const redirectUri = cleanString(env.CF_OAUTH_REDIRECT_URI, 2000) || `${getBaseOrigin(url)}/v1/cloudflare/connect/callback`;
+      if (!code || !stateRaw) {
+        return Response.json({ ok: false, error: "missing_code_or_state" }, { status: 400 });
+      }
+      const state = await consumeCloudflareOauthState(env, stateRaw);
+      if (!state) {
+        return Response.json({ ok: false, error: "invalid_or_expired_state" }, { status: 400 });
+      }
+      try {
+        const token = await exchangeCloudflareOAuthCode(env, { code, redirectUri });
+        await saveCloudflareConnection(env, {
+          siteId: state.siteId,
+          subscriptionId: state.subscriptionId,
+          status: "connected",
+          authMode: "oauth",
+          tokenPlaintext: token.accessToken,
+          scopes: token.scopes,
+          tokenExpiresAt: token.expiresAtMs,
+        });
+      } catch (error) {
+        const message = String((error as Error)?.message ?? error);
+        await saveCloudflareConnection(env, {
+          siteId: state.siteId,
+          subscriptionId: state.subscriptionId,
+          status: "connect_error",
+          authMode: "oauth",
+          tokenPlaintext: null,
+          scopes: [],
+          tokenExpiresAt: null,
+          lastError: message,
+        });
+        return Response.json({ ok: false, error: message, site_id: state.siteId }, { status: 500 });
+      }
+      return Response.redirect(
+        `/portal/onboarding?site_id=${encodeURIComponent(state.siteId)}${state.subscriptionId ? `&subscription_id=${encodeURIComponent(state.subscriptionId)}` : ""}`,
+        302
+      );
     }
 
     if (req.method === "GET" && url.pathname === "/v1/plans") {
@@ -10011,6 +13447,7 @@ export default {
           site_id: siteIdRaw || null,
           plan_key: planKey,
           contact_email: contactEmail,
+          onboarding_url: `/portal/onboarding?subscription_id=${encodeURIComponent(saved.subscriptionId)}${siteIdRaw ? `&site_id=${encodeURIComponent(siteIdRaw)}` : ""}`,
         });
       } catch (error) {
         const message = String((error as Error)?.message ?? error);
@@ -10611,6 +14048,30 @@ export default {
       const profile = safeJsonParseObject(saved.site_profile_json) ?? {};
       const savedInput = safeJsonParseObject(saved.input_json) ?? {};
       const plan = getSitePlanFromInput(savedInput);
+      let initialEnrichment: Record<string, unknown> | null = null;
+      if (saved.is_new_install) {
+        const run = await runInitialApifyActorBootstrap(env, saved, "plugin_site_upsert_initial_install");
+        initialEnrichment = run.ok
+          ? {
+              status: run.skipped ? "skipped" : "succeeded",
+              run_id: run.run_id,
+              actor_id: run.actor_id,
+              actor_url: run.actor_url,
+              domain: run.domain,
+              item_count: run.item_count,
+              job_id: run.job_id,
+              r2_key: run.r2_key,
+            }
+          : {
+              status: run.skipped ? "skipped" : "failed",
+              run_id: run.run_id,
+              actor_id: run.actor_id,
+              actor_url: run.actor_url,
+              domain: run.domain,
+              job_id: run.job_id,
+              error: run.error,
+            };
+      }
       return Response.json({
         ok: true,
         site_brief_id: saved.site_id,
@@ -10640,7 +14101,40 @@ export default {
             ? `Local metro tracking enabled: ${plan.metro ?? "configured"}`
             : "Local metro tracking disabled",
         },
+        initial_enrichment: initialEnrichment,
         analyzed_at: saved.last_analysis_at,
+      });
+    }
+
+    const pluginInitialEnrichmentSiteId = parseSiteIdFromPrefixedPath(
+      url.pathname,
+      `${pluginV1Prefix}/sites/`,
+      "/initial-enrichment/latest"
+    );
+    if (req.method === "GET" && pluginInitialEnrichmentSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const site = await loadStep1Site(env, pluginInitialEnrichmentSiteId);
+      if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      const latest = await loadLatestInitialEnrichmentRun(env, site.site_id);
+      if (!latest) {
+        return Response.json({ ok: false, error: "initial_enrichment_not_found" }, { status: 404 });
+      }
+      const includeData = parseBool(url.searchParams.get("include_data"), false);
+      let data: unknown = null;
+      if (includeData) {
+        const r2Ref = cleanString(latest.r2_key, 500);
+        const r2Key = r2Ref.startsWith("r2://") ? r2Ref.slice("r2://".length) : r2Ref;
+        const object = r2Key && env.MEMORY_R2 ? await env.MEMORY_R2.get(r2Key) : null;
+        data = object ? await object.json() : null;
+      }
+      return Response.json({
+        ok: true,
+        site_id: site.site_id,
+        latest_run: latest,
+        data,
       });
     }
 
@@ -11008,6 +14502,42 @@ export default {
       });
     }
 
+    const pluginStep3ExecuteSiteId = parseSiteIdFromPrefixedPath(url.pathname, `${pluginV1Prefix}/sites/`, "/step3/execute");
+    if (req.method === "POST" && pluginStep3ExecuteSiteId) {
+      const verified = await verifySignedPluginRequest(req, env);
+      if (verified.ok === false) {
+        return verified.response;
+      }
+      const site = await loadStep1Site(env, pluginStep3ExecuteSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const runIdRequested = cleanString(verified.body.site_run_id ?? verified.body.run_id, 120) || null;
+      const runMeta = await loadStep3RunMeta(env, { siteId: site.site_id, runId: runIdRequested });
+      if (!runMeta) {
+        return Response.json({ ok: false, error: "step3_run_not_found" }, { status: 404 });
+      }
+      const rawModes = parseStringListInput(verified.body.route_modes, 10, 20).map((v) => v.toUpperCase());
+      const modes: Step3TaskMode[] = (rawModes.length > 0 ? rawModes : ["AUTO", "DIY", "TEAM"]).filter(
+        (v): v is Step3TaskMode => v === "AUTO" || v === "DIY" || v === "TEAM"
+      );
+      const issuerWallet = cleanString(verified.body.issuer_wallet, 200) || cleanString(env.TEAM_ISSUER_WALLET, 200);
+      if (modes.includes("TEAM") && !issuerWallet) {
+        return Response.json({ ok: false, error: "issuer_wallet_required_for_team_routing" }, { status: 400 });
+      }
+      const orchestration = await runStep3ExecutionOrchestrator(env, {
+        siteId: site.site_id,
+        runId: runMeta.run_id,
+        autoApplyAutoTasks: parseBoolUnknown(verified.body.auto_apply_auto_tasks, false),
+        routeModes: modes,
+        issuerWallet: issuerWallet || "unknown",
+        deadlineDays: clampInt(verified.body.team_deadline_days, 1, 90, 7),
+        payoutToken: cleanString(verified.body.team_payout_token, 40) || "USDC",
+        payoutChain: cleanString(verified.body.team_payout_chain, 40) || null,
+      });
+      return Response.json({ ok: true, ...orchestration });
+    }
+
     const pluginTaskDetailMatch = url.pathname.match(/^\/plugin\/wp\/v1\/sites\/([^/]+)\/tasks\/([^/]+)$/);
     if (pluginTaskDetailMatch && req.method === "POST") {
       const verified = await verifySignedPluginRequest(req, env);
@@ -11111,6 +14641,30 @@ export default {
       const profile = safeJsonParseObject(saved.site_profile_json) ?? {};
       const savedInput = safeJsonParseObject(saved.input_json) ?? {};
       const plan = getSitePlanFromInput(savedInput);
+      let initialEnrichment: Record<string, unknown> | null = null;
+      if (saved.is_new_install) {
+        const run = await runInitialApifyActorBootstrap(env, saved, "site_upsert_initial_install");
+        initialEnrichment = run.ok
+          ? {
+              status: run.skipped ? "skipped" : "succeeded",
+              run_id: run.run_id,
+              actor_id: run.actor_id,
+              actor_url: run.actor_url,
+              domain: run.domain,
+              item_count: run.item_count,
+              job_id: run.job_id,
+              r2_key: run.r2_key,
+            }
+          : {
+              status: run.skipped ? "skipped" : "failed",
+              run_id: run.run_id,
+              actor_id: run.actor_id,
+              actor_url: run.actor_url,
+              domain: run.domain,
+              job_id: run.job_id,
+              error: run.error,
+            };
+      }
       return Response.json({
         ok: true,
         site_brief_id: saved.site_id,
@@ -11140,7 +14694,34 @@ export default {
             ? `Local metro tracking enabled: ${plan.metro ?? "configured"}`
             : "Local metro tracking disabled",
         },
+        initial_enrichment: initialEnrichment,
         analyzed_at: saved.last_analysis_at,
+      });
+    }
+
+    const siteInitialEnrichmentSiteId = parseSiteIdFromPath(url.pathname, "/initial-enrichment/latest");
+    if (req.method === "GET" && siteInitialEnrichmentSiteId) {
+      const site = await loadStep1Site(env, siteInitialEnrichmentSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      const latest = await loadLatestInitialEnrichmentRun(env, site.site_id);
+      if (!latest) {
+        return Response.json({ ok: false, error: "initial_enrichment_not_found" }, { status: 404 });
+      }
+      const includeData = parseBool(url.searchParams.get("include_data"), false);
+      let data: unknown = null;
+      if (includeData) {
+        const r2Ref = cleanString(latest.r2_key, 500);
+        const r2Key = r2Ref.startsWith("r2://") ? r2Ref.slice("r2://".length) : r2Ref;
+        const object = r2Key && env.MEMORY_R2 ? await env.MEMORY_R2.get(r2Key) : null;
+        data = object ? await object.json() : null;
+      }
+      return Response.json({
+        ok: true,
+        site_id: site.site_id,
+        latest_run: latest,
+        data,
       });
     }
 
@@ -11399,6 +14980,47 @@ export default {
           by_id: Object.fromEntries(tasks.map((task) => [task.task_id, task])),
         },
       });
+    }
+
+    const siteStep3ExecuteSiteId = parseSiteIdFromPath(url.pathname, "/step3/execute");
+    if (req.method === "POST" && siteStep3ExecuteSiteId) {
+      const site = await loadStep1Site(env, siteStep3ExecuteSiteId);
+      if (!site) {
+        return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
+      }
+      let body: Record<string, unknown> | null = null;
+      try {
+        body = parseJsonObject(await req.json());
+      } catch {
+        body = null;
+      }
+      if (!body) {
+        return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+      }
+      const runIdRequested = cleanString(body.site_run_id ?? body.run_id, 120) || null;
+      const runMeta = await loadStep3RunMeta(env, { siteId: site.site_id, runId: runIdRequested });
+      if (!runMeta) {
+        return Response.json({ ok: false, error: "step3_run_not_found" }, { status: 404 });
+      }
+      const rawModes = parseStringListInput(body.route_modes, 10, 20).map((v) => v.toUpperCase());
+      const modes: Step3TaskMode[] = (rawModes.length > 0 ? rawModes : ["AUTO", "DIY", "TEAM"]).filter(
+        (v): v is Step3TaskMode => v === "AUTO" || v === "DIY" || v === "TEAM"
+      );
+      const issuerWallet = cleanString(body.issuer_wallet, 200) || cleanString(env.TEAM_ISSUER_WALLET, 200);
+      if (modes.includes("TEAM") && !issuerWallet) {
+        return Response.json({ ok: false, error: "issuer_wallet_required_for_team_routing" }, { status: 400 });
+      }
+      const orchestration = await runStep3ExecutionOrchestrator(env, {
+        siteId: site.site_id,
+        runId: runMeta.run_id,
+        autoApplyAutoTasks: parseBoolUnknown(body.auto_apply_auto_tasks, false),
+        routeModes: modes,
+        issuerWallet: issuerWallet || "unknown",
+        deadlineDays: clampInt(body.team_deadline_days, 1, 90, 7),
+        payoutToken: cleanString(body.team_payout_token, 40) || "USDC",
+        payoutChain: cleanString(body.team_payout_chain, 40) || null,
+      });
+      return Response.json({ ok: true, ...orchestration });
     }
 
     const siteTasksBoardSiteId = parseSiteIdFromPath(url.pathname, "/tasks/board");
