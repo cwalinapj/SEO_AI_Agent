@@ -12982,7 +12982,10 @@ export default {
       });
     }
 
-    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/after-payment") {
+    if (
+      (req.method === "GET" || req.method === "HEAD") &&
+      (url.pathname === "/after-payment" || url.pathname === "/after-payment/")
+    ) {
       const html = renderAfterPaymentStartHtml(url.hostname);
       return new Response(html, {
         status: 200,
@@ -12993,7 +12996,10 @@ export default {
       });
     }
 
-    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/after-payment/results") {
+    if (
+      (req.method === "GET" || req.method === "HEAD") &&
+      (url.pathname === "/after-payment/results" || url.pathname === "/after-payment/results/")
+    ) {
       const html = renderAfterPaymentResultsHtml(url.hostname, url);
       return new Response(html, {
         status: 200,
@@ -13004,7 +13010,10 @@ export default {
       });
     }
 
-    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/after-payment/review") {
+    if (
+      (req.method === "GET" || req.method === "HEAD") &&
+      (url.pathname === "/after-payment/review" || url.pathname === "/after-payment/review/")
+    ) {
       const html = renderAfterPaymentReviewHtml(url.hostname, url);
       return new Response(html, {
         status: 200,
