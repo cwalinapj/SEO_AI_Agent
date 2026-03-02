@@ -6098,6 +6098,169 @@ async function loadStep1KeywordResearchResultsByRun(
   return safeJsonParseObject(cleanString(row.payload_json, 1_000_000));
 }
 
+type Step1ParsedKeywordVariable = {
+  index: number;
+  keyword: string;
+  reason: string | null;
+};
+
+function tryParseJsonFromFreeText(raw: string): Record<string, unknown> | null {
+  const text = cleanString(raw, 400_000);
+  if (!text) return null;
+  const direct = safeJsonParseObject(text);
+  if (direct) return direct;
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) {
+    const parsedFence = safeJsonParseObject(cleanString(fenced[1], 400_000));
+    if (parsedFence) return parsedFence;
+  }
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    const sliced = cleanString(text.slice(start, end + 1), 400_000);
+    const parsedSlice = safeJsonParseObject(sliced);
+    if (parsedSlice) return parsedSlice;
+  }
+  return null;
+}
+
+function extractOutputTextFromOpenAiResponse(responseJson: Record<string, unknown> | null): string {
+  if (!responseJson) return "";
+  const direct = cleanString(responseJson.output_text, 400_000);
+  if (direct) return direct;
+  const output = Array.isArray(responseJson.output) ? responseJson.output : [];
+  const chunks: string[] = [];
+  for (const item of output) {
+    const obj = parseJsonObject(item);
+    if (!obj) continue;
+    const content = Array.isArray(obj.content) ? obj.content : [];
+    for (const c of content) {
+      const cobj = parseJsonObject(c);
+      if (!cobj) continue;
+      const txt = cleanString(cobj.text, 200_000);
+      if (txt) chunks.push(txt);
+    }
+  }
+  return cleanString(chunks.join("\n"), 400_000);
+}
+
+function extractStep1Top20FromOpenAi(openAiObject: Record<string, unknown> | null): Step1ParsedKeywordVariable[] {
+  const responseJson = parseJsonObject(openAiObject?.response_json);
+  const outputText = extractOutputTextFromOpenAiResponse(responseJson);
+  const payload = tryParseJsonFromFreeText(outputText);
+  const arr = Array.isArray(payload?.top_20_keywords) ? payload?.top_20_keywords : [];
+  const out: Step1ParsedKeywordVariable[] = [];
+  for (const row of arr) {
+    const obj = parseJsonObject(row);
+    if (!obj) continue;
+    const keyword = cleanString(obj.keyword, 300);
+    if (!keyword) continue;
+    const reason = cleanString(obj.reason, 2000) || null;
+    out.push({ index: out.length + 1, keyword, reason });
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+function extractTop20FromResultFallback(result: Record<string, unknown>): Step1ParsedKeywordVariable[] {
+  const out: Step1ParsedKeywordVariable[] = [];
+  const primary = Array.isArray(result.primary_top_10) ? result.primary_top_10 : [];
+  const secondary = Array.isArray(result.secondary_top_10) ? result.secondary_top_10 : [];
+  for (const row of [...primary, ...secondary]) {
+    const obj = parseJsonObject(row);
+    if (!obj) continue;
+    const keyword = cleanString(obj.keyword, 300);
+    if (!keyword) continue;
+    out.push({
+      index: out.length + 1,
+      keyword,
+      reason: cleanString(obj.reason, 2000) || null,
+    });
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+async function loadSavedStep1ParsedKeywords(
+  env: Env,
+  siteId: string,
+  researchRunId: string
+): Promise<Record<string, unknown> | null> {
+  const row = await env.DB.prepare(
+    `SELECT payload_json
+     FROM wp_ai_seo_selections
+     WHERE site_id = ? AND research_run_id = ? AND selection_type = 'step1_parsed_keyword_variables'
+     LIMIT 1`
+  )
+    .bind(siteId, researchRunId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return safeJsonParseObject(cleanString(row.payload_json, 1_000_000));
+}
+
+async function saveStep1ParsedKeywords(
+  env: Env,
+  input: {
+    siteId: string;
+    researchRunId: string;
+    payload: Record<string, unknown>;
+  }
+): Promise<void> {
+  const ts = nowMs();
+  await env.DB.prepare(
+    `INSERT INTO wp_ai_seo_selections (
+      selection_id, site_id, research_run_id, selection_type, payload_json, created_at
+    ) VALUES (?, ?, ?, 'step1_parsed_keyword_variables', ?, ?)
+    ON CONFLICT(site_id, research_run_id, selection_type) DO UPDATE SET
+      payload_json = excluded.payload_json,
+      created_at = excluded.created_at`
+  )
+    .bind(uuid("sel"), input.siteId, input.researchRunId, safeJsonStringify(input.payload, 1_000_000), ts)
+    .run();
+}
+
+async function getOrBuildStep1ParsedKeywords(
+  env: Env,
+  input: { siteId: string; researchRunId: string }
+): Promise<Record<string, unknown> | null> {
+  const existing = await loadSavedStep1ParsedKeywords(env, input.siteId, input.researchRunId);
+  if (existing) {
+    const hasVars =
+      parseJsonObject(existing.keyword_variables) != null || parseJsonObject(existing.reason_variables) != null;
+    if (hasVars) return existing;
+  }
+  const result = await loadStep1KeywordResearchResultsByRun(env, input.siteId, input.researchRunId);
+  if (!result) return null;
+  const site = await loadStep1Site(env, input.siteId);
+  const openAiObject = parseJsonObject(result.step1_openai_top20);
+  let keywords = extractStep1Top20FromOpenAi(openAiObject);
+  if (keywords.length === 0) keywords = extractTop20FromResultFallback(result);
+  keywords = keywords.slice(0, 20).map((k, idx) => ({ ...k, index: idx + 1 }));
+  const keywordVariables: Record<string, string> = {};
+  const reasonVariables: Record<string, string> = {};
+  for (const row of keywords) {
+    keywordVariables[`keyword_${row.index}`] = row.keyword;
+    if (cleanString(row.reason, 4000)) {
+      reasonVariables[`reason_${row.index}`] = cleanString(row.reason, 4000);
+    }
+  }
+  const payload: Record<string, unknown> = {
+    site_id: input.siteId,
+    research_run_id: input.researchRunId,
+    url: cleanString(site?.site_url, 2000) || cleanString(result.site_url, 2000) || "",
+    generated_at: nowMs(),
+    keywords,
+    keyword_variables: keywordVariables,
+    reason_variables: reasonVariables,
+  };
+  await saveStep1ParsedKeywords(env, {
+    siteId: input.siteId,
+    researchRunId: input.researchRunId,
+    payload,
+  });
+  return payload;
+}
+
 function renderAfterPaymentStartHtml(hostname: string): string {
   return `<!doctype html>
 <html lang="en">
@@ -6203,7 +6366,7 @@ function renderAfterPaymentReviewHtml(hostname: string, currentUrl: URL): string
       <input id="primary-location" placeholder="City, State" />
       <label>Service terms (comma-separated)</label>
       <textarea id="service-terms" placeholder=""></textarea>
-      <button id="run-step1">Run Step 1 + OpenAI Finalization</button>
+      <button id="run-step1">Run Step 1</button>
       <p id="status" class="status"></p>
     </section>
   </main>
@@ -6294,6 +6457,132 @@ function renderAfterPaymentResultsHtml(hostname: string, currentUrl: URL): strin
       const res = await fetch("/v1/post-payment/step1/results?" + q.toString());
       const data = await res.json().catch(() => ({}));
       document.getElementById("json").textContent = JSON.stringify(data, null, 2);
+    }
+    load();
+  </script>
+</body>
+</html>`;
+}
+
+function renderAfterPaymentParsedResultsHtml(hostname: string, currentUrl: URL): string {
+  const siteId = cleanString(currentUrl.searchParams.get("site_id"), 120);
+  const runId = cleanString(currentUrl.searchParams.get("research_run_id"), 120);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Step 1 Parsed Keywords</title>
+  <style>
+    :root{--bg:#0b0f17;--card:#101826;--text:#e7eefc;--muted:#a9b6d0;--border:rgba(255,255,255,.14)}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Space Grotesk","Sora","Avenir Next",sans-serif;color:var(--text);background:radial-gradient(1200px 600px at 50% -10%, rgba(106,169,255,.18), transparent 60%), var(--bg);}
+    .wrap{max-width:980px;margin:0 auto;padding:28px 18px 64px}
+    .host,.meta{font-size:12px;color:var(--muted);margin-bottom:8px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px}
+    h1{margin:0 0 10px;font-size:30px}
+    .url{font-size:15px;word-break:break-all;margin:8px 0 16px}
+    .list{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    @media (max-width:900px){.list{grid-template-columns:1fr}}
+    .item{display:block;padding:12px;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.03);text-decoration:none;color:var(--text)}
+    .item:hover{background:rgba(255,255,255,.08)}
+    .idx{color:var(--muted);font-size:12px;display:block}
+    .status{color:var(--muted);font-size:13px}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="host">${htmlEscape(hostname)}</div>
+    <section class="card">
+      <h1>Step 1 Parsed Output</h1>
+      <div class="meta">site_id: ${htmlEscape(siteId)} | research_run_id: ${htmlEscape(runId)}</div>
+      <div id="url" class="url"></div>
+      <div id="list" class="list"></div>
+      <p id="status" class="status"></p>
+    </section>
+  </main>
+  <script>
+    async function load() {
+      const siteId = ${JSON.stringify(siteId)};
+      const runId = ${JSON.stringify(runId)};
+      const statusEl = document.getElementById("status");
+      const urlEl = document.getElementById("url");
+      const listEl = document.getElementById("list");
+      const q = new URLSearchParams({ site_id: siteId, research_run_id: runId });
+      const res = await fetch("/v1/post-payment/step1/results/parsed?" + q.toString());
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        statusEl.textContent = "Failed: " + (data.error || res.status);
+        return;
+      }
+      urlEl.textContent = "URL = " + (data.url || "");
+      const keywords = Array.isArray(data.keywords) ? data.keywords : [];
+      for (const row of keywords) {
+        if (!row || typeof row !== "object") continue;
+        const idx = Number(row.index || 0);
+        const keyword = String(row.keyword || "");
+        if (!idx || !keyword) continue;
+        const a = document.createElement("a");
+        a.className = "item";
+        a.href = "/after-payment/results/keyword" + idx + "?site_id=" + encodeURIComponent(siteId) + "&research_run_id=" + encodeURIComponent(runId);
+        a.innerHTML = '<span class="idx">Keyword ' + idx + ' =</span>' + keyword.replace(/</g, "&lt;");
+        listEl.appendChild(a);
+      }
+      if (keywords.length === 0) statusEl.textContent = "No parsed keywords were found.";
+    }
+    load();
+  </script>
+</body>
+</html>`;
+}
+
+function renderAfterPaymentKeywordDetailHtml(hostname: string, currentUrl: URL, keywordIndex: number): string {
+  const siteId = cleanString(currentUrl.searchParams.get("site_id"), 120);
+  const runId = cleanString(currentUrl.searchParams.get("research_run_id"), 120);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Keyword ${keywordIndex} Detail</title>
+  <style>
+    :root{--bg:#0b0f17;--card:#101826;--text:#e7eefc;--muted:#a9b6d0;--border:rgba(255,255,255,.14)}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Space Grotesk","Sora","Avenir Next",sans-serif;color:var(--text);background:radial-gradient(1200px 600px at 50% -10%, rgba(106,169,255,.18), transparent 60%), var(--bg);}
+    .wrap{max-width:900px;margin:0 auto;padding:28px 18px 64px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px}
+    .meta{font-size:12px;color:var(--muted);margin-bottom:10px}
+    h1{margin:0 0 8px;font-size:28px}
+    .k{font-size:20px;margin:8px 0 14px}
+    .reason{padding:14px;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.03);line-height:1.5}
+    a{color:#9ec6ff}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <div class="meta">site_id: ${htmlEscape(siteId)} | research_run_id: ${htmlEscape(runId)}</div>
+      <h1>Keyword ${keywordIndex}</h1>
+      <div id="keyword" class="k"></div>
+      <div id="reason" class="reason"></div>
+      <p><a href="/after-payment/results/parsed?site_id=${encodeURIComponent(siteId)}&research_run_id=${encodeURIComponent(runId)}">Back to parsed keyword list</a></p>
+    </section>
+  </main>
+  <script>
+    async function load() {
+      const siteId = ${JSON.stringify(siteId)};
+      const runId = ${JSON.stringify(runId)};
+      const idx = ${JSON.stringify(keywordIndex)};
+      const q = new URLSearchParams({ site_id: siteId, research_run_id: runId, keyword_index: String(idx) });
+      const res = await fetch("/v1/post-payment/step1/results/keyword?" + q.toString());
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        document.getElementById("keyword").textContent = "Not found";
+        document.getElementById("reason").textContent = data.error || String(res.status);
+        return;
+      }
+      document.getElementById("keyword").textContent = "Keyword " + idx + " = " + (data.keyword || "");
+      document.getElementById("reason").textContent = data.reason || "No reason provided.";
     }
     load();
   </script>
@@ -6443,6 +6732,84 @@ async function fetchSeedSiteFacts(siteUrl: string): Promise<{
       },
     };
   }
+}
+
+function buildSeedUrlCandidates(siteUrl: string): string[] {
+  const normalized = normalizeSubmittedSiteUrl(siteUrl);
+  if (!normalized) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (u: string) => {
+    if (!u || seen.has(u)) return;
+    seen.add(u);
+    out.push(u);
+  };
+  add(normalized);
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    const path = `${parsed.pathname || ""}${parsed.search || ""}${parsed.hash || ""}`;
+    if (host.startsWith("www.")) {
+      add(`${parsed.protocol}//${host.slice(4)}${path}`);
+    } else {
+      add(`${parsed.protocol}//www.${host}${path}`);
+    }
+  } catch {
+    // ignore
+  }
+  return out.slice(0, 3);
+}
+
+function scoreSeedFacts(input: {
+  siteName: string | null;
+  primaryLocationHint: string | null;
+  serviceTerms: string[];
+  topPage: { title: string; h1: string; meta: string; text_extract: string };
+}): number {
+  let score = 0;
+  if (cleanString(input.siteName, 200)) score += 3;
+  if (cleanString(input.primaryLocationHint, 200)) score += 3;
+  if (input.serviceTerms.length > 0) score += Math.min(input.serviceTerms.length, 6);
+  if (cleanString(input.topPage.title, 300)) score += 1;
+  if (cleanString(input.topPage.h1, 300)) score += 1;
+  if (cleanString(input.topPage.meta, 400)) score += 1;
+  if (cleanString(input.topPage.text_extract, 4000).length >= 120) score += 2;
+  return score;
+}
+
+async function fetchSeedSiteFactsWithFallback(siteUrl: string): Promise<{
+  resolvedUrl: string;
+  siteName: string | null;
+  primaryLocationHint: string | null;
+  serviceTerms: string[];
+  topPage: { url: string; title: string; h1: string; meta: string; text_extract: string };
+}> {
+  const candidates = buildSeedUrlCandidates(siteUrl);
+  const first = normalizeSubmittedSiteUrl(siteUrl) ?? siteUrl;
+  if (candidates.length === 0) {
+    const seed = await fetchSeedSiteFacts(first);
+    return { resolvedUrl: first, ...seed };
+  }
+  let best: (Awaited<ReturnType<typeof fetchSeedSiteFacts>> & { resolvedUrl: string; score: number }) | null = null;
+  for (const candidate of candidates) {
+    const seed = await fetchSeedSiteFacts(candidate);
+    const score = scoreSeedFacts(seed);
+    if (!best || score > best.score) {
+      best = { ...seed, resolvedUrl: candidate, score };
+    }
+    if (score >= 8) break;
+  }
+  if (!best) {
+    const seed = await fetchSeedSiteFacts(first);
+    return { resolvedUrl: first, ...seed };
+  }
+  return {
+    resolvedUrl: best.resolvedUrl,
+    siteName: best.siteName,
+    primaryLocationHint: best.primaryLocationHint,
+    serviceTerms: best.serviceTerms,
+    topPage: best.topPage,
+  };
 }
 
 async function runStep1OpenAiTop20Finalization(
@@ -13012,6 +13379,33 @@ export default {
 
     if (
       (req.method === "GET" || req.method === "HEAD") &&
+      (url.pathname === "/after-payment/results/parsed" || url.pathname === "/after-payment/results/parsed/")
+    ) {
+      const html = renderAfterPaymentParsedResultsHtml(url.hostname, url);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    const keywordRouteMatch = url.pathname.match(/^\/after-payment\/results\/keyword(\d{1,2})\/?$/);
+    if ((req.method === "GET" || req.method === "HEAD") && keywordRouteMatch) {
+      const keywordIndex = clampInt(Number(keywordRouteMatch[1] ?? 0), 1, 20, 1);
+      const html = renderAfterPaymentKeywordDetailHtml(url.hostname, url, keywordIndex);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    if (
+      (req.method === "GET" || req.method === "HEAD") &&
       (url.pathname === "/after-payment/review" || url.pathname === "/after-payment/review/")
     ) {
       const html = renderAfterPaymentReviewHtml(url.hostname, url);
@@ -13035,9 +13429,9 @@ export default {
       const submittedSiteUrl = cleanString(body.site_url, 2000);
       const siteUrl = normalizeSubmittedSiteUrl(submittedSiteUrl ?? "");
       if (!siteUrl) return Response.json({ ok: false, error: "site_url_required" }, { status: 400 });
-      const seed = await fetchSeedSiteFacts(siteUrl);
+      const seed = await fetchSeedSiteFactsWithFallback(siteUrl);
       const normalized = normalizeSiteUpsertPayload({
-        site_url: siteUrl,
+        site_url: seed.resolvedUrl || siteUrl,
         site_name: seed.siteName ?? cleanString(body.site_name, 200) ?? null,
         primary_location_hint: seed.primaryLocationHint ?? null,
         site_type_hint: "static_html_cloudflare",
@@ -13069,14 +13463,23 @@ export default {
       const site = await loadStep1Site(env, siteId);
       if (!site) return Response.json({ ok: false, error: "site_not_found" }, { status: 404 });
       const siteInput = safeJsonParseObject(site.input_json) ?? {};
-      const services = parseStringArray(siteInput.services, 200, 120);
+      let businessName =
+        cleanString(site.site_name, 200) || cleanString(siteInput.site_name, 200) || "";
+      let primaryLocationHint =
+        cleanString(site.primary_location_hint, 200) || cleanString(siteInput.primary_location_hint, 200) || "";
+      let services = parseStringArray(siteInput.services, 200, 120);
+      if (!businessName || !primaryLocationHint || services.length === 0) {
+        const seed = await fetchSeedSiteFactsWithFallback(site.site_url);
+        if (!businessName) businessName = cleanString(seed.siteName, 200) || "";
+        if (!primaryLocationHint) primaryLocationHint = cleanString(seed.primaryLocationHint, 200) || "";
+        if (services.length === 0) services = seed.serviceTerms.slice(0, 20);
+      }
       return Response.json({
         ok: true,
         site_id: site.site_id,
         site_url: site.site_url,
-        business_name: cleanString(site.site_name, 200) || cleanString(siteInput.site_name, 200) || "",
-        primary_location_hint:
-          cleanString(site.primary_location_hint, 200) || cleanString(siteInput.primary_location_hint, 200) || "",
+        business_name: businessName,
+        primary_location_hint: primaryLocationHint,
         site_type_hint: cleanString(site.site_type_hint, 80) || "static_html_cloudflare",
         service_terms: services,
       });
@@ -13192,6 +13595,54 @@ export default {
         research_run_id: researchRunId,
         openai,
         openai_response_json: parseJsonObject(openai?.response_json) ?? null,
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/post-payment/step1/results/parsed") {
+      const siteId = cleanString(url.searchParams.get("site_id"), 120);
+      const researchRunId = cleanString(url.searchParams.get("research_run_id"), 120);
+      if (!siteId || !researchRunId) {
+        return Response.json({ ok: false, error: "site_id_and_research_run_id_required" }, { status: 400 });
+      }
+      const parsed = await getOrBuildStep1ParsedKeywords(env, { siteId, researchRunId });
+      if (!parsed) {
+        return Response.json({ ok: false, error: "parsed_keywords_not_found" }, { status: 404 });
+      }
+      return Response.json({
+        ok: true,
+        site_id: siteId,
+        research_run_id: researchRunId,
+        url: cleanString(parsed.url, 2000) || "",
+        keywords: Array.isArray(parsed.keywords) ? parsed.keywords : [],
+        keyword_variables: parseJsonObject(parsed.keyword_variables) ?? {},
+        reason_variables: parseJsonObject(parsed.reason_variables) ?? {},
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/post-payment/step1/results/keyword") {
+      const siteId = cleanString(url.searchParams.get("site_id"), 120);
+      const researchRunId = cleanString(url.searchParams.get("research_run_id"), 120);
+      const keywordIndex = clampInt(Number(url.searchParams.get("keyword_index") ?? 0), 1, 20, 1);
+      if (!siteId || !researchRunId) {
+        return Response.json({ ok: false, error: "site_id_and_research_run_id_required" }, { status: 400 });
+      }
+      const parsed = await getOrBuildStep1ParsedKeywords(env, { siteId, researchRunId });
+      if (!parsed) {
+        return Response.json({ ok: false, error: "parsed_keywords_not_found" }, { status: 404 });
+      }
+      const rows = Array.isArray(parsed.keywords) ? parsed.keywords : [];
+      const rowObj = parseJsonObject(
+        rows.find((row) => clampInt(Number(parseJsonObject(row)?.index ?? 0), 1, 20, 0) === keywordIndex)
+      );
+      if (!rowObj) return Response.json({ ok: false, error: "keyword_not_found" }, { status: 404 });
+      return Response.json({
+        ok: true,
+        site_id: siteId,
+        research_run_id: researchRunId,
+        keyword_index: keywordIndex,
+        keyword: cleanString(rowObj.keyword, 300) || "",
+        reason: cleanString(rowObj.reason, 4000) || "",
+        url: cleanString(parsed.url, 2000) || "",
       });
     }
 
