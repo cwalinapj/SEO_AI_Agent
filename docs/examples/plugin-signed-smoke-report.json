@@ -1,0 +1,50 @@
+{
+  "upsert": {
+    "status": 200,
+    "ok": true,
+    "site_id": "site_7e1d2844ed0c431e31d1a2c610331f86527fe2ae213",
+    "error": null
+  },
+  "keyword_research": {
+    "status": 200,
+    "ok": true,
+    "job_id": "job_8b1fae30-466a-4822-b869-7c2549f98ee6",
+    "error": null
+  },
+  "step2_run": {
+    "status": 200,
+    "ok": true,
+    "job_id": "job_43d4b318-f3b4-484b-9b9e-002f9500ddaa",
+    "error": null
+  },
+  "step3_plan": {
+    "status": 200,
+    "ok": true,
+    "job_id": "job_f9a6c82b-04d2-4b5e-a142-f2d715b6dcd6",
+    "error": null
+  },
+  "tasks_board": {
+    "status": 200,
+    "ok": true,
+    "total": 17,
+    "error": null
+  },
+  "step3_tasks": {
+    "status": 200,
+    "ok": true,
+    "count": 14,
+    "error": null
+  },
+  "memory_upsert": {
+    "status": 500,
+    "ok": false,
+    "memory_id": null,
+    "error": "VECTOR_UPSERT_ERROR (code = 40008): id too long; max is 64 bytes, got 104 bytes"
+  },
+  "memory_search": {
+    "status": 500,
+    "ok": false,
+    "count": null,
+    "error": "VECTOR_QUERY_ERROR (code = 40006): invalid query vector, expected 1536 dimensions, and got 3072 dimensions"
+  }
+}

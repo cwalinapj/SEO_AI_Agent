@@ -1,0 +1,350 @@
+[{
+  "data_captured_at": "2026-03-02T01:51:12.527288",
+  "type": "domain_authority",
+  "last_updated": "2026-03-02T01:51:12.527271",
+  "domain": "https://supremexdetail.com",
+  "domain_age_years": 2.7041095890410958,
+  "authority_score": 7,
+  "page_authority_score": 25,
+  "trust_score": 3,
+  "spam_score": 1,
+  "offpage_seo_score_percentage": 0.44,
+  "authority_score_last_month": 7,
+  "authority_score_month_over_month_change": 0,
+  "authority_score_history": [
+    {
+      "date": "2023-06-01T00:00:00",
+      "domain_authority": 1
+    },
+    {
+      "date": "2023-07-01T00:00:00",
+      "domain_authority": 1
+    },
+    {
+      "date": "2023-08-01T00:00:00",
+      "domain_authority": 1
+    },
+    {
+      "date": "2023-09-01T00:00:00",
+      "domain_authority": 1
+    },
+    {
+      "date": "2023-10-01T00:00:00",
+      "domain_authority": 3
+    },
+    {
+      "date": "2023-11-01T00:00:00",
+      "domain_authority": 5
+    },
+    {
+      "date": "2023-12-01T00:00:00",
+      "domain_authority": 4
+    },
+    {
+      "date": "2024-01-01T00:00:00",
+      "domain_authority": 5
+    },
+    {
+      "date": "2024-02-01T00:00:00",
+      "domain_authority": 5
+    },
+    {
+      "date": "2024-03-01T00:00:00",
+      "domain_authority": 5
+    },
+    {
+      "date": "2024-04-01T00:00:00",
+      "domain_authority": 6
+    },
+    {
+      "date": "2024-05-01T00:00:00",
+      "domain_authority": 7
+    },
+    {
+      "date": "2024-06-01T00:00:00",
+      "domain_authority": 7
+    },
+    {
+      "date": "2024-07-01T00:00:00",
+      "domain_authority": 7
+    },
+    {
+      "date": "2024-08-01T00:00:00",
+      "domain_authority": 7
+    },
+    {
+      "date": "2024-09-01T00:00:00",
+      "domain_authority": 7
+    },
+    {
+      "date": "2024-10-01T00:00:00",
+      "domain_authority": 8
+    },
+    {
+      "date": "2024-11-01T00:00:00",
+      "domain_authority": 8
+    },
+    {
+      "date": "2024-12-01T00:00:00",
+      "domain_authority": 8
+    },
+    {
+      "date": "2025-01-01T00:00:00",
+      "domain_authority": 12
+    },
+    {
+      "date": "2025-02-01T00:00:00",
+      "domain_authority": 10
+    },
+    {
+      "date": "2025-03-01T00:00:00",
+      "domain_authority": 12
+    },
+    {
+      "date": "2025-04-01T00:00:00",
+      "domain_authority": 11
+    },
+    {
+      "date": "2025-05-01T00:00:00",
+      "domain_authority": 11
+    },
+    {
+      "date": "2025-06-01T00:00:00",
+      "domain_authority": 8
+    },
+    {
+      "date": "2025-07-01T00:00:00",
+      "domain_authority": 8
+    },
+    {
+      "date": "2025-08-01T00:00:00",
+      "domain_authority": 8
+    },
+    {
+      "date": "2025-09-01T00:00:00",
+      "domain_authority": 9
+    },
+    {
+      "date": "2025-10-01T00:00:00",
+      "domain_authority": 9
+    },
+    {
+      "date": "2025-11-01T00:00:00",
+      "domain_authority": 9
+    },
+    {
+      "date": "2025-12-01T00:00:00",
+      "domain_authority": 7
+    },
+    {
+      "date": "2026-01-01T00:00:00",
+      "domain_authority": 7
+    },
+    {
+      "date": "2026-02-01T00:00:00",
+      "domain_authority": 7
+    }
+  ],
+  "total_linking_root_domains": 187,
+  "total_backlinks": 491,
+  "quality_backlinks": 286,
+  "quality_backlinks_percentage": 0.58,
+  "do_follow_backlinks_percentage": 0.71,
+  "no_follow_backlinks_percentage": 0.29,
+  "backlinks_discovered_lost_history": [
+    {
+      "date": "2025-12-30T00:00:00",
+      "discovered": 1,
+      "lost": -1
+    },
+    {
+      "date": "2026-01-21T00:00:00",
+      "discovered": 1,
+      "lost": -1
+    },
+    {
+      "date": "2026-01-22T00:00:00",
+      "discovered": 1,
+      "lost": -1
+    },
+    {
+      "date": "2026-01-25T00:00:00",
+      "discovered": 1,
+      "lost": -1
+    },
+    {
+      "date": "2026-02-08T00:00:00",
+      "discovered": 1,
+      "lost": -1
+    },
+    {
+      "date": "2026-02-22T00:00:00",
+      "discovered": 1,
+      "lost": -2
+    },
+    {
+      "date": "2026-02-24T00:00:00",
+      "discovered": 1,
+      "lost": -1
+    }
+  ],
+  "keywords_ranking_distribution": [
+    {
+      "domain": "supremexdetail.com",
+      "position": "#1-3",
+      "ranking_keywords": 0
+    },
+    {
+      "domain": "supremexdetail.com",
+      "position": "#4-10",
+      "ranking_keywords": 3
+    },
+    {
+      "domain": "supremexdetail.com",
+      "position": "#11-20",
+      "ranking_keywords": 6
+    },
+    {
+      "domain": "supremexdetail.com",
+      "position": "#21-30",
+      "ranking_keywords": 0
+    },
+    {
+      "domain": "supremexdetail.com",
+      "position": "#31-40",
+      "ranking_keywords": 2
+    },
+    {
+      "domain": "supremexdetail.com",
+      "position": "#41-50",
+      "ranking_keywords": 4
+    }
+  ],
+  "top_pages": [
+    {
+      "page_url": "supremexdetail.com/",
+      "page_authority": 25
+    },
+    {
+      "page_url": "www.supremexdetail.com/",
+      "page_authority": 22
+    },
+    {
+      "page_url": "supremexdetail.com/wp-content/uploads/2023/10/Carfidant-Scratch-and-Swirl-Remover-img-01.png",
+      "page_authority": 16
+    },
+    {
+      "page_url": "supremexdetail.com/wp-content/uploads/2023/09/TICARVE-Car-Cleaning-Gel-Detailing-Putty-img-01.jpg",
+      "page_authority": 16
+    },
+    {
+      "page_url": "supremexdetail.com/wp-content/uploads/2023/10/WINSHIELD-WITH-CERAMIC-COATING.webp",
+      "page_authority": 16
+    },
+    {
+      "page_url": "supremexdetail.com/tag/starting-a-car-detailing-business/feed/",
+      "page_authority": 13
+    },
+    {
+      "page_url": "supremexdetail.com/product/meguiars-mirror-glaze-m10508-ultra-cut-compound-professional-grade-formula-with-fast-cutting-action-that-removes-scratches-heavy-swirls-and-more-8-oz/",
+      "page_authority": 13
+    }
+  ],
+  "top_linking_domains": [
+    {
+      "domain": "pages.dev",
+      "domain_authority": 92
+    },
+    {
+      "domain": "about.me",
+      "domain_authority": 92
+    },
+    {
+      "domain": "webflow.io",
+      "domain_authority": 91
+    },
+    {
+      "domain": "site123.me",
+      "domain_authority": 89
+    },
+    {
+      "domain": "pbase.com",
+      "domain_authority": 88
+    },
+    {
+      "domain": "web.app",
+      "domain_authority": 88
+    },
+    {
+      "domain": "yellowpages.com",
+      "domain_authority": 86
+    }
+  ],
+  "top_ranking_keywords": [
+    {
+      "keyword": "reno nv mobile detailing",
+      "rank": 8
+    },
+    {
+      "keyword": "mobile car detailing reno nv",
+      "rank": 8
+    },
+    {
+      "keyword": "interior auto detailing reno",
+      "rank": 9
+    },
+    {
+      "keyword": "interior car reno",
+      "rank": 11
+    },
+    {
+      "keyword": "auto detailing reno",
+      "rank": 12
+    },
+    {
+      "keyword": "car detailing reno",
+      "rank": 13
+    },
+    {
+      "keyword": "supreme auto detailing",
+      "rank": 17
+    }
+  ],
+  "top_branded_keywords": [
+    {
+      "keyword": "supreme finish auto detail shop & mobile service",
+      "volume": 5
+    }
+  ],
+  "top_questions": [],
+  "top_competitors": [
+    {
+      "domain": "renomobiledetail.com",
+      "visibility": 2.82
+    },
+    {
+      "domain": "www.yelp.com",
+      "visibility": 2.44
+    },
+    {
+      "domain": "fairfaxautodetailing.com",
+      "visibility": 0.9
+    },
+    {
+      "domain": "detailsupreme.com",
+      "visibility": 0.9
+    },
+    {
+      "domain": "supreme-shine-auto-detailing.square.site",
+      "visibility": 0.9
+    },
+    {
+      "domain": "jimbosdetailing.com",
+      "visibility": 0.9
+    },
+    {
+      "domain": "supremedetailingsuperstore.com",
+      "visibility": 0.9
+    }
+  ]
+}]
